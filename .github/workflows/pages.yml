@@ -1,0 +1,63 @@
+name: Deploy to GitHub Pages
+
+# Numpla is a fully static site: the compute core is WebAssembly running in the
+# browser. app/pkg/ is a build artifact and is never committed, so CI builds it
+# from the Rust crates on every push — the published WASM always matches source.
+# See docs/hosting.md.
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Let a running deploy finish rather than cancelling it half-published.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace
+      - run: cargo clippy --all-targets -- -D warnings
+      - name: Math field model tests
+        run: node app/mathfield.test.mjs
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: jetli/wasm-pack-action@v0.4.0
+      - name: Build WASM
+        run: wasm-pack build --target web --out-dir ../../app/pkg crates/numpla-wasm
+      - name: Strip dev-only files from the bundle
+        run: rm -f app/serve.mjs app/mathfield.test.mjs app/mathfield-test.html
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: app
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

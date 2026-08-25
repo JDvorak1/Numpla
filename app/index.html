@@ -1,12 +1,13 @@
 <!doctype html>
-<html lang="en" data-theme="dark">
+<html lang="en" data-theme="light">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Numpla</title>
-<meta name="color-scheme" content="dark">
+<meta name="color-scheme" content="light">
+<link rel="stylesheet" href="./mathfield.css">
 <link rel="stylesheet" href="./styles.css">
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%230e1116'/%3E%3Cpath d='M5 21C10 21 10 11 16 11S22 21 27 21' fill='none' stroke='%2360e0c8' stroke-width='2.5' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23ffffff'/%3E%3Crect x='.5' y='.5' width='31' height='31' rx='7.5' fill='none' stroke='%23dfe2e8'/%3E%3Cpath d='M5 21C10 21 10 11 16 11S22 21 27 21' fill='none' stroke='%230f7d70' stroke-width='2.5' stroke-linecap='round'/%3E%3C/svg%3E">
 </head>
 <body>
 
@@ -38,6 +39,14 @@
       <span class="brand__name">numpla</span>
       <span class="brand__slice">vertical slice</span>
     </div>
+    <button id="demos-btn" class="demosbtn" type="button"
+            aria-haspopup="menu" aria-expanded="false" aria-controls="demomenu">
+      <svg class="icon" viewBox="0 0 16 16" aria-hidden="true">
+        <path d="M2 3.4h12M2 8h12M2 12.6h12" fill="none" stroke="currentColor"
+              stroke-width="1.6" stroke-linecap="round"/>
+      </svg>
+      Demos
+    </button>
     <div class="telemetry" id="telemetry">
       <span class="stat" title="Accepted steps"><i>acc</i><b id="stat-accepted">—</b></span>
       <span class="stat" title="Rejected steps"><i>rej</i><b id="stat-rejected">—</b></span>
@@ -48,73 +57,78 @@
 
   <main class="workspace">
 
-    <aside class="pane pane--editor">
+    <!-- expression pane: fixed width, scrolls internally -->
+    <aside class="pane pane--doc">
       <div class="pane__head">
         <h2 class="pane__title">System</h2>
-        <span class="pane__hint">one row per line · <code>x' = -y</code></span>
+        <span class="pane__note" id="diag-count">clean</span>
       </div>
 
-      <div class="editor">
-        <div class="editor__gutter" id="gutter" aria-hidden="true"></div>
-        <textarea id="source" class="editor__area" spellcheck="false" autocomplete="off"
-                  autocapitalize="off" autocorrect="off" wrap="off"
-                  aria-label="System source"># harmonic oscillator
-x' = -y
-y' = x
-x(0) = 1
-y(0) = 0</textarea>
-      </div>
+      <div class="rows" id="rows" role="list"></div>
 
-      <div class="pane__head pane__head--sub">
-        <h2 class="pane__title">Diagnostics</h2>
-        <span class="pane__hint" id="diag-count">clean</span>
-      </div>
-      <ul class="diags" id="diags"></ul>
-
-      <div class="pane__head pane__head--sub">
-        <h2 class="pane__title">Span</h2>
-      </div>
-      <div class="span">
-        <label class="field"><span>t₀</span><input id="t0" type="number" step="0.5" value="0"></label>
-        <label class="field"><span>t₁</span><input id="t1" type="number" step="0.5" value="20"></label>
+      <div class="rows__foot">
+        <button id="add-row" class="ghostbtn" type="button">
+          <span aria-hidden="true">+</span> Add row
+        </button>
+        <span class="pane__hint">Enter · new row &nbsp;·&nbsp; ↑ ↓ · move</span>
       </div>
     </aside>
 
-    <section class="pane pane--plots">
-      <div class="plot plot--time">
+    <!-- draggable divider -->
+    <div class="divider" id="divider" role="separator" tabindex="0"
+         aria-orientation="vertical" aria-label="Resize the expression pane"
+         title="Drag to resize · arrow keys to nudge"><span class="divider__grip" aria-hidden="true"></span></div>
+
+    <!-- one plot surface -->
+    <section class="pane pane--plot">
+      <div class="plot">
         <div class="plot__head">
-          <h2 class="pane__title">State vs time</h2>
+          <div class="views" id="views" role="group" aria-label="Plot view">
+            <button class="viewchip is-active" type="button" data-view="time">t–y</button>
+            <button class="viewchip" type="button" data-view="phase">phase</button>
+            <button class="viewchip" type="button" data-view="polar">polar</button>
+          </div>
           <div class="legend" id="legend"></div>
         </div>
-        <div class="plot__canvas"><canvas id="canvas-time"></canvas></div>
-      </div>
-
-      <div class="plot plot--phase" id="phase-wrap" hidden>
-        <div class="plot__head">
-          <h2 class="pane__title">Phase plane</h2>
-          <span class="pane__hint" id="phase-axes"></span>
-        </div>
-        <div class="plot__canvas"><canvas id="canvas-phase"></canvas></div>
+        <div class="plot__canvas"><canvas id="canvas"></canvas></div>
       </div>
     </section>
 
   </main>
 
-  <footer class="dock">
-    <button id="play" class="playbtn" type="button" aria-label="Play" title="Play / pause (space)">
-      <svg class="icon icon--play" viewBox="0 0 16 16" aria-hidden="true"><path d="M4.5 2.8v10.4L13 8z"/></svg>
-      <svg class="icon icon--pause" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 2.6h3v10.8H4zM9 2.6h3v10.8H9z"/></svg>
-    </button>
-
-    <div class="scrub">
-      <input id="scrub" class="scrub__input" type="range" min="0" max="1000" value="0" step="1"
-             aria-label="Time scrubber">
-      <div class="scrub__time"><span class="scrub__label">t</span><b id="tval">0.000</b></div>
+  <!-- one controls section: every slider, t included -->
+  <footer class="controls">
+    <div class="controls__head">
+      <button id="play" class="playbtn" type="button" aria-label="Play" title="Play / pause (space)">
+        <svg class="icon icon--play" viewBox="0 0 16 16" aria-hidden="true"><path d="M4.5 2.8v10.4L13 8z"/></svg>
+        <svg class="icon icon--pause" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 2.6h3v10.8H4zM9 2.6h3v10.8H9z"/></svg>
+      </button>
+      <h2 class="pane__title">Controls</h2>
+      <div class="readout" id="readout"></div>
     </div>
-
-    <div class="readout" id="readout"></div>
+    <div class="sliders" id="sliders"></div>
   </footer>
 
+</div>
+
+<!-- Demo gallery. Like the slider settings, a document-level overlay in fixed
+     coordinates, so opening it cannot resize or reflow the workspace. -->
+<div class="demomenu" id="demomenu" role="menu" aria-label="Demos" hidden></div>
+
+<!-- Slider range settings. A document-level overlay, positioned in fixed
+     coordinates, so opening it can never resize or reflow anything. -->
+<div class="settings" id="slider-settings" role="dialog" aria-modal="false"
+     aria-label="Slider range" hidden>
+  <div class="settings__head">
+    <span class="settings__name" id="settings-name">t</span>
+    <span class="settings__hint">range &amp; step</span>
+  </div>
+  <div class="settings__grid">
+    <label class="settings__field"><span>min</span><input id="settings-min" type="number" step="any"></label>
+    <label class="settings__field"><span>max</span><input id="settings-max" type="number" step="any"></label>
+    <label class="settings__field"><span>step</span><input id="settings-step" type="number" step="any" min="0"></label>
+  </div>
+  <p class="settings__foot" id="settings-foot">Esc to close</p>
 </div>
 
 <script type="module" src="./main.js"></script>

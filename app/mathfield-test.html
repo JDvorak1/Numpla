@@ -1,0 +1,221 @@
+<!doctype html>
+<!--
+  mathfield-test.html - the eyeball test for app/mathfield.js.
+
+    node app/serve.mjs   ->  http://localhost:5173/mathfield-test.html
+
+  (ES modules need a server; file:// will not load them.)
+
+  Every field below is live. Type in any of them: `/` starts a fraction, `^` a
+  superscript, `sqrt` inflates into a radical, `(` inserts a matched pair,
+  arrows walk in and out of every structure, backspace at the left edge of a
+  slot collapses it. The readout under each field is the real `.source` and
+  `.latex` of that field, updated on every keystroke.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Numpla math field - test bench</title>
+<link rel="stylesheet" href="./mathfield.css">
+<style>
+  :root {
+    --ink: #1b1d21;
+    --muted: #7c828c;
+    --line: #e6e9ee;
+    --paper: #fbfbfc;
+    --accent: #2f6fd0;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 34px 28px 80px;
+    background: var(--paper);
+    color: var(--ink);
+    font: 15px/1.5 -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  h1 { font-size: 20px; font-weight: 600; margin: 0 0 4px; letter-spacing: -0.01em; }
+  h2 {
+    font-size: 12px; font-weight: 600; text-transform: uppercase;
+    letter-spacing: 0.08em; color: var(--muted);
+    margin: 34px 0 12px; padding-bottom: 6px; border-bottom: 1px solid var(--line);
+  }
+  .lede { color: var(--muted); margin: 0 0 6px; max-width: 62ch; }
+  .wrap { max-width: 900px; margin: 0 auto; }
+  .case { margin: 0 0 20px; }
+  .label { font-size: 12px; color: var(--muted); margin-bottom: 5px; }
+  .readout {
+    margin-top: 7px;
+    font: 12.5px/1.6 ui-monospace, "Cascadia Mono", Consolas, "Courier New", monospace;
+    color: #545a63;
+    display: grid;
+    grid-template-columns: 58px 1fr;
+    gap: 0 10px;
+    word-break: break-all;
+  }
+  .readout b { color: var(--muted); font-weight: 500; }
+  .readout .ok { color: #2f6fd0; }
+  .readout .bad { color: #b4453b; font-weight: 600; }
+  kbd {
+    font: 11px ui-monospace, Consolas, monospace; background: #fff;
+    border: 1px solid var(--line); border-bottom-width: 2px;
+    border-radius: 4px; padding: 1px 5px;
+  }
+  .hint { color: var(--muted); font-size: 13px; margin: 10px 0 20px; }
+  .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px 22px; }
+  @media (max-width: 760px) { .grid { grid-template-columns: 1fr; } }
+  #summary {
+    margin-top: 10px; padding: 10px 12px; border: 1px solid var(--line);
+    border-radius: 6px; background: #fff;
+    font: 12.5px/1.6 ui-monospace, Consolas, monospace;
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>Numpla math field</h1>
+  <p class="lede">
+    Every field is live and independent. Click one and type.
+    <kbd>/</kbd> fraction &middot; <kbd>^</kbd> superscript &middot;
+    <kbd>_</kbd> subscript &middot; <kbd>sqrt</kbd> radical &middot;
+    <kbd>(</kbd> matched pair &middot; <kbd>'</kbd> prime &middot;
+    arrows walk the structure &middot; <kbd>Backspace</kbd> at a slot's left edge
+    collapses it.
+  </p>
+  <p class="hint">
+    <code>source</code> is what goes to the solver; it must be plain text the
+    Numpla parser accepts. <code>round&nbsp;trip</code> re-parses that text and
+    re-serialises it: it must come back identical.
+  </p>
+
+  <h2>A harmonic oscillator, one row at a time</h2>
+  <div class="grid" id="doc"></div>
+
+  <h2>Structures</h2>
+  <div class="grid" id="structures"></div>
+
+  <h2>Tall and nested</h2>
+  <div class="grid" id="tall"></div>
+
+  <h2>Diagnostics</h2>
+  <div class="grid" id="diags"></div>
+
+  <h2>Empty - type here</h2>
+  <div class="grid" id="blank"></div>
+
+  <h2>Round-trip summary</h2>
+  <div id="summary">checking...</div>
+
+</div>
+
+<script type="module">
+import { MathField, MathModel } from './mathfield.js';
+
+const fields = [];
+
+function mount(hostId, label, value, opts = {}) {
+  const section = document.getElementById(hostId);
+
+  const wrap = document.createElement('div');
+  wrap.className = 'case';
+
+  const cap = document.createElement('div');
+  cap.className = 'label';
+  cap.textContent = label;
+  wrap.appendChild(cap);
+
+  const slot = document.createElement('div');
+  wrap.appendChild(slot);
+
+  const readout = document.createElement('div');
+  readout.className = 'readout';
+  readout.innerHTML =
+    '<b>source</b><span data-src></span>' +
+    '<b>latex</b><span data-tex></span>' +
+    '<b>trip</b><span data-trip></span>';
+  wrap.appendChild(readout);
+  section.appendChild(wrap);
+
+  const srcEl = readout.querySelector('[data-src]');
+  const texEl = readout.querySelector('[data-tex]');
+  const tripEl = readout.querySelector('[data-trip]');
+
+  const refresh = (f) => {
+    const src = f.source;
+    srcEl.textContent = src === '' ? '(empty)' : src;
+    texEl.textContent = f.latex === '' ? '(empty)' : f.latex;
+    // Round-trip check: parse the emitted source back and re-emit it.
+    const again = new MathModel(src).source;
+    const stable = again === src;
+    tripEl.textContent = stable ? 'stable' : 'DRIFT -> ' + JSON.stringify(again);
+    tripEl.className = stable ? 'ok' : 'bad';
+    return stable;
+  };
+
+  const field = new MathField(slot, Object.assign({
+    value,
+    onChange: refresh,
+    onEnter: () => console.log('enter:', field.source),
+    onNavigate: (f, dir) => {
+      const i = fields.indexOf(f);
+      const next = fields[dir === 'up' || dir === 'left' ? i - 1 : i + 1];
+      if (next) next.focus();
+    },
+  }, opts));
+
+  fields.push(field);
+  field.refresh = () => refresh(field);
+  field.refresh();
+  return field;
+}
+
+// --- an actual document -----------------------------------------------------
+mount('doc', 'ODE row, first order', "x' = -y");
+mount('doc', 'ODE row, second order', "x'' = -x - 0.4x'");
+mount('doc', 'parameter', 'k = 0.5');
+mount('doc', 'initial condition', 'x(0) = 1');
+mount('doc', 'function definition', 'f(x) = x^(2) - 1');
+mount('doc', 'lowered velocity state', "x'(0) = 0");
+
+// --- one of each structure --------------------------------------------------
+mount('structures', 'fraction', 'y = (x + 1)/(x - 1)');
+mount('structures', 'superscript', 'E = m*c^(2)');
+mount('structures', 'radical', 'r = sqrt(x^(2) + y^(2))');
+mount('structures', 'subscripts and primes', "x_1' = -k_1*x_2");
+mount('structures', 'delimiters that grow', 'z = ((a)/(b) + c)');
+mount('structures', 'functions, upright', 'y = sin(2pit) + exp(-t)*cos(t)');
+mount('structures', 'implicit multiplication (xy is x times y)', 'p = 2xy - 3ab');
+mount('structures', 'brackets', 'v = [1, 2, 3]');
+
+// --- stress -----------------------------------------------------------------
+mount('tall', 'nested fractions', 'q = ((1)/(2))/((3)/(4))');
+mount('tall', 'fraction inside a radical', 's = sqrt((a + b)/(c - d))');
+mount('tall', 'radical inside a fraction', 'g = (1 + sqrt(5))/(2)');
+mount('tall', 'a tower', 'h = 2^(3^(2)) + ((x)/(y))^(2)');
+mount('tall', 'continued fraction', 'c = 1 + (1)/(1 + (1)/(1 + (1)/(2)))');
+mount('tall', 'everything at once',
+  "w'' = -(k)/(m)*w - sqrt((c)/(m))*w' + f_0*cos(2pi*t)");
+
+// --- diagnostics ------------------------------------------------------------
+mount('diags', 'clean', 'a = 1').setDiagnostic(null, '');
+mount('diags', 'pending (half typed, muted, never red)', 'b = 1 + ')
+  .setDiagnostic('pending', 'incomplete expression');
+mount('diags', 'error (still gray, not red)', 'c = )(')
+  .setDiagnostic('error', 'unexpected )');
+
+// --- blank ------------------------------------------------------------------
+mount('blank', 'empty field', '');
+mount('blank', 'try: 1/2 then arrows, then sqrt, then ^', '');
+
+// --- summary ----------------------------------------------------------------
+const drift = fields.filter((f) => f.refresh() === false);
+document.getElementById('summary').textContent =
+  fields.length + ' fields mounted, ' + (fields.length - drift.length) +
+  ' round-trip stable, ' + drift.length + ' drifting.';
+
+fields[0].focus();
+window.fields = fields;
+</script>
+</body>
+</html>

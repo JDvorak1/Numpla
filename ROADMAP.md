@@ -107,6 +107,38 @@ idea-generation engine.
 
 ---
 
+---
+
+## Known bugs
+
+### Implicit multiplication loses to function-call syntax on `^`
+
+`g (y - x)^3` evaluates as `(g*(y-x))^3`, not `g*(y-x)^3`. At `g=40, y-x=-1`
+that is `-64000` instead of `-40`.
+
+Cause: an identifier followed by `(` is parsed as `Expr::Call`, because the
+parser cannot yet know whether `g` is a function or a coefficient. The exponent
+then attaches to the whole call node, and eval's "not a function, so multiply"
+fallback happens *inside* the cube. The fallback itself is right — ordinary
+notation needs `2(x+1)` — but it silently changes precedence.
+
+Found by benchmarking two spellings of the same physics against each other and
+noticing the trajectories diverged. It is dangerous precisely because nothing
+errors: you get a plausible curve of the wrong system.
+
+Fix: resolve call-vs-coefficient with knowledge of which names are functions.
+`numpla-model` already collects the `f(u) = ...` rows, so the shape is a
+two-pass compile — gather definitions, then build expression trees with the
+function set in hand. Until then, parenthesise: `g ((y-x)^3)`.
+
+### `rand()` has no call-site identity
+
+Two separate `rand()` calls in one document draw the same value, because the
+evaluator has no notion of where a call sits in the tree. `numpla-noise`
+already exports `rand_at(seed, index)` and `derive_seed(doc, site)`; what is
+missing is the document layer assigning a stable index per call site.
+
+
 ## Crate split (published separately)
 
 | crate | contents |

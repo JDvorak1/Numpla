@@ -7,3 +7,4 @@ repository.workspace = true
 description = "Numpla: expr"
 
 [dependencies]
+numpla-noise.workspace = true

@@ -47,4 +47,37 @@ mod integration {
 
         assert_eq!(rhs, vec![("x".to_string(), 0.0), ("y".to_string(), 1.0)]);
     }
+
+    /// A noise-driven row is a vector field like any other. The solver calls
+    /// this six times per step and twice more per rejected step, always at
+    /// times it chooses; what it must never see is two different answers for
+    /// one `(t, y)`. `numpla-noise` proves the integration converges — this
+    /// proves the property survives the parser and the evaluator.
+    #[test]
+    fn a_noise_driven_row_is_a_deterministic_vector_field() {
+        let (stmt, errs) = parse("x' = -x + 0.5 smooth(t)");
+        assert!(errs.is_empty(), "{:?}", errs);
+        let rhs = match stmt {
+            Stmt::Ode { name, order, rhs } => {
+                assert_eq!((name.as_str(), order), ("x", 1));
+                rhs
+            }
+            other => panic!("{:?}", other),
+        };
+
+        let field = |t: f64, x: f64| -> f64 {
+            let mut env = Env::new();
+            env.set("t", t).set("x", x);
+            eval(&rhs, &env).unwrap().scalar().unwrap()
+        };
+
+        // Out of order, repeatedly, exactly as an adaptive stepper would.
+        for t in [0.0, 1.7, 0.4, 1.7, 9.9, 0.4] {
+            let first = field(t, 1.0);
+            assert!(first.is_finite());
+            assert_eq!(field(t, 1.0).to_bits(), first.to_bits(), "at t = {}", t);
+        }
+        // And it is genuinely a function of t, not a constant.
+        assert_ne!(field(0.0, 1.0), field(1.7, 1.0));
+    }
 }

@@ -1,0 +1,12 @@
+[package]
+name = "numpla-noise"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Numpla: noise - deterministic, band-limited noise as a function of time"
+
+[dependencies]
+
+[dev-dependencies]
+numpla-ode.workspace = true

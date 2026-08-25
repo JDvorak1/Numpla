@@ -6,10 +6,17 @@
 //! functions and constants, which are matched longest-first.
 
 /// Function names recognised without parentheses (`sin x` == `sin(x)`).
+///
+/// The noise names are reserved here for the same reason `sin` is: a
+/// multi-letter name is a known function or it is several variables, and
+/// `smooth(t)` has to be the function. The cost is that `b*l*u*e` can no
+/// longer be written as `blue`, which is the trade the single-letter
+/// identifier rule makes everywhere else too.
 pub const FUNCS: &[&str] = &[
     "arcsin", "arccos", "arctan", "sinh", "cosh", "tanh", "sin", "cos", "tan",
     "sqrt", "exp", "ln", "log", "abs", "min", "max", "floor", "ceil", "round",
     "sign", "mod",
+    "white", "pink", "brown", "blue", "smooth", "telegraph", "randn", "rand",
 ];
 
 /// Multi-letter constants that must not be split into single letters.
@@ -193,5 +200,27 @@ mod tests {
     #[test]
     fn keeps_constants_whole() {
         assert_eq!(toks("pi"), vec![Tok::Ident("pi".into())]);
+    }
+
+    #[test]
+    fn reads_noise_names_as_functions() {
+        for name in [
+            "white", "pink", "brown", "blue", "smooth", "telegraph", "rand", "randn",
+        ] {
+            assert_eq!(toks(name), vec![Tok::Func(name.into())], "{}", name);
+        }
+    }
+
+    /// `randn` is `rand` plus a letter, and `pink` starts with the constant
+    /// `pi`. Longest-match has to resolve both, or `randn(3)` silently becomes
+    /// `rand(3) * n * 3`.
+    #[test]
+    fn noise_names_do_not_shadow_each_other() {
+        assert_eq!(toks("randn"), vec![Tok::Func("randn".into())]);
+        assert_eq!(toks("pink"), vec![Tok::Func("pink".into())]);
+        assert_eq!(
+            toks("pix"),
+            vec![Tok::Ident("pi".into()), Tok::Ident("x".into())]
+        );
     }
 }
