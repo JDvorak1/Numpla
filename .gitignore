@@ -1,6 +1,8 @@
 /target
 **/*.rs.bk
-Cargo.lock
+# Cargo.lock IS committed. This workspace is an application that CI builds and
+# deploys, not a library: pinning the exact dependency versions is what stops
+# somebody else's patch release from breaking a deploy with no change here.
 node_modules/
 dist/
 pkg/

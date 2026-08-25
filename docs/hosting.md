@@ -46,6 +46,45 @@ that can set headers (Cloudflare Pages, Netlify, a plain nginx). That is a
 hosting decision, not a code decision — which is exactly why it is written down
 here rather than discovered later.
 
+## Publishing it
+
+The repository has no remote yet. Three steps, once:
+
+1. **Create an empty repository** on github.com — no README, no .gitignore, no
+   licence, since this one already has them.
+
+2. **Point this checkout at it and push.** The workflow triggers on `main` or
+   `master`, so either branch name works:
+
+   ```
+   git remote add origin https://github.com/<you>/Numpla.git
+   git push -u origin master
+   ```
+
+3. **Turn Pages on**: repository → Settings → Pages → *Source: GitHub Actions*.
+   Not "Deploy from a branch" — the site is built by the workflow, because
+   `app/pkg/` is a build artifact and is never committed.
+
+The first push runs the workflow: it tests the Rust core, fails the build on any
+clippy warning, builds the WASM, runs all four JS suites against that real
+module, strips the dev-only files, and deploys. The site lands at
+`https://<you>.github.io/Numpla/`.
+
+### Visibility
+
+GitHub Pages on a **private** repository needs a paid plan (Pro/Team/
+Enterprise). On the free plan the repository has to be **public** for the site
+to be served. The code is a maths app with no secrets in it, so public is the
+ordinary choice — but it is a choice, and it is worth making deliberately rather
+than discovering when the deploy is skipped.
+
+### If the deploy fails
+
+The `test` job runs before `build`, so a red deploy is nearly always a genuine
+test failure rather than a Pages problem — read that job first. The one
+environment-specific gotcha is that the JS suites need the WASM built, which the
+workflow does explicitly for exactly this reason.
+
 ## Other options, for reference
 
 | Host | Custom headers | Notes |
