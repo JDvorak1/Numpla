@@ -58,11 +58,10 @@ fn match_word(chars: &[char], i: usize, table: &[&str]) -> Option<String> {
     let mut best: Option<&str> = None;
     for w in table {
         let wc: Vec<char> = w.chars().collect();
-        if i + wc.len() <= chars.len() && chars[i..i + wc.len()] == wc[..] {
-            if best.map_or(true, |b| b.len() < w.len()) {
+        if i + wc.len() <= chars.len() && chars[i..i + wc.len()] == wc[..]
+            && best.is_none_or(|b| b.len() < w.len()) {
                 best = Some(w);
             }
-        }
     }
     best.map(|s| s.to_string())
 }

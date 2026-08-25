@@ -98,6 +98,23 @@ power-conserving interconnection. Plain `x' = f(x,t)` rows stay fully supported
 for everything that is not energy-based — but when a model *is* physical, the pH
 path gives correctness that ad hoc signal-wiring cannot.
 
+## Found while implementing: `dt_max` must not default to infinity
+
+Every adaptive method shares this failure mode, and it bit the first test
+written against Tsit5. Starting on a flat stretch of solution, the controller
+grows the step geometrically (10x per accepted step at default settings) and
+can **leap clean over a narrow feature**. The error estimate never sees the
+bump because the method never lands on it.
+
+Demonstrated concretely in `narrow_features_can_be_stepped_over_without_a_step_cap`: integrating a Gaussian pulse of width ~0.3 over t in [0, 10] with
+`dt_max = inf` misses the pulse almost entirely; capping at `dt_max = 1.0`
+resolves it to 1e-6.
+
+Product consequence: **`dt_max` must default to something tied to the visible
+time window**, not to infinity, or a user can plot a pulse the solver never
+notices. A silently-wrong plot is far worse than a slow one. The plotter should
+set `dt_max` from the width of the t-axis it is about to draw.
+
 ## Implementation order for M2
 
 1. `System` trait + state vector, with dense output in the interface from day

@@ -14,10 +14,10 @@ Nothing else ships until that works, because that loop *is* Numpla.
 
 - [x] Repo, git, docs (VISION.md, ROADMAP.md)
 - [x] Cargo workspace + crate split
+- [x] `cargo test` green — 42 tests, clippy clean
 - [ ] TS app shell (Vite), WASM build wired
-- [ ] `cargo test` green  ← blocked on Rust toolchain install
 
-## M1 — Expression core  (`numpla-expr`)
+## M1 — Expression core  (`numpla-expr`)  — done
 
 Everything downstream is an AST walk, so this lands first.
 
@@ -30,14 +30,20 @@ Everything downstream is an AST walk, so this lands first.
 
 ## M2 — Solvers  (`numpla-ode`)
 
-- `System` trait: state vector, rhs, optional Jacobian
-- Continuous: Dormand-Prince RK45 adaptive, dense output (needed for scrubbing)
-- Continuous stiff: Radau IIA or ESDIRK
-- Discrete/structure-preserving: symplectic (Verlet, Yoshida4) + a modern
-  variational/geometric integrator per current literature
-- Step telemetry out of the solver as data (accepted/rejected/local error) ->
-  feeds the M8 telemetry strip and the save-file export
-- Event detection (zero crossings) — needed for anything with contact
+Selection and rationale in `docs/solvers.md`.
+
+- [x] `System` trait, allocation-free right-hand side
+- [x] Tsit5 adaptive with PI step control and Hairer automatic initial step
+- [x] Dense output (4th-order continuous extension) — in the interface from day
+      one, because scrubbing needs `solution(t)`, not a list of samples
+- [x] `Solution::eval` / `sample` — binary search + interpolation
+- [x] Step telemetry as data (accepted/rejected/local error, per attempt)
+- [ ] Velocity Verlet + Yoshida4 (makes the conservation demo work)
+- [ ] Event detection on the dense output
+- [ ] Rodas5P or an ESDIRK for stiffness
+- [ ] Port-Hamiltonian system type + power-conserving interconnection
+- [ ] `dt_max` defaulted from the visible time window (see solvers.md)
+
 
 ## M3 — Render  (`numpla-plot`)
 

@@ -113,11 +113,7 @@ impl Parser {
 
     pub fn expr(&mut self, min_bp: u8) -> Expr {
         let mut lhs = self.prefix();
-        loop {
-            let t = match self.peek() {
-                Some(t) => t,
-                None => break,
-            };
+        while let Some(t) = self.peek() {
             let (op, lbp, rbp, explicit) = match t {
                 Tok::Plus => (BinOp::Add, BP_ADD.0, BP_ADD.1, true),
                 Tok::Minus => (BinOp::Sub, BP_ADD.0, BP_ADD.1, true),
