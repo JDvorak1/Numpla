@@ -13,16 +13,29 @@
 //! - `x^a * x^b -> x^(a+b)` only for integer literal exponents, for the same
 //!   reason: `x^0.5 * x^0.5` is not `x` when `x < 0`.
 //! - `exp(ln u) -> u` and `sqrt(u)^2 -> u` are never applied: both change the
-//!   value outside the domain of the inner function.
+//!   value outside the domain of the inner function. `ln(exp u) -> u` *is*
+//!   applied, and the asymmetry is the point — see [`call`].
+//! - `ln(u*v) -> ln u + ln v` is not applied unless both factors are provably
+//!   positive, because `ln((-2)(-3))` is a number and `ln(-2) + ln(-3)` is not.
+//!   The conditional form is offered by [`crate::equal`] *with its condition
+//!   attached*, which is the only honest way to hand somebody a rewrite that
+//!   is true on part of the domain.
 //! - Transcendental calls of a literal are left alone. `sin(2)` is a number the
 //!   way `sqrt(2)` is; turning it into `0.9092974268256817` throws away the
-//!   only exact form there is. `cas_eval` is where you ask for a number.
+//!   only exact form there is. `evalf` is where you ask for a number.
 //!
 //! Two rewrites *do* change the value at isolated points, and are kept because
 //! every CAS keeps them and the alternative is an unusable simplifier:
 //! `0 * u -> 0` and cancelling `u/u -> 1`, both of which differ from the input
 //! where `u` is not finite. The property test skips points where the *input*
 //! is not finite, which is exactly the set on which they disagree.
+//!
+//! Merging logarithms is a third, of a different kind: `ln u + ln v` and
+//! `ln(u v)` are the same real number, but the product can overflow to infinity
+//! where the two logarithms were ordinary — so the rewrite is bounded to the
+//! coefficients that make an expression shorter (see [`MAX_LOG_COEFF`]) and the
+//! disagreement, where it happens at all, is the floating-point range and not
+//! the algebra.
 //!
 //! # Shape of the algorithm
 //!
@@ -49,9 +62,31 @@ use numpla_expr::{BinOp, Expr};
 /// rather see as a stale answer than as a hung tab; in practice this settles
 /// after two passes (the second one proving the first reached the fixpoint).
 pub fn simplify(e: &Expr) -> Expr {
-    let mut cur = pass(e);
+    fixpoint(e, true)
+}
+
+/// Simplify without collecting a sum of logarithms back into one.
+///
+/// [`crate::expand`] wants the *other* direction, and a final pass that undid
+/// what it had just done would make expansion of a logarithm a no-op with extra
+/// steps. Everything else about the two is identical, so this is one flag
+/// rather than a second simplifier that could drift from this one.
+pub(crate) fn simplify_keeping_logs_apart(e: &Expr) -> Expr {
+    fixpoint(e, false)
+}
+
+fn fixpoint(e: &Expr, merge_logs: bool) -> Expr {
+    let step = |e: &Expr| {
+        let reduced = pass(e);
+        if merge_logs {
+            merge_log_sums(&reduced)
+        } else {
+            reduced
+        }
+    };
+    let mut cur = step(e);
     for _ in 0..8 {
-        let next = pass(&cur);
+        let next = step(&cur);
         if next == cur {
             break;
         }
@@ -198,6 +233,148 @@ fn degree(e: &Expr) -> f64 {
     }
 }
 
+// ---- logarithms ---------------------------------------------------------
+
+/// The largest coefficient a logarithm may carry into a merge.
+///
+/// `ln u + ln v -> ln(u v)` is exact in the reals, but `u v` can overflow to
+/// infinity where `u` and `v` were both finite — the same class of
+/// finite-precision compromise as `0 * u -> 0` differing at infinities, and
+/// documented in the module header for the same reason. A coefficient of a
+/// thousand turns that from a corner case into the normal case (`1000 ln 2` is
+/// `ln(2^1000)`, which is `ln(inf)`), so the merge is limited to the
+/// coefficients that actually make an expression shorter to read.
+const MAX_LOG_COEFF: f64 = 8.0;
+
+/// `ln u + ln v -> ln(u v)`, over a whole sum at once.
+///
+/// This is the direction that is unconditionally true, which is why it lives
+/// here rather than in [`crate::equal`] with a condition attached: wherever the
+/// input has a value at all, `ln u` and `ln v` are both defined, so `u` and `v`
+/// are both positive and the product law holds with nothing left to assume.
+/// Breaking `ln(u v)` back apart is *not* symmetric — `u` and `v` could both be
+/// negative — so that direction lives in `expand` behind a positivity check and
+/// in `equal` behind a stated condition.
+///
+/// A lone term is left alone: `2 ln(x)` is not more readable as `ln(x^2)`, and
+/// a rewrite whose only effect is to move things around is noise.
+fn merge_log_sums(e: &Expr) -> Expr {
+    let mapped = map_children(e, merge_log_sums);
+    if matches!(mapped, Expr::Bin { op: BinOp::Add | BinOp::Sub, .. } | Expr::Neg(_)) {
+        if let Some(merged) = merged_logs(&mapped) {
+            return merged;
+        }
+    }
+    mapped
+}
+
+fn merged_logs(e: &Expr) -> Option<Expr> {
+    let mut terms: Vec<(f64, Expr)> = Vec::new();
+    additive_terms(e, 1.0, &mut terms);
+    let is_mergeable_log = |c: &f64, rest: &Expr| {
+        c.fract() == 0.0 && c.abs() <= MAX_LOG_COEFF && log_argument(rest).is_some()
+    };
+    if terms.iter().filter(|(c, r)| is_mergeable_log(c, r)).count() < 2 {
+        return None;
+    }
+
+    let mut factors: Vec<(Expr, bool)> = Vec::new();
+    let mut rest: Vec<(Expr, bool)> = Vec::new();
+    for (c, term) in &terms {
+        match log_argument(term) {
+            Some(u) if is_mergeable_log(c, term) => {
+                factors.push((bin(BinOp::Pow, u.clone(), Expr::Num(c.abs())), *c < 0.0));
+            }
+            _ => rest.push((scale(c.abs(), term), *c < 0.0)),
+        }
+    }
+    rest.push((
+        Expr::Call { name: "ln".into(), args: vec![product(&factors)] },
+        false,
+    ));
+    Some(sum(&rest))
+}
+
+fn log_argument(e: &Expr) -> Option<&Expr> {
+    match e {
+        Expr::Call { name, args } if name == "ln" && args.len() == 1 => Some(&args[0]),
+        _ => None,
+    }
+}
+
+/// The addends of a sum, each as `(signed coefficient, remainder)`.
+///
+/// Separate from `gather_sum` because that one is folding into an accumulator
+/// and this one needs the terms themselves; sharing it would mean one function
+/// with two jobs and a flag.
+pub(crate) fn additive_terms(e: &Expr, sign: f64, out: &mut Vec<(f64, Expr)>) {
+    match e {
+        Expr::Neg(a) => additive_terms(a, -sign, out),
+        Expr::Bin { op: BinOp::Add, lhs, rhs } => {
+            additive_terms(lhs, sign, out);
+            additive_terms(rhs, sign, out);
+        }
+        Expr::Bin { op: BinOp::Sub, lhs, rhs } => {
+            additive_terms(lhs, sign, out);
+            additive_terms(rhs, -sign, out);
+        }
+        _ => {
+            let (c, rest) = split_coeff(e);
+            out.push((sign * c, rest));
+        }
+    }
+}
+
+/// Rebuild `e` with `f` applied to each of its immediate children.
+///
+/// Written once here because four of this crate's passes are "recurse, then
+/// look at this node", and four hand-written copies of the same nine-arm match
+/// is four places for a new [`Expr`] variant to be forgotten.
+pub(crate) fn map_children(e: &Expr, f: impl Fn(&Expr) -> Expr) -> Expr {
+    match e {
+        Expr::Num(_) | Expr::Var(_) | Expr::Deriv { .. } | Expr::Hole => e.clone(),
+        Expr::Neg(a) => Expr::Neg(Box::new(f(a))),
+        Expr::List(items) => Expr::List(items.iter().map(f).collect()),
+        Expr::Call { name, args } => Expr::Call {
+            name: name.clone(),
+            args: args.iter().map(f).collect(),
+        },
+        Expr::Bin { op, lhs, rhs } => Expr::Bin {
+            op: *op,
+            lhs: Box::new(f(lhs)),
+            rhs: Box::new(f(rhs)),
+        },
+    }
+}
+
+/// Is this expression strictly positive for every value its names can take?
+///
+/// Deliberately narrow, and the omissions are the interesting part. `pi` is
+/// *not* here: it is an ordinary `Var` that a document is free to bind, and a
+/// rewrite that assumed otherwise would break in exactly the document that
+/// wrote `pi = 3` as a joke. `u^2` is not here either — it is non-negative, not
+/// positive, and `ln(0)` is the difference.
+pub(crate) fn provably_positive(e: &Expr) -> bool {
+    match e {
+        Expr::Num(n) => *n > 0.0,
+        Expr::Call { name, args } => match (name.as_str(), args.len()) {
+            // `exp` is positive wherever it is a number at all, and `cosh` is
+            // at least 1.
+            ("exp", 1) | ("cosh", 1) => true,
+            ("sqrt", 1) => provably_positive(&args[0]),
+            _ => false,
+        },
+        Expr::Bin { op, lhs, rhs } => match op {
+            BinOp::Add | BinOp::Mul | BinOp::Div => {
+                provably_positive(lhs) && provably_positive(rhs)
+            }
+            BinOp::Pow => provably_positive(lhs),
+            BinOp::Sub => false,
+        },
+        _ => false,
+    }
+}
+
 // ---- products -----------------------------------------------------------
 
 /// One factor, as a base raised to an exponent.
@@ -235,11 +412,20 @@ fn product(parts: &[(Expr, bool)]) -> Expr {
         den = -den;
     }
     // Divide out only where the quotient is exact — the division either comes
-    // out whole (`4x/2` is `2x`) or the denominator is a power of two, which is
-    // the only other case a binary float divides without loss (`3/4` is
-    // `0.75`). Everything else stays a fraction, because `x/3` is a better
-    // answer than `0.3333333333333333x` and is also the only *exact* one.
-    if den != 0.0 && den != 1.0 && (num % den == 0.0 || is_power_of_two(den)) {
+    // out whole (`4x/2` is `2x`) or the whole product is arithmetic and the
+    // denominator is a power of two, which is the only other case a binary
+    // float divides without loss (`3/4` is `0.75`). Everything else stays a
+    // fraction, because `x/3` is a better answer than `0.3333333333333333x`
+    // and is also the only *exact* one.
+    //
+    // The `factors.is_empty()` half of that is what keeps `n(n + 1)/2` from
+    // coming back as `0.5n * (n + 1)`. Both are the same number; only one of
+    // them is the formula somebody recognises, and a closed form nobody
+    // recognises has lost most of its value.
+    if den != 0.0
+        && den != 1.0
+        && (num % den == 0.0 || (is_power_of_two(den) && factors.is_empty()))
+    {
         let q = num / den;
         if q * den == num {
             num = q;
@@ -413,6 +599,18 @@ fn power(base: Expr, exp: Expr) -> Expr {
 /// integer", which is the largest set of exactly-representable answers these
 /// functions produce.
 fn call(name: &str, args: Vec<Expr>) -> Expr {
+    // `ln(exp u) -> u`, but never `exp(ln u) -> u`, and the asymmetry is real
+    // rather than an oversight: `exp` is defined on every real and lands in
+    // `ln`'s domain, so the first is an identity on the whole line, while the
+    // second is false for every `u <= 0`. A CAS that applied both because they
+    // "look like inverses" is one that turns `exp(ln(-2))` into `-2`.
+    if name == "ln" && args.len() == 1 {
+        if let Expr::Call { name: inner, args: inner_args } = &args[0] {
+            if inner == "exp" && inner_args.len() == 1 {
+                return inner_args[0].clone();
+            }
+        }
+    }
     let literals: Option<Vec<f64>> = args
         .iter()
         .map(|a| match a {
@@ -425,9 +623,40 @@ fn call(name: &str, args: Vec<Expr>) -> Expr {
             if v.is_finite() && v.fract() == 0.0 {
                 return Expr::Num(v);
             }
+            // A square root that comes out exactly, integer or not: `sqrt(0.25)`
+            // is `0.5` and squares back to `0.25` with nothing lost. The test is
+            // the round trip itself, which is the only one that cannot be fooled
+            // by a decimal that merely looks tidy.
+            if name == "sqrt" && v.is_finite() && v * v == vals[0] {
+                return Expr::Num(v);
+            }
+        }
+        if name == "sqrt" && args.len() == 1 {
+            if let Some(extracted) = extract_square_factor(vals[0]) {
+                return extracted;
+            }
         }
     }
     Expr::Call { name: name.to_string(), args }
+}
+
+/// `sqrt(72) -> 6sqrt(2)`.
+///
+/// Exact, and only ever applied to a non-negative integer literal, so there is
+/// no domain question to answer: the identity `sqrt(k^2 m) = k sqrt(m)` needs
+/// `k >= 0`, and `k` here is a positive integer by construction. Worth doing
+/// because it is what makes a quadratic's roots readable — `(2 + sqrt(8))/2`
+/// is an answer nobody can see is `1 + sqrt(2)`.
+fn extract_square_factor(x: f64) -> Option<Expr> {
+    let n = crate::num::as_integer(x).filter(|n| *n > 1)?;
+    let (outside, rest) = crate::num::square_factor(n);
+    (outside > 1).then(|| {
+        bin(
+            BinOp::Mul,
+            Expr::Num(outside as f64),
+            Expr::Call { name: "sqrt".into(), args: vec![Expr::Num(rest as f64)] },
+        )
+    })
 }
 
 /// The same arithmetic `numpla_expr::eval` does, for the folding above.

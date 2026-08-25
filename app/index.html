@@ -189,40 +189,53 @@
   </main>
 
   <!-- ── compute ──────────────────────────────────────────────────────
-       The second way in. A Maple-like pane driven by the CAS calls, in the
-       SAME grid cell as the workspace, so the two are alternatives and never
-       both on screen; which one is showing is a class on <body>.
+       The second way in: a WORKSHEET, not a form. A scrolling document of
+       lines you have run, each with its result beneath it, and the live
+       prompt at the bottom — Maple's shape, in the SAME grid cell as the
+       workspace, so the two are alternatives and never both on screen.
 
-       The input surface is a MathField - the same class every row in the
-       system pane uses - because there is one way to type mathematics in this
-       product and a text box would be a second one. Results are rendered the
-       same way, from the Numpla source the CAS returns, which is also why a
-       result can be pressed straight back into the input. -->
+       Commands are typed, not clicked: `solve(2x = 2, x)`, `diff(x^3, x)`,
+       `evalf(pi)`. Enter evaluates; a bare expression is `eval`. The strip
+       under the prompt is the phone's Tab key — it TYPES a command into the
+       line rather than running one — and the ditto keys put a previous
+       result where the caret is.
+
+       The prompt is a MathField - the same class every row in the system
+       pane uses - because there is one way to type mathematics in this
+       product and a text box would be a second one. Results are rendered
+       the same way, from the Numpla source the CAS returns, which is also
+       why a result can be pressed straight back into the line. -->
   <section class="compute" id="compute" aria-label="Compute">
     <div class="compute__head">
-      <h2 class="compute__title">compute</h2>
-      <p class="compute__note" id="compute-note">simplify · differentiate · expand · evaluate</p>
+      <h2 class="compute__title">worksheet</h2>
+      <p class="compute__note" id="compute-note">solve · eval · evalf · equal · diff</p>
       <button id="compute-clear" class="framebtn" type="button"
-              title="Empty the history">clear</button>
+              title="Empty the worksheet">clear</button>
     </div>
+
+    <!-- The document. Everything that has been run, oldest at the top, each
+         input with its result under it. Kept as `compute-log` because that is
+         the name the shell and the suite already know it by. -->
+    <div class="compute__sheet" id="compute-log" role="log" aria-label="Worksheet"></div>
 
     <div class="compute__io">
-      <div class="compute__field" id="compute-field"></div>
-      <div class="compute__row">
-        <!-- Built in main.js, one button per call the build actually has, so a
-             WASM without `cas_expand` shows three buttons and says why. -->
-        <div class="compute__ops" id="compute-ops" role="group" aria-label="Operations"></div>
-        <label class="compute__var">
-          <span>d/d</span>
-          <input id="compute-var" type="text" value="x" spellcheck="false"
-                 autocomplete="off" aria-label="Differentiate with respect to">
-        </label>
+      <div class="compute__prompt">
+        <span class="compute__gutter" id="compute-gutter" aria-hidden="true">[1]</span>
+        <div class="compute__field" id="compute-field"></div>
+        <button id="compute-run" class="compute__run" type="button"
+                title="Evaluate this line (Enter)">enter</button>
       </div>
+      <!-- What the caret is standing in, or what Tab would complete: the
+           signature, while you are choosing. Built in main.js. -->
+      <p class="compute__sig" id="compute-sig"></p>
+      <!-- One chip per command the build actually has, plus the ditto keys.
+           A chip TYPES; it never runs. Built in main.js. -->
+      <div class="compute__ops" id="compute-ops" role="group" aria-label="Commands"></div>
     </div>
 
-    <div class="compute__log" id="compute-log" role="log" aria-label="Results"></div>
     <p class="compute__foot" id="compute-foot"></p>
   </section>
+
 
   <!-- ── the start screen ─────────────────────────────────────────────
        Not a second gate bolted onto the loader: it lives INSIDE the app shell,
@@ -254,8 +267,8 @@
             </svg>
           </span>
           <span class="choice__name">Compute</span>
-          <span class="choice__why" id="choice-compute-why">Type an expression and
-            simplify, differentiate, expand or evaluate it.</span>
+          <span class="choice__why" id="choice-compute-why">A worksheet: type
+            solve(2x = 2, x), diff(x^3, x), evalf(pi) — Enter evaluates.</span>
         </button>
       </div>
       <p class="chooser__foot" id="chooser-foot">The logo brings you back here.</p>

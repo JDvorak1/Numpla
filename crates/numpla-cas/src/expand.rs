@@ -11,7 +11,8 @@
 
 use numpla_expr::{BinOp, Expr};
 
-use crate::simplify::{bin, neg, simplify};
+use crate::num::as_integer;
+use crate::simplify::{bin, neg, provably_positive, simplify_keeping_logs_apart};
 
 /// The largest integer power of a sum that will be multiplied out.
 ///
@@ -42,7 +43,9 @@ pub fn expand(e: &Expr) -> Expr {
 /// are what the code actually computed, in that order.
 pub fn expand_with_steps(e: &Expr) -> (Expr, Expr) {
     let distributed = distribute(e);
-    let collected = simplify(&distributed);
+    // Not the ordinary `simplify`: that one collects `ln u + ln v` back into
+    // `ln(u v)`, which is the opposite of what was just asked for.
+    let collected = simplify_keeping_logs_apart(&distributed);
     (distributed, collected)
 }
 
@@ -50,11 +53,18 @@ fn distribute(e: &Expr) -> Expr {
     match e {
         Expr::Num(_) | Expr::Var(_) | Expr::Deriv { .. } | Expr::Hole => e.clone(),
         Expr::List(items) => Expr::List(items.iter().map(distribute).collect()),
-        Expr::Call { name, args } => Expr::Call {
-            name: name.clone(),
-            args: args.iter().map(distribute).collect(),
-        },
-        Expr::Neg(a) => neg(distribute(a)),
+        Expr::Call { name, args } => {
+            let call = Expr::Call {
+                name: name.clone(),
+                args: args.iter().map(distribute).collect(),
+            };
+            split_transcendental(&call).unwrap_or(call)
+        }
+        // A negation is a product by -1, so it distributes: `-(x + y)` is
+        // `-x - y`. Wrapping it instead - which is what `neg` alone would do -
+        // leaves the one product in the language that `expand` was not
+        // expanding.
+        Expr::Neg(a) => cross(&Expr::Num(-1.0), &distribute(a)),
         Expr::Bin { op, lhs, rhs } => {
             let (l, r) = (distribute(lhs), distribute(rhs));
             match op {
@@ -72,6 +82,60 @@ fn distribute(e: &Expr) -> Expr {
                 BinOp::Pow => integer_power(&l, &r),
             }
         }
+    }
+}
+
+/// The logarithm laws, in the direction that breaks one call into several.
+///
+/// This is where `expand` has to be more careful than a textbook:
+/// `ln((-2)(-3))` is `ln 6`, while `ln(-2) + ln(-3)` is not a number at all. So
+/// a product is only split when both factors are *provably* positive, and a
+/// power only when the exponent is an odd integer — where `u^n < 0` for `u < 0`
+/// makes the input undefined too, so nothing is lost — or the base is provably
+/// positive.
+///
+/// The conditional forms are not thrown away: [`crate::equal`] offers them with
+/// the condition written out, which is where a rewrite that holds on part of
+/// the domain belongs.
+///
+/// **`exp(u + v) -> exp(u) exp(v)` is deliberately absent.** It is an exact
+/// identity in the reals and a trap in floating point: `exp(500 - 500)` is `1`
+/// and `exp(500)/exp(500)` is `inf/inf`, so the rewrite turns an ordinary
+/// number into a NaN on a perfectly reasonable input. Splitting a logarithm
+/// only ever makes the intermediate values *smaller*, which is why that
+/// direction is safe and this one is not. `equal` offers it, where a candidate
+/// is something you choose rather than something you are given.
+fn split_transcendental(e: &Expr) -> Option<Expr> {
+    let Expr::Call { name, args } = e else {
+        return None;
+    };
+    if args.len() != 1 {
+        return None;
+    }
+    match (name.as_str(), &args[0]) {
+        ("ln", Expr::Bin { op: op @ (BinOp::Mul | BinOp::Div), lhs, rhs })
+            if provably_positive(lhs) && provably_positive(rhs) =>
+        {
+            let part = |u: &Expr| Expr::Call { name: "ln".into(), args: vec![u.clone()] };
+            Some(bin(
+                if *op == BinOp::Mul { BinOp::Add } else { BinOp::Sub },
+                part(lhs),
+                part(rhs),
+            ))
+        }
+        ("ln", Expr::Bin { op: BinOp::Pow, lhs, rhs }) => {
+            let odd = crate::num::const_value(rhs)
+                .and_then(as_integer)
+                .is_some_and(|n| n % 2 != 0);
+            (odd || provably_positive(lhs)).then(|| {
+                bin(
+                    BinOp::Mul,
+                    (**rhs).clone(),
+                    Expr::Call { name: "ln".into(), args: vec![(**lhs).clone()] },
+                )
+            })
+        }
+        _ => None,
     }
 }
 

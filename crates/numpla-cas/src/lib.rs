@@ -22,10 +22,23 @@
 //! In:
 //!
 //! - [`simplify`] — arithmetic folding, identity and zero laws, like terms,
-//!   canonical ordering of commutative operands.
+//!   canonical ordering of commutative operands, exact radicals, and the
+//!   logarithm laws in the combining direction.
 //! - [`diff`] — sum, product, quotient, chain and power rules, and every
 //!   builtin `numpla-expr` can evaluate.
-//! - [`expand`] — products over sums, and small integer powers of sums.
+//! - [`expand`] — products over sums, small integer powers of sums, and the
+//!   logarithm laws in the splitting direction where they hold unconditionally.
+//! - [`factor`] — over the rationals, completely for one variable.
+//! - [`solve`] — one equation, one unknown. Polynomials through their rational
+//!   roots, quadratics and biquadratics in closed form, and anything the
+//!   unknown occurs once in, by inverting the operations around it. Everything
+//!   else is refused by name; the list is in [`solve`]'s own docs.
+//! - [`sum`] and [`product`] — closed forms for the shapes that have one, the
+//!   series itself over numeric limits, and a refusal otherwise.
+//! - [`equal`] — every equivalent form the crate can find, as a list to choose
+//!   from, each labelled and each carrying its condition if it has one.
+//! - [`identify`] — inverse symbolic lookup: a number back to a closed form,
+//!   labelled as a numeric match rather than as a proof.
 //! - [`subs`] and [`value`] — substitution and numeric evaluation.
 //!
 //! Out, deliberately, and not half-done:
@@ -33,16 +46,33 @@
 //! - **Symbolic integration.** There is no algorithm short of Risch that gives
 //!   an honest answer, and a table lookup that silently fails on `exp(-x^2)` is
 //!   the kind of tool that teaches people not to trust the tool.
-//! - **Equation solving.** `numpla`'s answer to "solve this" is to integrate
-//!   it; a symbolic root-finder that handles quadratics and gives up on cubics
-//!   would be a worse promise than none.
-//! - **Limits and series.** Both need an ordering on growth rates that this
-//!   representation does not have.
+//! - **The cubic and quartic formulas.** [`solve`] finds every *rational* root
+//!   of any polynomial and finishes a quadratic or biquadratic remainder. It
+//!   will not print Cardano: nested radicals nobody can check are not an
+//!   answer, and in the casus irreducibilis they are a real root written as a
+//!   sum of complex numbers.
+//! - **Complex numbers.** `numpla-expr` evaluates over `f64`, so `x^2 = -1` has
+//!   no solutions here and the refusal says which field it means.
+//! - **Limits and series expansions.** Both need an ordering on growth rates
+//!   that this representation does not have. (`sum` and `product` are finite;
+//!   an infinite series is not offered.)
 //! - **Matrices.** `numpla-linalg` is where linear algebra lives; a second,
 //!   symbolic notion of a matrix here would be a fork of it.
 //!
-//! Asking for any of them is not a failure mode this crate has: there is no
-//! function to call. That is the honest form of "out of scope".
+//! Asking for any of them is not a failure mode this crate has: either there is
+//! no function to call, or the refusal names itself. That is the honest form of
+//! "out of scope".
+//!
+//! # One assumption, stated once
+//!
+//! `pi`, `tau` and `e` are read as the constants `numpla-expr` gives them. They
+//! are ordinary names that a document is free to bind to something else, and if
+//! one does, the algebra here is answering a question about a different
+//! expression than the document is. The alternative — refusing to fold `sqrt(2)`
+//! in case somebody rebound `e` — would make the CAS useless to everyone in
+//! order to be right about nobody. The one place this rule is *not* taken is
+//! inside [`simplify`], where a rewrite happens without being asked for: there,
+//! only literals count as positive.
 //!
 //! # Depends only on `numpla-expr`
 //!
@@ -52,8 +82,15 @@
 
 pub mod diff;
 pub mod expand;
+pub mod factor;
+pub mod forms;
+pub mod identify;
+pub mod num;
+pub mod poly;
 pub mod print;
+pub mod series;
 pub mod simplify;
+pub mod solve;
 
 use std::collections::HashMap;
 use std::fmt;
@@ -62,8 +99,13 @@ use numpla_expr::{Env, EvalError, Expr, Value};
 
 pub use diff::{diff, diff_with_steps};
 pub use expand::{expand, expand_with_steps};
+pub use factor::factor;
+pub use forms::{equal, Condition, Form, FormKind, Guard};
+pub use identify::{identify, Identified};
 pub use print::to_source;
+pub use series::{product, sum, Closed};
 pub use simplify::simplify;
+pub use solve::{check_root, solve, unknowns, RootCheck, Solutions};
 
 /// Why a CAS call could not answer.
 ///

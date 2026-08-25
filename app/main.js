@@ -137,15 +137,17 @@ const el = {
   choiceCompute: $('choice-compute'),
   choiceWhy:     $('choice-compute-why'),
 
-  // the compute pane
-  compute:      $('compute'),
-  computeField: $('compute-field'),
-  computeOps:   $('compute-ops'),
-  computeVar:   $('compute-var'),
-  computeLog:   $('compute-log'),
-  computeFoot:  $('compute-foot'),
-  computeNote:  $('compute-note'),
-  computeClear: $('compute-clear'),
+  // the compute pane - a worksheet, not a form
+  compute:       $('compute'),
+  computeField:  $('compute-field'),
+  computeOps:    $('compute-ops'),
+  computeSig:    $('compute-sig'),
+  computeGutter: $('compute-gutter'),
+  computeRun:    $('compute-run'),
+  computeLog:    $('compute-log'),
+  computeFoot:   $('compute-foot'),
+  computeNote:   $('compute-note'),
+  computeClear:  $('compute-clear'),
 
   // narrow layout
   panetabs:  $('panetabs'),
@@ -276,8 +278,18 @@ function parseJson(text, what) {
 
 let M = null;             // { setSource, solve, sample, eval }
 let ModelCtor = null;     // the Model class itself - demo previews need their own
+
 let MathField = null;     // the class from ./mathfield.js
 let funcNames = () => []; // MathField's functionNamesIn, bound at boot
+
+/**
+ * The two pure helpers out of mathfield.js that the worksheet's `%` key needs.
+ * A ditto REPLACES what the last one left rather than stacking a second copy,
+ * and a replacement is a splice, which the field's own insert() cannot do.
+ * Probed like everything else - a mathfield.js that predates these exports
+ * costs the walk-back and nothing else (see insertDitto).
+ */
+const mfKit = { curList: null, parseSource: null };
 
 // ---------------------------------------------------------------------------
 // Application state
@@ -569,6 +581,10 @@ function refreshDocumentNames() {
       console.error('[numpla] MathField.setDocumentNames threw', err);
     }
   }
+  // The worksheet reads the same document: its prompt completes the document's
+  // own function names beside the commands, and `f(x)` there is the call an
+  // `f(u) = u^2` row made it. One vocabulary, two panes.
+  syncCasNames();
   // The keyboard's name row is the same fact, drawn as keys.
   renderKeyboardVars();
 }
@@ -2902,43 +2918,118 @@ globalThis.__numplaInspect = {
   /** Go somewhere without pressing the card - the same call the card makes. */
   setRoute: (name) => setRoute(name, false),
 
-  /** The compute pane as it stands: what it can do, what is typed, what it said. */
+  /**
+   * The worksheet as it stands: what this build can do, what is in the prompt,
+   * and every line that has been run - with the `equal` candidates and their
+   * exact/numeric flags, because "is this shown as a proof or as a guess" is a
+   * question the suite has to be able to ask.
+   */
   cas: () => ({
     available: !!casApi,
-    ops: CAS_CALLS.filter((c) => casApi && casApi[c.id]).map((c) => c.id),
+    ops: casVerbs.filter((c) => HAVE_CALL(c)).map((c) => c.id),
+    dispatch: !!(casApi && casApi.command) ? 'cas_command' : 'the shell',
+    listed: !!(casApi && casApi.commands),
+    commands: casVerbs.map((c) => ({
+      id: c.id, sig: c.sig, rust: c.rust, have: HAVE_CALL(c),
+    })),
     mounted: casMounted,
     input: casInput ? casInput.source : '',
     lastOp: casLastOp,
-    log: casLog.map((e) => ({ op: e.op, input: e.input, output: e.output, error: e.error })),
+    seq: casSeq,
+    sig: el.computeSig ? el.computeSig.textContent : '',
+    /** What `%`, `%%` and `%%%` currently stand for, by entry number. */
+    ditto: [1, 2, 3].map((n) => {
+      const e = dittoEntry(n);
+      return e ? { n: e.n, output: e.output, source: dittoSource(e) } : null;
+    }),
+    lastPick: casLastPick,
+    log: casLog.map((e) => ({
+      n: e.n, op: e.op, input: e.input, output: e.output, error: e.error,
+      pending: !!e.pending, inferred: e.inferred || '',
+      forms: e.forms ? e.forms.map((f) => ({ ...f })) : null,
+    })),
   }),
 
   /**
    * Swap the CAS calls out. `false` is "this build has none", an object is a
    * stub, and null/undefined restores whatever the real probe found - the same
-   * three-way switch `setApis` gives the field and seed calls.
+   * three-way switch `setApis` gives the field and seed calls. A stub that
+   * omits a key is a build that lacks that call, which is how the suite proves
+   * the worksheet refuses by name instead of throwing.
    */
   setCasApi: (next) => {
     casApi = next === false ? null
            : (next == null ? probedCas : next);
-    syncChooser();
-    syncComputeNote();
-    if (casMounted) renderCasOps();
+    syncCas();
     if (!casApi && route === 'compute') setRoute('solve', false);
     return !!casApi;
   },
 
-  /** Type into the compute field, through the field's own typing path. */
-  typeCas: (text) => {
-    if (!casInput) return '';
-    try { casInput.insert(String(text)); } catch (err) { console.error(err); }
-    return casInput.source;
+  /**
+   * Type into the prompt, through the pane's own typing path - which is the
+   * field's, except for the two characters the worksheet claims.
+   */
+  typeCas: (text) => casType(text),
+
+  /** Empty the prompt, the way selecting everything and deleting would. */
+  clearCas: () => {
+    if (casInput) casInput.source = '';
+    dittoMark = null;
+    syncCasSig();
+    return casInput ? casInput.source : '';
   },
 
-  /** Empty it, the way selecting everything and deleting would. */
-  clearCas: () => { if (casInput) casInput.source = ''; return casInput ? casInput.source : ''; },
+  /**
+   * Run a line. With no argument it runs what is in the prompt, exactly as
+   * Enter does; with one it runs that text, which is how a line carrying a
+   * literal `%` can be driven when `%` is not a character the field types.
+   */
+  runCompute: (text) => runWorksheet(text == null ? undefined : String(text)),
 
-  /** Run one operation, exactly as its button does. */
-  runCas: (op) => runCas(op),
+  /** Enter: run the prompt and clear it. Returns the entry. */
+  enterCompute: () => submitWorksheet(),
+
+  /** The ditto substitution on its own, before anything is parsed or sent. */
+  expandDitto: (text) => expandDitto(String(text)),
+
+  /**
+   * Press `%`. A level runs straight to it; `null` is what the key does -
+   * one back, then two, then three, while the line is otherwise untouched.
+   * Returns { level, input }.
+   */
+  pressDitto: (level) => ({
+    level: insertDitto(level == null ? null : Number(level)),
+    input: casInput ? casInput.source : '',
+  }),
+
+  /** Press Tab in the prompt, through the field's own command API. */
+  tabCas: () => {
+    if (!casInput) return { input: '', menu: false };
+    try { casInput.command('tab'); } catch (err) { console.error(err); }
+    syncCasSig();
+    return { input: casInput.source, menu: !!casInput.menuOpen };
+  },
+
+  /**
+   * Where the caret is in the prompt. The proof that Tab left it INSIDE the
+   * parentheses is structural - a path one level deep into the call's group -
+   * and no amount of looking at the source can show it.
+   */
+  casCaret: () => {
+    const st = casInput && casInput.model && casInput.model.st;
+    if (!st) return null;
+    return { path: JSON.parse(JSON.stringify(st.path)), index: st.index };
+  },
+
+  /** Tap a command chip: it TYPES the command, it does not run it. */
+  typeCommand: (id) => typeCommand(String(id)),
+
+  /** Pick one of an `equal` entry's candidate forms, by entry number. */
+  pickForm: (n, index) => {
+    const entry = casLog.find((e) => e.n === Number(n));
+    if (!entry) return '';
+    return pickForm(entry, Number(index));
+  },
 
   /**
    * Swap the optional calls out. The suite uses this twice: with `null`, to
@@ -3698,18 +3789,90 @@ const REFERENCE = [
   },
 ];
 
+/** One entry, flattened, with the text the search matches against. */
+function refFlatten(group, e) {
+  return {
+    ...e,
+    group: group.group,
+    asRow: e.asRow || !!group.rows,
+    insert: e.insert != null ? e.insert : (group.rows ? e.sig : ''),
+    hay: [group.group, e.sig, e.desc, e.keys || ''].join(' ').toLowerCase(),
+  };
+}
+
 /** Everything flattened once, with the text the search matches against. */
 const REF_ENTRIES = [];
 for (const g of REFERENCE) {
-  for (const e of g.entries) {
-    REF_ENTRIES.push({
-      ...e,
-      group: g.group,
-      asRow: e.asRow || !!g.rows,
-      insert: e.insert != null ? e.insert : (g.rows ? e.sig : ''),
-      hay: [g.group, e.sig, e.desc, e.keys || ''].join(' ').toLowerCase(),
+  for (const e of g.entries) REF_ENTRIES.push(refFlatten(g, e));
+}
+
+/**
+ * The worksheet's commands, in the reference, from the ONE list that also
+ * binds them, completes them and draws the strip. The panel is where "what can
+ * I type here?" is answered; making the worksheet answer it somewhere else
+ * would be a second reference, and a second reference is one that goes stale.
+ *
+ * Rebuilt every time the panel is drawn, because that list comes from the
+ * MODULE when the module can supply it (cas_commands()) - so a verb added to
+ * numpla-cas is documented here without an edit, exactly as a method added to
+ * numpla-ode reaches the integrator group.
+ */
+const COMPUTE_GRAMMAR = [
+  { sig: '%  %%  %%%',
+    desc: "The ditto operator, Maple's own: " +
+      '% is the previous result, %% the one before, %%% the one before that. ' +
+      'It is substituted BEFORE the line is parsed, so diff(x^3, x) then ' +
+      'solve(% = 12) retypes nothing. A line that REFUSED produced no expression, ' +
+      'so % steps straight over it and still means the last real result — and the ' +
+      'pane says which entry it reached, by number, every time. equal() does not ' +
+      'move it either: it answers with a list, and picking from the list is how ' +
+      'you take one.',
+    keys: 'compute worksheet ditto previous result percent history maple' },
+  { sig: 'Enter',
+    desc: 'Runs the line and puts it in the sheet with its result beneath it. ' +
+      'A bare expression with no command is eval.',
+    keys: 'compute worksheet run evaluate enter' },
+  { sig: 'Tab',
+    desc: 'Completes a command name in the worksheet: sol then Tab is solve(⎸), ' +
+      'caret inside the parentheses. The same completion the document rows use, ' +
+      "driven by the command list instead of the document's names. " +
+      'The chips under the line do the same thing for a screen with no Tab key.',
+    keys: 'compute worksheet tab complete completion autocomplete' },
+];
+
+function registerComputeReference(calls, extra) {
+  const group = {
+    group: 'Compute commands',
+    note: "The worksheet's vocabulary — the second route, on the start screen. " +
+      'Typed as functions, never chosen from buttons: Enter runs the line, and a bare ' +
+      'expression with no command is eval. Insert puts one in the line with the caret ' +
+      'inside its parentheses, which is exactly what Tab does there.',
+    entries: [],
+  };
+  for (const c of calls) {
+    group.entries.push({
+      sig: c.sig,
+      desc: c.hint.charAt(0).toUpperCase() + c.hint.slice(1) + '.' +
+        (HAVE_CALL(c) ? '' : ' Not in this build — it needs ' + c.rust + '().'),
+      insert: c.id + '(',
+      keys: 'compute worksheet command cas ' + c.id + ' ' + c.rust,
     });
   }
+  for (const e of extra) group.entries.push(e);
+
+  // Replace, never append: this runs again whenever the panel is drawn.
+  const at = REFERENCE.findIndex((g) => g.group === group.group);
+  if (at >= 0) REFERENCE.splice(at, 1, group); else REFERENCE.push(group);
+  for (let i = REF_ENTRIES.length - 1; i >= 0; i--) {
+    if (REF_ENTRIES[i].group === group.group) REF_ENTRIES.splice(i, 1);
+  }
+  for (const e of group.entries) REF_ENTRIES.push(refFlatten(group, e));
+  return group;
+}
+
+/** The compute group, from the verbs this build actually offers. */
+function syncComputeReference() {
+  registerComputeReference(casVerbs, COMPUTE_GRAMMAR);
 }
 
 let refSelection = -1;      // index into the entries currently rendered
@@ -3719,9 +3882,30 @@ function refFoot(msg) {
   el.infoFoot.textContent = msg;
 }
 
-/** Write an entry into the document. Rows become rows; the rest is typed. */
+/**
+ * Write an entry into whatever is on screen. In the workspace that is the
+ * document - rows become rows, the rest is typed into the row that last had
+ * the caret. In the worksheet there are no rows, so everything is typed into
+ * the prompt: `insert` on `solve(2x = 2, x)` leaves `solve(⎸)` in the line,
+ * which is what Tab does there and what the reference is FOR.
+ */
 function insertEntry(entry) {
   if (!entry || !entry.insert) return;
+
+  if (route === 'compute' && casInput) {
+    try {
+      casInput.insert(entry.insert);
+    } catch (err) {
+      console.error('[numpla] inserting from the reference threw', err);
+      return;
+    }
+    closeInfo();
+    dittoMark = null;
+    syncCasSig();
+    try { casInput.focus(); } catch (err) { /* best effort */ }
+    casFoot(entry.sig + ' — in the line');
+    return;
+  }
 
   if (entry.asRow) {
     const row = makeRow(entry.insert, realRowCount());   // before the blank one
@@ -3812,6 +3996,9 @@ function selectRef(i) {
 }
 
 function renderReference() {
+  // The worksheet's verbs can change under us - a stub in the suite, a
+  // rebuilt app/pkg/ - so the group is rebuilt rather than remembered.
+  syncComputeReference();
   const q = (el.infoSearch.value || '').trim().toLowerCase();
   const terms = q ? q.split(/\s+/) : [];
   const match = (e) => terms.every((t) => e.hay.indexOf(t) >= 0);
@@ -4556,13 +4743,16 @@ function pressKey(key) {
 
   let handled = false;
   if (key.act === 'newrow') {
-    // In the compute pane there is no row below: Enter runs the operation.
-    if (row.compute) runCas(casLastOp); else insertAfter(row);
+    // In the worksheet there is no row below: Enter runs the line.
+    if (row.compute) submitWorksheet(); else insertAfter(row);
     handled = true;
   } else if (key.cmd) {
     handled = fieldCommand(row.field, key.cmd, row);
   } else if (key.ins != null) {
-    handled = fieldInsert(row.field, key.ins);
+    // In the worksheet, `=` and `%` are the pane's, not the field's.
+    handled = (row.compute && (key.ins === '=' || key.ins === '%'))
+      ? (casType(key.ins), true)
+      : fieldInsert(row.field, key.ins);
     // A function name wants its argument next, and an argument is digits.
     if (key.act === 'fn') setKeyboardPage('123');
   }
@@ -4974,39 +5164,101 @@ function wire() {
 // The CAS calls
 //
 // Probed, never assumed - app/pkg/ can be older than the crate, exactly as it
-// can for `vector_field` and `trajectory_from`. Each call returns JSON:
+// can for `vector_field` and `trajectory_from`.
 //
-//     { ok, input, output, steps?, error? }
+// There are two ways in, and the shell uses the better one when it is there:
 //
-// and `output` is Numpla SOURCE, which is the whole reason a result can be
-// rendered as mathematics and pressed straight back into the input: it goes
-// through the same parser the rest of the product uses.
+//   cas_command(line, history)  ONE line, as typed. The crate parses it,
+//                               substitutes `%` from the history, checks the
+//                               arity and dispatches - and answers
+//                               { command, source, reply }. Switching on
+//                               `command` is how the reply's shape is known.
 //
-// A build with none of them does not get a Compute route. The chooser says so
-// on the card rather than opening a pane with four dead buttons.
+//   cas_solve / cas_equal / ... the individual verbs, for a caller that has
+//                               already parsed. This shell can parse, so a
+//                               build without cas_command is still a worksheet
+//                               - it just has the shell's reading of a line
+//                               instead of the crate's.
+//
+// `cas_commands()` is the third: the verb names and signatures, in menu order,
+// FROM THE MODULE. Tab completion, the strip and the reference are built from
+// it when it is there, so a verb added to numpla-cas reaches all three without
+// an edit here - the same rule `Model.methods()` already earns on the plot.
+//
+// A build with NONE of them does not get a Compute route. A build with SOME of
+// them gets a worksheet where the verbs it lacks refuse by name.
 // ---------------------------------------------------------------------------
 
+/**
+ * The shell's own table of the verbs. It is the fallback when the module
+ * cannot list them, and it is where the hints and the argument counts live
+ * whatever the module says - a signature tells you the shape of a call, and a
+ * sentence tells you what it is for.
+ *
+ *   args    [least, most] arguments, for the shell's own reading of a line
+ *   varArg  index of an optional variable argument, inferred when left out
+ *   forms   true when the reply is a candidate LIST rather than one expression
+ */
 const CAS_CALLS = [
-  { id: 'simplify', rust: 'cas_simplify', camel: 'casSimplify',
-    label: 'simplify', vars: false, hint: 'fold arithmetic, collect like terms, order canonically' },
-  { id: 'diff', rust: 'cas_diff', camel: 'casDiff',
-    label: 'd/d', vars: true, hint: 'differentiate with respect to one variable' },
-  { id: 'expand', rust: 'cas_expand', camel: 'casExpand',
-    label: 'expand', vars: false, hint: 'distribute products over sums' },
-  { id: 'eval', rust: 'cas_eval', camel: 'casEval',
-    label: 'evaluate', vars: false, hint: 'a number where there is one' },
+  { id: 'solve', rust: 'cas_solve', camel: 'casSolve', args: [1, 2], varArg: 1,
+    sig: 'solve(2x = 2, x)',
+    hint: 'the solutions; the unknown may be left out when there is only one' },
+  { id: 'eval', rust: 'cas_eval', camel: 'casEval', args: [1, 1],
+    sig: 'eval(e)',
+    hint: 'the best exact form the CAS can reach — what a bare expression runs' },
+  { id: 'evalf', rust: 'cas_evalf', camel: 'casEvalf', args: [1, 1],
+    sig: 'evalf(e)', hint: 'a number, always' },
+  { id: 'equal', rust: 'cas_equal', camel: 'casEqual', args: [1, 1], forms: true,
+    sig: 'equal(e)',
+    hint: 'every equivalent form it can find, as a list to choose from' },
+  { id: 'simplify', rust: 'cas_simplify', camel: 'casSimplify', args: [1, 1],
+    sig: 'simplify(e)',
+    hint: 'fold arithmetic, collect like terms, order canonically' },
+  { id: 'expand', rust: 'cas_expand', camel: 'casExpand', args: [1, 1],
+    sig: 'expand(e)', hint: 'distribute products over sums' },
+  { id: 'factor', rust: 'cas_factor', camel: 'casFactor', args: [1, 1],
+    sig: 'factor(e)', hint: 'the other direction: write it as a product' },
+  { id: 'diff', rust: 'cas_diff', camel: 'casDiff', args: [1, 2], varArg: 1,
+    sig: 'diff(x^3, x)',
+    hint: 'differentiate; the variable may be left out when there is only one' },
+  { id: 'sum', rust: 'cas_sum', camel: 'casSum', args: [4, 4],
+    sig: 'sum(k, k, 1, n)',
+    hint: 'closed form where one exists, else a number' },
+  { id: 'product', rust: 'cas_product', camel: 'casProduct', args: [4, 4],
+    sig: 'product(k, k, 1, n)',
+    hint: 'closed form where one exists, else a number' },
+  { id: 'subs', rust: 'cas_subs', camel: 'casSubs', args: [2, 2],
+    sig: 'subs(x = 3, e)', hint: 'substitution' },
 ];
 
-/** Bind whichever of the four this build has. Null when it has none. */
-export function probeCasApi(model) {
+/**
+ * The verbs as the pane knows them right now: the table above, with the
+ * module's own signatures laid over it and any verb the module has that the
+ * table does not. Rebuilt whenever the API changes.
+ */
+let casVerbs = CAS_CALLS.slice();
+
+const casCall = (id) => casVerbs.find((c) => c.id === id) ||
+                        CAS_CALLS.find((c) => c.id === id) || null;
+
+/** Every command name, in menu order. The Tab completion list. */
+const casNames = () => casVerbs.map((c) => c.id);
+
+/** Bind whichever of them this build has. Null when it has none. */
+export function probeCasApi(model, ctor) {
   if (!model) return null;
   const api = {};
-  for (const c of CAS_CALLS) {
-    const name = typeof model[c.rust] === 'function' ? c.rust
-               : typeof model[c.camel] === 'function' ? c.camel
+  const bind = (key, snake, camel, on) => {
+    const host = on || model;
+    const name = host && typeof host[snake] === 'function' ? snake
+               : host && typeof host[camel] === 'function' ? camel
                : null;
-    if (name) api[c.id] = (...args) => model[name](...args);
-  }
+    if (name) api[key] = (...args) => host[name](...args);
+  };
+  for (const c of CAS_CALLS) bind(c.id, c.rust, c.camel);
+  bind('command', 'cas_command', 'casCommand');
+  // `cas_commands()` takes no `&self`, so wasm-bindgen puts it on the CLASS.
+  bind('commands', 'cas_commands', 'casCommands', ctor || model.constructor);
   return Object.keys(api).length ? api : null;
 }
 
@@ -5014,29 +5266,87 @@ let casApi = null;
 let probedCas = null;          // what the probe found, so a stub can be undone
 
 const CAS_MISSING =
-  'Not in this build: the compute core has no cas_simplify, cas_diff, ' +
-  'cas_expand or cas_eval. Rebuild it to turn this on.';
+  'Not in this build: the compute core has no cas_command, cas_simplify, ' +
+  'cas_diff, cas_expand or cas_eval. Rebuild it to turn this on.';
+
+/**
+ * Can this build run this verb? `cas_command` runs all of them, because it is
+ * the thing that dispatches; without it, the verb needs its own call.
+ */
+const HAVE_CALL = (c) => !!(casApi && c && (casApi.command || casApi[c.id]));
+
+/** The module's own list of verbs, when it has one. */
+function moduleVerbs() {
+  if (!casApi || !casApi.commands) return null;
+  let raw;
+  try {
+    raw = casApi.commands();
+  } catch (err) {
+    console.error('[numpla] cas_commands() threw', err);
+    return null;
+  }
+  const list = parseJson(String(raw), 'cas_commands');
+  if (!Array.isArray(list) || !list.length) return null;
+  const out = [];
+  for (const item of list) {
+    const name = item && typeof item.name === 'string' ? item.name.trim() : '';
+    if (!name) continue;
+    const sig = item && typeof item.signature === 'string' ? item.signature.trim() : '';
+    out.push({ name, sig });
+  }
+  return out.length ? out : null;
+}
+
+/**
+ * Re-derive the verb list. The module's order and signatures win; the table's
+ * hints, argument counts and Rust names are kept, because the module does not
+ * carry those. A verb only the module knows is offered when `cas_command` can
+ * dispatch it - the shell has no call of its own to make for it.
+ */
+function syncCasVerbs() {
+  const listed = moduleVerbs();
+  if (!listed) { casVerbs = CAS_CALLS.slice(); return; }
+  const out = [];
+  for (const v of listed) {
+    const known = CAS_CALLS.find((c) => c.id === v.name);
+    if (known) { out.push({ ...known, sig: v.sig || known.sig }); continue; }
+    if (!casApi.command) continue;
+    out.push({
+      id: v.name, rust: 'cas_' + v.name, camel: 'cas' + v.name,
+      args: [1, 9], sig: v.sig || v.name + '(e)',
+      hint: 'this build has it; this shell has no note for it yet',
+    });
+  }
+  for (const c of CAS_CALLS) {
+    if (!out.some((v) => v.id === c.id)) out.push({ ...c });
+  }
+  casVerbs = out;
+}
 
 // ---------------------------------------------------------------------------
-// The compute pane
+// The worksheet
 //
-// Input on top, history below. The input surface is a MathField - the same
-// class every row in the system pane uses - because there is exactly one way to
-// type mathematics in this product and a text box would be a second one. Every
-// result is rendered by another MathField, with its editing switched off, so
-// mathematics comes back as mathematics rather than as a line of source.
+// A DOCUMENT, not a form: what you ran, with its result under it, then the
+// next thing you ran, scrolling back as far as you like — and the live prompt
+// at the bottom, which is where a REPL and a Maple worksheet both put it. The
+// prompt sits OUTSIDE the scroller on purpose: nothing above a scroller may
+// change size because a result arrived, which is the same layout rule the
+// system pane follows.
 //
-// What it does NOT do, and says so instead of half-doing it: symbolic
-// integration, equation solving, limits, series, matrices.
+// Commands are typed, not clicked. `solve(2x = 2, x)`. `diff(x^3, x)`.
+// `evalf(pi)`. Enter runs the line; a bare expression with no command is
+// `eval`. The chips under the prompt TYPE a command into the line - they are
+// the phone's Tab key, since a phone has no Tab - and they never run one.
 // ---------------------------------------------------------------------------
 
-const CAS_LOG_MAX = 80;
+const CAS_LOG_MAX = 60;
 
-let casInput = null;           // the MathField the user types into
+let casInput = null;           // the MathField the prompt is
 let casMounted = false;
-let casLastOp = 'simplify';
-const casLog = [];             // { op, input, output, error }
-const casDisplays = [];        // the read-only fields currently in the log
+let casSeq = 0;                // the number in the gutter, monotone
+let casLastOp = '';            // the last command that ran, for the hook
+const casLog = [];             // see absorbReply() for the shape
+const casDisplays = [];        // the read-only fields currently in the sheet
 
 /** The pseudo-row the math keyboard types into while `compute` is on screen. */
 let casRowCache = null;
@@ -5046,11 +5356,6 @@ function casRow() {
     casRowCache = { field: casInput, el: el.compute, compute: true };
   }
   return casRowCache;
-}
-
-function casVarName() {
-  const raw = el.computeVar ? String(el.computeVar.value || '').trim() : '';
-  return raw || 'x';
 }
 
 function casFoot(text, bad) {
@@ -5067,11 +5372,19 @@ function syncComputeNote() {
     el.computeNote.classList.add('is-bad');
     return;
   }
-  const have = CAS_CALLS.filter((c) => casApi[c.id]);
-  const missing = CAS_CALLS.filter((c) => !casApi[c.id]);
-  el.computeNote.textContent = have.map((c) => c.id).join(' · ') +
-    (missing.length ? ' — no ' + missing.map((c) => c.rust + '()').join(', ') : '');
-  el.computeNote.classList.toggle('is-bad', missing.length > 0);
+  const have = casVerbs.filter(HAVE_CALL);
+  const missing = casVerbs.filter((c) => !HAVE_CALL(c));
+  let text = have.map((c) => c.id).join(' · ');
+  if (missing.length) {
+    const named = missing.slice(0, 3).map((c) => c.rust + '()').join(', ');
+    text += ' — no ' + named +
+      (missing.length > 3 ? ' and ' + (missing.length - 3) + ' more' : '');
+  }
+  el.computeNote.textContent = text;
+  // Muted, never red: a build that predates half the calls is a FACT about
+  // app/pkg/, not a fault in the line in front of you. Only a build with no
+  // CAS at all - which is a rebuild, not a worksheet - is coloured.
+  el.computeNote.classList.remove('is-bad');
 }
 
 /** The chooser's second card is only live on a build that can serve it. */
@@ -5082,17 +5395,17 @@ function syncChooser() {
   el.choiceCompute.classList.toggle('is-unavailable', !have);
   if (el.choiceWhy) {
     el.choiceWhy.textContent = have
-      ? 'Type an expression and simplify, differentiate, expand or evaluate it.'
+      ? 'A worksheet: type solve(2x = 2, x), diff(x^3, x), evalf(pi) — Enter evaluates.'
       : CAS_MISSING;
   }
 }
 
 /**
  * A rendering of Numpla source as mathematics, with the editing taken away.
- * It is a MathField, not a second renderer: the input and the answer are drawn
- * by the same code, so they cannot disagree about what an expression looks
- * like. Keys and clicks are stopped on the HOST, in the capture phase, which
- * runs before the field's own listeners - so nothing reaches it.
+ * It is a MathField, not a second renderer: the prompt and the answer are
+ * drawn by the same code, so they cannot disagree about what an expression
+ * looks like. Keys and clicks are stopped on the HOST, in the capture phase,
+ * which runs before the field's own listeners - so nothing reaches it.
  */
 function staticMath(host, source) {
   if (!host) return null;
@@ -5119,8 +5432,383 @@ function staticMath(host, source) {
   return field;
 }
 
-/** Put a result back where it came from: the input surface. */
-function useCasResult(source) {
+// ---------------------------------------------------------------------------
+// `%` - the ditto operator
+//
+// `%` is the previous result, `%%` the one before, `%%%` the one before that:
+// Maple's own convention, and what makes a worksheet a worksheet. `diff(x^3,
+// x)` then `solve(% = 12)` with nothing retyped.
+//
+// TWO things are true of it here, and they are the same rule seen from either
+// end:
+//
+//   - It is SUBSTITUTED BEFORE THE LINE IS PARSED, let alone sent. On a build
+//     with `cas_command` the crate does it, from the history this pane hands
+//     over; without one, expandDitto() does it here. Either way `%` is
+//     genuinely the previous expression and never a reference resolved later.
+//
+//   - Pressing `%` in the prompt substitutes it THERE, straight away, so you
+//     can see what you are about to compute with. Pressing it again while the
+//     line is otherwise untouched walks further back - `%`, `%%`, `%%%` - and
+//     the chips in the strip reach the same three levels for a phone, which
+//     has no `%` key on a mathematics keyboard.
+//
+// AFTER A FAILURE: `%` does not move. A line that refused produced no
+// expression, and a ditto that pointed at one would be a reference to nothing;
+// so the history `%` walks is the history of RESULTS, and a refusal is stepped
+// straight over. That is Maple's behaviour too - an error leaves `%` alone -
+// and the pane says which entry `%` actually reached, by number, every time it
+// is used. `equal` likewise does not move `%`: it answers with a list rather
+// than one expression, and picking from the list is how you take one.
+// ---------------------------------------------------------------------------
+
+/** How far back `%` reaches. Maple stops at three, and so does this. */
+const DITTO_MAX = 3;
+
+/** The entries that produced an expression, newest first. */
+function casResults() {
+  const out = [];
+  for (let i = casLog.length - 1; i >= 0; i--) {
+    if (casLog[i].output) out.push(casLog[i]);
+  }
+  return out;
+}
+
+/** The history `cas_command` reads `%` from: results, most recent first. */
+function casHistory() {
+  return casResults().map((e) => e.output);
+}
+
+/** What `%`, `%%` or `%%%` stands for right now, or null. */
+function dittoEntry(level) {
+  if (!(level >= 1) || level > DITTO_MAX) return null;
+  return casResults()[level - 1] || null;
+}
+
+/**
+ * A result, wrapped so it stays ONE OPERAND wherever it is dropped. Only a
+ * bare number and a bare name go in naked; everything else gets brackets,
+ * because `2k` dropped into `x^%` unbracketed is `(x^2)k`, which is a
+ * different expression and a silent one.
+ */
+function dittoSource(entry) {
+  const src = String(entry.output).trim();
+  const atomic = /^[0-9]+(.[0-9]+)?$/.test(src) ||
+                 /^[A-Za-z](_[A-Za-z0-9]+)?$/.test(src);
+  return atomic ? src : '(' + src + ')';
+}
+
+/**
+ * Substitute every run of `%` in a line. Returns the text, and the deepest
+ * level that had nothing to point at - which is a refusal, not a guess. The
+ * shell's own copy of what `cas_command` does, for a build without one.
+ */
+function expandDitto(src) {
+  let missing = 0;
+  const text = String(src == null ? '' : src).replace(/%+/g, (run) => {
+    const entry = dittoEntry(run.length);
+    if (!entry) { missing = Math.max(missing, run.length); return run; }
+    return dittoSource(entry);
+  });
+  return { text, missing };
+}
+
+/** Why a ditto could not be resolved, as a sentence. */
+function dittoRefusal(level) {
+  const n = casResults().length;
+  const mark = '%'.repeat(Math.min(level, DITTO_MAX + 1));
+  if (level > DITTO_MAX) {
+    return mark + ' goes back further than % ever does — ' +
+      '%, %% and %%% are the three results Maple keeps, and so are these.';
+  }
+  if (!n) return mark + ' is the previous result, and nothing has produced one yet.';
+  return mark + ' is ' + level + ' results back, and there ' +
+    (n === 1 ? 'is 1 result' : 'are only ' + n + ' results') + ' so far.';
+}
+
+// Where the last ditto went, so pressing `%` again walks back instead of
+// stacking a second copy. Only honoured while the line is EXACTLY as the
+// insertion left it; any edit at all and the next `%` starts a fresh one.
+let dittoMark = null;
+
+function caretSignature(st) {
+  return JSON.stringify(st.path) + '@' + st.index;
+}
+
+/**
+ * Put a result where the caret is. `level` is 1, 2 or 3; pressing `%` with no
+ * level bumps whatever the last press left, so `%` `%` `%` walks backwards.
+ * Returns the level actually used, or 0 when there was nothing to reach.
+ */
+function insertDitto(level) {
+  if (!casInput) return 0;
+  const st = casInput.model && casInput.model.st;
+  const canSplice = !!(st && mfKit.curList && mfKit.parseSource);
+
+  let want = level;
+  let replacing = null;
+  if (want == null) {
+    want = 1;
+    if (canSplice && dittoMark && dittoMark.src === casInput.source &&
+        dittoMark.caret === caretSignature(st)) {
+      want = dittoMark.level >= DITTO_MAX ? 1 : dittoMark.level + 1;
+      replacing = dittoMark;
+    }
+  }
+
+  const entry = dittoEntry(want);
+  if (!entry) {
+    dittoMark = null;
+    casFoot(dittoRefusal(want), true);
+    return 0;
+  }
+
+  const text = dittoSource(entry);
+  if (canSplice) {
+    const list = mfKit.curList(st);
+    const from = replacing ? replacing.from : st.index;
+    const len = replacing ? replacing.len : 0;
+    const atoms = mfKit.parseSource(text, st.funcs);
+    list.splice(from, len, ...atoms);
+    st.index = from + atoms.length;
+    st.pristine = null;
+    casInput.render();
+    dittoMark = { level: want, from, len: atoms.length,
+                  src: casInput.source, caret: caretSignature(st) };
+  } else {
+    // A mathfield.js that predates the exports this leans on: type it instead.
+    // Walking back is what is lost, and only that.
+    try { casInput.insert(text); } catch (err) { console.error(err); }
+    dittoMark = null;
+  }
+
+  try { casInput.focus(); } catch (err) { /* best effort */ }
+  syncCasSig();
+  casFoot('%'.repeat(want) + ' is [' + entry.n + '] · ' + entry.output);
+  return want;
+}
+
+// ---------------------------------------------------------------------------
+// Reading a line, when the crate cannot
+//
+// `solve(2x = 2, x)` is a command with two arguments; `2x + 3x` is a bare
+// expression, which is `eval`. On a build with `cas_command` this is the
+// crate's job and none of it runs. Without one it is the shell's, on the
+// SOURCE STRING the field hands over - the same string the CAS is given, so
+// there is nothing between what you see and what is computed.
+// ---------------------------------------------------------------------------
+
+/** The index of the `)` matching the `(` at `open`, or -1. */
+function matchParen(text, open) {
+  let depth = 0;
+  for (let i = open; i < text.length; i++) {
+    const ch = text[i];
+    if (ch === '(' || ch === '[') depth += 1;
+    else if (ch === ')' || ch === ']') {
+      depth -= 1;
+      if (depth === 0) return i;
+    }
+  }
+  return -1;
+}
+
+/** Split an argument list on the commas that are not inside anything. */
+function splitArgs(text) {
+  const out = [];
+  let depth = 0;
+  let start = 0;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (ch === '(' || ch === '[') depth += 1;
+    else if (ch === ')' || ch === ']') depth -= 1;
+    else if (ch === ',' && depth === 0) { out.push(text.slice(start, i)); start = i + 1; }
+  }
+  out.push(text.slice(start));
+  return out.map((s) => s.trim());
+}
+
+/**
+ * What this line asks for: a named command with its arguments, or a bare
+ * expression, which is `eval`. The command has to span the WHOLE line -
+ * `solve(x) + 1` is arithmetic on something called solve, not a solve. That is
+ * unambiguous because every command name is multi-letter and every identifier
+ * in this language is a single letter.
+ */
+function readLine(src) {
+  const text = String(src == null ? '' : src).trim();
+  if (!text) return null;
+  const m = /^([A-Za-z][A-Za-z0-9]*)\s*\(/.exec(text);
+  if (m) {
+    const call = casCall(m[1]);
+    const open = m[0].length - 1;
+    const close = matchParen(text, open);
+    if (call && close === text.length - 1) {
+      const inner = text.slice(open + 1, close).trim();
+      return { call, args: inner ? splitArgs(inner) : [], text, bare: false };
+    }
+  }
+  return { call: casCall('eval'), args: [text], text, bare: true };
+}
+
+/** Names that are not variables: the builtins, the constants, the commands. */
+const NOT_A_VARIABLE = new Set([
+  'pi', 'tau', 'inf', 'e', 'sqrt', 'exp', 'ln', 'log', 'abs', 'min', 'max',
+  'mod', 'floor', 'ceil', 'round', 'sign', 'sin', 'cos', 'tan', 'arcsin',
+  'arccos', 'arctan', 'sinh', 'cosh', 'tanh', 'white', 'pink', 'brown',
+  'blue', 'smooth', 'telegraph', 'rand', 'randn',
+].concat(CAS_CALLS.map((c) => c.id)));
+
+/**
+ * The one unknown in an expression, for the commands that let you leave it
+ * out. A name in this language is one letter, so this is a scan for letters
+ * that are not part of a word the engine already owns; `x`, `y`, `t` win when
+ * they are there, because that is what a person means by "the variable".
+ */
+function inferVar(src) {
+  const text = String(src == null ? '' : src);
+  const words = text.match(/[A-Za-z][A-Za-z0-9]*/g) || [];
+  const seen = [];
+  for (const w of words) {
+    if (NOT_A_VARIABLE.has(w)) continue;
+    for (const ch of w) if (!seen.includes(ch)) seen.push(ch);
+  }
+  for (const pref of ['x', 'y', 'z', 'u', 'n', 'k', 't']) {
+    if (seen.includes(pref)) return pref;
+  }
+  return seen[0] || 'x';
+}
+
+// ---------------------------------------------------------------------------
+// Reading a reply
+//
+// Three shapes, and which one it is comes from the COMMAND, never from
+// sniffing the fields: `solve` answers with a solution list, `equal` with a
+// list of alternative forms, everything else with one expression.
+//
+// The field that carries the honesty is `kind`, and the whole point of the
+// choice list is that the four are rendered APART:
+//
+//   exact           equal to the input wherever the input has a value
+//   conditional     equal WHERE ITS CONDITION HOLDS, and it carries it
+//   decimal         the floating-point value. An approximation.
+//   identification  a closed form that MATCHES THE NUMBER to near machine
+//                   precision. Not proved, and never shown as a bare `=`.
+//
+// A solution carries the same distinction under another name: `verified` is
+// `exact` when substituting it back gives literally zero, and `numeric` when
+// it vanishes to within rounding. That is a weaker claim than "exact" and it
+// is shown as one - but it is not the same claim as an identification, so it
+// does not borrow its words.
+//
+// The shapes are still read defensively. The crate settled on `forms` with
+// `kind`; a reply that spells it `candidates` with `exact: true` is read too,
+// because a shell that hard-codes one spelling is one that breaks on a build
+// it was not compiled against. What is NEVER guessed is the exactness: a
+// candidate is called exact only when the reply says exact.
+// ---------------------------------------------------------------------------
+
+const firstString = (...vals) => {
+  for (const v of vals) {
+    if (typeof v === 'string' && v.trim()) return v.trim();
+  }
+  return '';
+};
+
+const FORM_STYLE = {
+  exact:          { rel: '=', flag: 'exact' },
+  conditional:    { rel: '=', flag: '' },   // the condition itself is the flag
+  checked:        { rel: '=', flag: 'checked numerically' },
+  decimal:        { rel: '≈', flag: 'an approximation' },
+  identification: { rel: '≈', flag: 'numeric match — not a proven identity' },
+  unknown:        { rel: '=', flag: '' },
+};
+
+const formStyle = (kind) => FORM_STYLE[kind] || FORM_STYLE.unknown;
+
+/** The candidate's claim, in the crate's own vocabulary. Never a guess. */
+function formKind(item) {
+  if (item.numeric === true || item.identified === true ||
+      item.approximate === true || item.exact === false) return 'identification';
+  const say = String(firstString(item.kind, item.type, item.certainty,
+                                 item.evidence) || '').toLowerCase();
+  if (/identif|numeric|approx|guess|match|inverse symbolic/.test(say)) {
+    return 'identification';
+  }
+  if (/decimal|machine precision|float/.test(say)) return 'decimal';
+  if (/condition/.test(say) || firstString(item.condition)) return 'conditional';
+  if (item.exact === true || item.proven === true) return 'exact';
+  if (/exact|proven|proved|verified/.test(say)) return 'exact';
+  return 'unknown';
+}
+
+/** The candidate list out of an `equal` reply, whatever it chose to call it. */
+function readForms(rep) {
+  const lists = [rep.forms, rep.candidates, rep.results, rep.outputs,
+                 rep.equal, rep.alternatives, rep.output];
+  let raw = null;
+  for (const l of lists) if (Array.isArray(l)) { raw = l; break; }
+  if (!raw) return null;
+
+  const out = [];
+  const seen = new Set();
+  for (const item of raw) {
+    let expr = '';
+    let label = '';
+    let kind = 'unknown';
+    let note = '';
+    let condition = '';
+    if (typeof item === 'string') {
+      expr = item.trim();
+    } else if (item && typeof item === 'object') {
+      expr = firstString(item.expr, item.output, item.form, item.source,
+                         item.value, item.text, item.result);
+      label = firstString(item.label, item.rule, item.how, item.via, item.by,
+                          item.origin, item.name);
+      condition = firstString(item.condition, item.where);
+      note = firstString(item.note, item.detail, item.why);
+      kind = formKind(item);
+    }
+    if (!expr || seen.has(expr)) continue;
+    seen.add(expr);
+    out.push({ expr, label, kind, note, condition });
+  }
+  return out.length ? out : null;
+}
+
+/**
+ * The solutions out of a `solve` reply, as the same kind of row the choice
+ * list draws - because a set of roots IS a list to pick from, and each one
+ * carries how far it was checked.
+ */
+function readSolutions(rep) {
+  if (!Array.isArray(rep.solutions)) return null;
+  const method = firstString(rep.method);
+  const out = [];
+  for (const item of rep.solutions) {
+    const expr = typeof item === 'string' ? item.trim()
+               : firstString(item && item.expr, item && item.output,
+                             item && item.source);
+    if (!expr) continue;
+    const verified = item && typeof item === 'object'
+      ? String(item.verified || '').toLowerCase() : '';
+    out.push({
+      expr,
+      label: method || 'a solution',
+      kind: verified === 'exact' ? 'exact'
+          : verified === 'numeric' ? 'checked' : 'unknown',
+      note: '',
+      condition: '',
+    });
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// The sheet
+// ---------------------------------------------------------------------------
+
+/** Put a result, or a chosen form, back where it came from: the prompt. */
+function useCasResult(source, note) {
   if (!casInput || !source) return '';
   try {
     casInput.source = source;
@@ -5128,55 +5816,194 @@ function useCasResult(source) {
     console.error('[numpla] could not put the result back', err);
     return '';
   }
+  dittoMark = null;
   try { casInput.focus(); } catch (err) { /* best effort */ }
-  casFoot('the result is in the input — run another operation on it');
+  syncCasSig();
+  casFoot(note || 'in the line — run a command on it, or press Enter');
   return casInput.source;
 }
+
+/** The button every insertable thing in the sheet carries. */
+function useButton(cls, text, title, onUse) {
+  const b = document.createElement('button');
+  b.type = 'button';
+  b.className = cls;
+  b.textContent = text;
+  b.title = title;
+  b.addEventListener('click', (e) => {
+    if (e && typeof e.preventDefault === 'function') e.preventDefault();
+    if (e && typeof e.stopPropagation === 'function') e.stopPropagation();
+    onUse();
+  });
+  return b;
+}
+
+/**
+ * What a form CLAIMS, as the words that go beside it. The label says where the
+ * form came from and this says what it is worth; when the label has already
+ * said it, saying it twice reads as a stutter, so it is dropped.
+ */
+function formFlagText(form) {
+  const flag = form.kind === 'conditional'
+    ? (form.condition ? 'where ' + form.condition : 'conditional')
+    : formStyle(form.kind).flag;
+  if (!flag) return '';
+  const label = String(form.label || '').toLowerCase();
+  return label.includes(flag.toLowerCase()) ? '' : flag;
+}
+
+function formsEl(entry) {
+  const list = document.createElement('div');
+  list.className = 'casforms';
+  list.setAttribute('role', 'list');
+
+  entry.forms.forEach((form, i) => {
+    const style = formStyle(form.kind);
+    const row = document.createElement('div');
+    row.className = 'casform is-' + form.kind + (style.rel === '≈' ? ' is-approx' : '');
+    row.dataset.form = String(i);
+    row.dataset.kind = form.kind;
+    row.setAttribute('role', 'listitem');
+    row.title = form.note || 'Put this form into the line';
+    row.addEventListener('click', () => pickForm(entry, i));
+
+    const rel = document.createElement('span');
+    rel.className = 'casform__rel';
+    rel.textContent = style.rel;
+    // The relation is the honest part of the row and a screen reader must not
+    // be left with a bare glyph: `≈` is read out as what it means.
+    rel.setAttribute('aria-label',
+      style.rel === '≈' ? 'approximately equal' : 'equals');
+
+    const math = document.createElement('div');
+    math.className = 'casform__math';
+
+    const label = document.createElement('span');
+    label.className = 'casform__label';
+    label.textContent = form.label || 'another form';
+
+    row.append(rel, math, label);
+
+    const flagText = formFlagText(form);
+    if (flagText) {
+      const flag = document.createElement('span');
+      flag.className = 'casform__flag';
+      flag.textContent = flagText;
+      row.append(flag);
+    }
+
+    row.append(useButton('casform__use', 'use',
+      'Put this form into the line',
+      () => pickForm(entry, i)));
+
+    // The crate's own sentence about WHY it offered this - what an
+    // identification agreed to, and the reminder that agreeing is not
+    // proving. It is the justification, so it is shown, not hidden in a title.
+    if (form.note) {
+      const note = document.createElement('p');
+      note.className = 'casform__note';
+      note.textContent = form.note;
+      row.append(note);
+    }
+
+    list.append(row);
+    staticMath(math, form.expr);
+  });
+
+  return list;
+}
+
+/** Take one candidate: it goes into the prompt, and it says what it is. */
+function pickForm(entry, index) {
+  if (!entry || !entry.forms) return '';
+  const form = entry.forms[index];
+  if (!form) return '';
+  casLastPick = { n: entry.n, index, kind: form.kind, expr: form.expr };
+  const said = form.kind === 'identification'
+    ? 'a NUMERIC identification, not a proven identity'
+    : form.kind === 'conditional'
+      ? 'valid where ' + (form.condition || 'its condition holds')
+      : form.kind === 'decimal' ? 'the value, to machine precision'
+      : form.kind === 'checked' ? 'checked numerically'
+      : form.kind === 'exact' ? 'exact' : '';
+  return useCasResult(form.expr, 'in the line — ' +
+    (form.label ? form.label : 'an equivalent form') + (said ? ', ' + said : ''));
+}
+
+let casLastPick = null;
 
 function casItemEl(entry) {
   const item = document.createElement('div');
   item.className = 'casitem';
   item.dataset.op = entry.op;
-  if (entry.error) item.classList.add('is-error');
+  item.dataset.n = String(entry.n);
+  if (entry.error && !entry.pending) item.classList.add('is-error');
+  if (entry.pending) item.classList.add('is-pending');
+  if (entry.forms) item.classList.add('has-forms');
 
   const op = document.createElement('span');
   op.className = 'casitem__op';
-  const call = CAS_CALLS.find((c) => c.id === entry.op);
-  op.textContent = entry.op === 'diff' ? 'd/d' + (entry.varName || 'x')
-    : (call ? call.label : entry.op);
+  op.textContent = '[' + entry.n + '] ' + entry.op;
 
   const inHost = document.createElement('div');
   inHost.className = 'casitem__in';
 
   const sign = document.createElement('span');
   sign.className = 'casitem__sign';
-  sign.textContent = '=';
+  // The relation, when there is one. An answer that is a SENTENCE - "no
+  // solutions", "every value of x" - relates nothing to nothing, and an equals
+  // sign with an empty right-hand side would be the wrong claim about it.
+  sign.textContent = entry.pending ? '…'
+    : entry.error ? '×'
+    : entry.forms ? '⋮'
+    : entry.output ? '=' : '—';
   sign.setAttribute('aria-hidden', 'true');
 
-  const use = document.createElement('button');
-  use.type = 'button';
-  use.className = 'casitem__use';
-  use.textContent = 'use';
-  use.title = 'put this answer back into the input';
-  use.hidden = !entry.output;
-  use.addEventListener('click', (e) => {
-    if (e && typeof e.preventDefault === 'function') e.preventDefault();
-    useCasResult(entry.output);
-  });
+  // Going BACK through the document is half of what a worksheet is for: the
+  // line you typed is one click away from being the line you are typing.
+  const again = useButton('casitem__edit', 'edit',
+    'Put this input back into the line',
+    () => useCasResult(entry.input, 'back in the line — [' + entry.n + ']'));
 
-  item.append(op, inHost, use, sign);
+  const use = useButton('casitem__use', 'use',
+    'Put this answer into the line',
+    () => useCasResult(entry.output,
+      'in the line — the answer from [' + entry.n + ']'));
+  use.hidden = !entry.output;
+
+  const acts = document.createElement('div');
+  acts.className = 'casitem__acts';
+  acts.append(again, use);
+
+  item.append(op, inHost, acts, sign);
 
   if (entry.error) {
     const err = document.createElement('div');
-    err.className = 'casitem__err';
+    err.className = 'casitem__err' + (entry.pending ? ' is-pending' : '');
     err.textContent = entry.error;
     item.append(err);
-    sign.textContent = '×';
-  } else {
+  } else if (entry.forms) {
+    item.append(formsEl(entry));
+  } else if (entry.output) {
     const outHost = document.createElement('div');
     outHost.className = 'casitem__out';
+    outHost.title = 'Put this answer into the line';
+    // Every result is selectable: the answer ITSELF is the target, not only
+    // the small button beside it. The read-only field swallows mousedown so
+    // it cannot be edited; click is left alone, and this is why.
+    outHost.addEventListener('click', () => useCasResult(entry.output,
+      'in the line — the answer from [' + entry.n + ']'));
     item.append(outHost);
     staticMath(outHost, entry.output);
+  }
+
+  // What the answer assumes, what it does not contain, or that there is none.
+  // An assumption the reader cannot see is one they cannot check.
+  if (entry.note) {
+    const note = document.createElement('p');
+    note.className = 'casitem__note';
+    note.textContent = entry.note;
+    item.append(note);
   }
 
   staticMath(inHost, entry.input);
@@ -5194,96 +6021,541 @@ function renderCasLog() {
     const empty = document.createElement('p');
     empty.className = 'casempty';
     empty.textContent =
-      'Type an expression above and press one of the operations. ' +
-      'Answers are Numpla source, so any of them can go back into the input. ' +
-      'Not here, deliberately: symbolic integration, equation solving, limits, ' +
-      'series, matrices.';
+      'A worksheet. Type a command and press Enter: solve(2x = 2, x), ' +
+      'diff(x^3, x), evalf(pi), equal(1^(1/2)). A bare expression with no ' +
+      'command is eval. Tab completes a command name; % is the previous ' +
+      'result, %% the one before. Every answer is Numpla source, so any of ' +
+      'them can go back into the line.';
     el.computeLog.append(empty);
+    syncCasGutter();
     return;
   }
   for (const entry of casLog) el.computeLog.append(casItemEl(entry));
+  scrollSheetToEnd();
+  syncCasGutter();
+}
+
+function scrollSheetToEnd() {
   try {
-    if (typeof el.computeLog.scrollHeight === 'number') {
+    if (el.computeLog && typeof el.computeLog.scrollHeight === 'number') {
       el.computeLog.scrollTop = el.computeLog.scrollHeight;
     }
   } catch (err) { /* no scroller in the test shim */ }
 }
 
+function syncCasGutter() {
+  if (el.computeGutter) el.computeGutter.textContent = '[' + (casSeq + 1) + ']';
+}
+
+/** How this entry reads in one line, for the foot. */
+function casFootFor(entry) {
+  if (entry.error) return '[' + entry.n + '] ' + entry.error;
+  if (entry.forms) {
+    const n = entry.forms.length;
+    const loud = entry.forms.filter((f) => f.kind === 'identification').length;
+    const noun = (entry.op === 'solve' ? ' solution' : ' equivalent form') +
+      (n === 1 ? '' : 's');
+    const said = !loud ? ''
+      : n === 1 ? ' — a numeric identification, not a proof'
+      : loud === n ? ' — all of them numeric identifications, not proofs'
+      : ' — ' + loud + ' of them numeric identifications, not proofs';
+    return '[' + entry.n + '] ' + n + noun + said +
+      ' · pick one to put it in the line';
+  }
+  if (!entry.output) return '[' + entry.n + '] ' + (entry.note || 'no answer');
+  return '[' + entry.n + '] ' + entry.input + '  =  ' + entry.output +
+    '  ·  % is this';
+}
+
 function pushCas(entry) {
+  casSeq += 1;
+  entry.n = casSeq;
   casLog.push(entry);
+  const trimmed = casLog.length > CAS_LOG_MAX;
   while (casLog.length > CAS_LOG_MAX) casLog.shift();
-  renderCasLog();
-  casFoot(entry.error
-    ? entry.error
-    : entry.op + ' · ' + entry.input + '  =  ' + entry.output, !!entry.error);
+
+  // A worksheet grows by ONE line, and rebuilding sixty entries - a hundred
+  // and twenty read-only fields - on every Enter is how a document pane stops
+  // feeling like one. The fast path is taken only when the sheet already
+  // matches the log minus this entry; anything else falls back to the full
+  // render, which stays the single source of truth.
+  const drawn = el.computeLog
+    ? el.computeLog.querySelectorAll('.casitem').length : -1;
+  if (!trimmed && drawn > 0 && drawn === casLog.length - 1) {
+    el.computeLog.append(casItemEl(entry));
+    scrollSheetToEnd();
+    syncCasGutter();
+  } else {
+    renderCasLog();
+  }
+  syncCasDitto();
+  casFoot(casFootFor(entry), !!entry.error && !entry.pending);
   return entry;
 }
 
-/** One operation, on whatever is in the input. Returns the log entry. */
-function runCas(opId) {
-  const call = CAS_CALLS.find((c) => c.id === opId) || CAS_CALLS[0];
-  if (!casApi || !casApi[call.id]) {
-    casFoot('this build has no ' + call.rust + '()', true);
-    return null;
+// ---------------------------------------------------------------------------
+// Running a line
+// ---------------------------------------------------------------------------
+
+/**
+ * One reply, whichever call produced it, turned into one line of the sheet.
+ * `op` decides the shape: `solve` answers with solutions, `equal` with forms,
+ * everything else with one expression.
+ */
+function absorbReply(op, line, rep, inferred) {
+  const entry = { op, input: line, output: '', error: '', inferred };
+
+  // gray, not red: half-typed is a normal state at this boundary too.
+  if (rep.ok !== true && rep.pending === true) {
+    entry.pending = true;
+    entry.error = firstString(rep.error) ||
+      'still reading that — it is unfinished, not wrong';
+    return pushCas(entry);
   }
-  const src = casInput ? String(casInput.source || '').trim() : '';
-  if (!src) {
-    casFoot('type an expression first');
-    return null;
+
+  if (rep.ok === false) {
+    entry.error = firstString(rep.error) || 'no answer';
+    return pushCas(entry);
+  }
+
+  if (op === 'solve') {
+    const sols = readSolutions(rep);
+    if (sols) {
+      const exprs = sols.map((s) => s.expr);
+      // `x = x`: the list is not the answer and must not be shown as one.
+      if (rep.everyValue === true) {
+        entry.note = 'every value of ' +
+          (firstString(rep.variable) || 'the unknown') + ' is a solution.';
+        return pushCas(entry);
+      }
+      if (!exprs.length) {
+        entry.note = 'no solutions' +
+          (firstString(rep.method) ? ' — ' + rep.method : '') + '.';
+        return pushCas(entry);
+      }
+      // One root is itself; several are a list, which this language has - so
+      // `%` after a solve is an expression either way.
+      entry.output = exprs.length === 1 ? exprs[0] : '[' + exprs.join(', ') + ']';
+      entry.forms = sols;
+      entry.note = firstString(rep.note);
+      entry.variable = firstString(rep.variable);
+      entry.method = firstString(rep.method);
+      return pushCas(entry);
+    }
+  }
+
+  const forms = readForms(rep);
+  if (forms) {
+    entry.forms = forms;
+    entry.note = firstString(rep.note);
+    return pushCas(entry);
+  }
+
+  let output = typeof rep.output === 'string' ? rep.output.trim() : '';
+  if (!output && Array.isArray(rep.outputs)) {
+    output = rep.outputs.filter((s) => typeof s === 'string').join(', ').trim();
+  }
+
+  if (!output) {
+    const call = casCall(op);
+    // `equal` with an empty list is an ANSWER: there was no other way of
+    // writing it. Saying "no answer" would be a different, wrong claim.
+    entry.note = call && call.forms
+      ? 'no other way of writing it was found.'
+      : '';
+    if (!entry.note) entry.error = firstString(rep.error) || 'no answer';
+    return pushCas(entry);
+  }
+
+  entry.output = output;
+  entry.note = firstString(rep.note);
+  return pushCas(entry);
+}
+
+/** The crate reads the line, substitutes `%` from the history and dispatches. */
+function runViaCommand(src) {
+  let history = '[]';
+  try { history = JSON.stringify(casHistory()); } catch (err) { history = '[]'; }
+
+  let raw;
+  try {
+    raw = casApi.command(src, history);
+  } catch (err) {
+    console.error('[numpla] cas_command threw', err);
+    return pushCas({ op: 'eval', input: src, output: '',
+                     error: 'cas_command() failed' });
+  }
+  const rep = parseJson(String(raw), 'cas_command');
+  if (!rep) {
+    return pushCas({ op: 'eval', input: src, output: '',
+                     error: 'cas_command() did not answer in JSON' });
+  }
+  // Switch on `command`, not on the fields of `reply`.
+  const op = firstString(rep.command) || 'eval';
+  const line = firstString(rep.source) || src;
+  const reply = rep.reply && typeof rep.reply === 'object' ? rep.reply : rep;
+  casLastOp = op;
+  return absorbReply(op, line, reply, '');
+}
+
+/** The shell reads the line, and calls one verb. For a build with no dispatch. */
+function runViaVerbs(src) {
+  const dit = expandDitto(src);
+  if (dit.missing) {
+    return pushCas({ op: 'ditto', input: src, output: '',
+                     error: dittoRefusal(dit.missing) });
+  }
+  const line = dit.text;
+
+  const read = readLine(line);
+  if (!read || !read.call) {
+    return pushCas({ op: 'eval', input: line, output: '',
+                     error: 'this build has no cas_eval(), so a bare ' +
+                            'expression has nothing to run' });
+  }
+  const call = read.call;
+  const [least, most] = call.args;
+
+  if (!casApi[call.id]) {
+    return pushCas({ op: call.id, input: line, output: '',
+                     error: 'this build has no ' + call.rust + '() — ' +
+                            call.sig + ' needs it' });
+  }
+
+  let args = read.args.slice();
+  if (args.some((a) => !a)) {
+    return pushCas({ op: call.id, input: line, output: '',
+                     error: call.sig + ' — an argument is empty' });
+  }
+  if (args.length < least || args.length > most) {
+    return pushCas({ op: call.id, input: line, output: '',
+                     error: call.sig + ' takes ' +
+                       (least === most ? least : least + ' or ' + most) +
+                       (least === 1 && most === 1 ? ' argument' : ' arguments') +
+                       ', and this has ' + args.length });
+  }
+  // The variable a command lets you leave out is filled in from the
+  // expression, and the entry says which one it used - a silent guess is
+  // exactly the thing this product does not do.
+  let inferred = '';
+  if (call.varArg != null && args.length === call.varArg) {
+    inferred = inferVar(args[0]);
+    args = args.concat([inferred]);
   }
 
   casLastOp = call.id;
-  renderCasOps();
 
-  const varName = casVarName();
   let raw;
   try {
-    raw = call.vars ? casApi[call.id](src, varName) : casApi[call.id](src);
+    raw = casApi[call.id](...args);
   } catch (err) {
     console.error('[numpla] ' + call.rust + ' threw', err);
-    return pushCas({ op: call.id, varName, input: src, output: '',
+    return pushCas({ op: call.id, input: line, output: '',
                      error: call.rust + '() failed' });
   }
 
   const rep = parseJson(String(raw), call.rust);
   if (!rep) {
-    return pushCas({ op: call.id, varName, input: src, output: '',
+    return pushCas({ op: call.id, input: line, output: '',
                      error: call.rust + '() did not answer in JSON' });
   }
-  const output = typeof rep.output === 'string' ? rep.output.trim() : '';
-  const failed = rep.ok === false || !output;
-  return pushCas({
-    op: call.id,
-    varName,
-    input: typeof rep.input === 'string' && rep.input ? rep.input : src,
-    output: failed ? '' : output,
-    error: failed
-      ? (typeof rep.error === 'string' && rep.error ? rep.error : 'no answer')
-      : '',
-  });
+  return absorbReply(call.id, line, rep, inferred);
+}
+
+/**
+ * Run one line of the worksheet. With no argument it runs what is in the
+ * prompt, which is what Enter does; with one it runs that text, which is how
+ * the suite drives the substitution path without a `%` key.
+ *
+ * Returns the entry it wrote, or null when there was nothing to run.
+ */
+function runWorksheet(rawSrc) {
+  const given = rawSrc != null ? String(rawSrc)
+              : (casInput ? String(casInput.source || '') : '');
+  const src = given.trim();
+  if (!src) { casFoot('type a command or an expression, then press Enter'); return null; }
+  if (!casApi) { casFoot(CAS_MISSING, true); return null; }
+  return casApi.command ? runViaCommand(src) : runViaVerbs(src);
+}
+
+/** Enter: run the line, and leave the prompt ready for the next one. */
+function submitWorksheet() {
+  const entry = runWorksheet();
+  if (!entry) return null;
+  try { casInput.source = ''; } catch (err) { /* best effort */ }
+  dittoMark = null;
+  syncCasSig();
+  try { casInput.focus(); } catch (err) { /* best effort */ }
+  return entry;
+}
+
+// ---------------------------------------------------------------------------
+// Tab completion, and the signature while you choose
+//
+// The math field already has completion, driven by a NAME LIST that a shell
+// hands it - the same machinery every row in the system pane uses for the
+// document's own function names. The worksheet's list is the commands, so
+// `sol` then Tab gives `solve(⎸)` with the caret inside the parentheses, and
+// there is no second completion system anywhere in this file.
+//
+// What the field's menu cannot show is the real signature - it renders a
+// generic `solve(x)` for any name it was handed - so the signature is shown
+// HERE, live, under the prompt: what Tab would complete, or, once the caret is
+// inside a call, what that call takes.
+// ---------------------------------------------------------------------------
+
+/** The command whose parentheses the caret is standing inside, if any. */
+function commandAtCaret(st) {
+  let list = st.root;
+  let found = null;
+  for (const step of st.path) {
+    const at = step[0];
+    const key = step[1];
+    const atom = list[at];
+    if (!atom) return found;
+    if (key === 'body' && atom.type === 'group' && atom.open === '(') {
+      const prev = list[at - 1];
+      if (prev && prev.type === 'func') {
+        const call = casCall(prev.name);
+        if (call) found = call;
+      }
+    }
+    list = atom[key];
+    if (!Array.isArray(list)) return found;
+  }
+  return found;
+}
+
+/** Is the caret standing directly inside a round bracket? */
+function caretInParenGroup(st) {
+  if (!st.path.length) return false;
+  let list = st.root;
+  for (let i = 0; i < st.path.length; i++) {
+    const at = st.path[i][0];
+    const key = st.path[i][1];
+    const atom = list[at];
+    if (!atom) return false;
+    if (i === st.path.length - 1) {
+      return key === 'body' && atom.type === 'group' && atom.open === '(';
+    }
+    list = atom[key];
+    if (!Array.isArray(list)) return false;
+  }
+  return false;
+}
+
+function casSigText() {
+  if (!casInput) return '';
+  let comp = null;
+  try { comp = casInput.completions(); } catch (err) { comp = null; }
+
+  // What Tab is about to do wins: it is the thing being chosen.
+  if (comp && comp.prefix) {
+    const hits = casVerbs.filter((c) => c.id.startsWith(comp.prefix));
+    if (hits.length === 1) {
+      return 'Tab  ' + hits[0].sig + '  —  ' + hits[0].hint;
+    }
+    if (hits.length > 1) {
+      return 'Tab  ' + hits.map((c) => c.sig).slice(0, 3).join('   ·   ') +
+        (hits.length > 3 ? '   ·   +' + (hits.length - 3) + ' more' : '');
+    }
+  }
+
+  const st = casInput.model && casInput.model.st;
+  if (st) {
+    const inside = commandAtCaret(st);
+    if (inside) {
+      return inside.sig + '  —  ' + inside.hint +
+        (HAVE_CALL(inside) ? '' : '  ·  not in this build');
+    }
+    const head = st.root && st.root[0];
+    if (head && head.type === 'func') {
+      const call = casCall(head.name);
+      if (call) return call.sig + '  —  ' + call.hint;
+    }
+  }
+
+  return 'Enter runs the line  ·  Tab completes a command  ·  ' +
+    '% is the previous result  ·  a bare expression is eval';
+}
+
+function syncCasSig() {
+  if (!el.computeSig) return;
+  el.computeSig.textContent = casSigText();
+  syncCasGutter();
+}
+
+/**
+ * Hand the command names to the field's completion, together with whatever
+ * the document defines. `functions` is what makes `solve(2x = 2, x)` READ as
+ * a call rather than as five letters times a bracket, which is the same fact
+ * the completion needs - so it is one call, not two.
+ */
+function syncCasNames() {
+  if (!casInput) return;
+  const doc = docNames();
+  const names = casNames();
+  try {
+    casInput.setDocumentNames({
+      functions: names.concat(doc.functions.filter((f) => !names.includes(f))),
+      params: doc.params,
+      states: doc.states,
+    });
+  } catch (err) {
+    console.error('[numpla] MathField.setDocumentNames threw', err);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Typing into the prompt
+//
+// Two characters mean something HERE that they do not mean in a document row,
+// and the worksheet claims both before the field ever sees them.
+//
+//   `%`  is not mathematics at all, so the field cannot type it; it is the
+//        ditto, and it substitutes on the spot (see insertDitto).
+//
+//   `=`  is the interesting one. The field's rule is that `=` SPLITS A ROW, so
+//        typing one steps out of whatever structure the caret is in - which is
+//        exactly right for `dx/dt = -y` and exactly wrong for
+//        `solve(2x = 2, x)`, where the equation is an ARGUMENT and belongs
+//        inside the call. The worksheet is not a row list, so inside a
+//        command's round brackets the `=` is put where it was typed. Everywhere
+//        else - at the top of the line, in an exponent, in a denominator - the
+//        field's own rule stands untouched.
+// ---------------------------------------------------------------------------
+
+/** `=` inside a command's parentheses. True when this claimed the key. */
+function casTypeEquals() {
+  if (!casInput || !mfKit.curList || !mfKit.parseSource) return false;
+  const st = casInput.model && casInput.model.st;
+  if (!st || !caretInParenGroup(st) || !commandAtCaret(st)) return false;
+  const list = mfKit.curList(st);
+  const atoms = mfKit.parseSource('=', st.funcs);
+  if (!atoms.length) return false;
+  list.splice(st.index, 0, ...atoms);
+  st.index += atoms.length;
+  st.pristine = null;
+  casInput.render();
+  dittoMark = null;
+  syncCasSig();
+  return true;
+}
+
+/**
+ * Type into the prompt, one character at a time, giving the worksheet's own
+ * two keys their meaning and handing everything else to the field unchanged.
+ * One path, so a keystroke, a tap on the math keyboard and the suite all end
+ * up in the same place.
+ */
+function casType(text) {
+  if (!casInput) return '';
+  for (const ch of String(text == null ? '' : text)) {
+    if (ch === '%') { insertDitto(null); continue; }
+    if (ch === '=' && casTypeEquals()) continue;
+    try { casInput.insert(ch); } catch (err) { console.error(err); }
+  }
+  syncCasSig();
+  return casInput.source;
+}
+
+// ---------------------------------------------------------------------------
+// The command strip
+//
+// A phone has no Tab key, and a worksheet whose commands are only reachable
+// through one would be a desktop-only worksheet. So the strip: one chip per
+// command, which TYPES `solve(⎸)` into the line exactly as Tab does, and never
+// runs anything. Plus the three ditto keys, for the same reason - `%` is not
+// on a mathematics keyboard either.
+//
+// It is not a second place to learn what the commands are: that is the
+// reference panel, which carries all of them with their descriptions.
+// ---------------------------------------------------------------------------
+
+/** Type a command into the line, caret inside its parentheses. */
+function typeCommand(id) {
+  const call = casCall(id);
+  if (!call || !casInput) return '';
+  dittoMark = null;
+  try {
+    casInput.insert(call.id);
+    // A build of mathfield.js whose completion does not know the name yet
+    // leaves bare letters; the parentheses are what the caret needs, so they
+    // are added when they did not arrive.
+    if (!/\($/.test(String(casInput.source || ''))) casInput.insert('(');
+  } catch (err) {
+    console.error('[numpla] typing a command threw', err);
+  }
+  try { casInput.focus(); } catch (err) { /* best effort */ }
+  syncCasSig();
+  casFoot(call.sig + '  —  ' + call.hint);
+  return casInput.source;
 }
 
 function renderCasOps() {
   if (!el.computeOps) return;
   el.computeOps.textContent = '';
-  for (const call of CAS_CALLS) {
-    const have = !!(casApi && casApi[call.id]);
+
+  for (const call of casVerbs) {
+    const have = HAVE_CALL(call);
     const b = document.createElement('button');
     b.type = 'button';
     b.className = 'casop';
     b.dataset.op = call.id;
-    b.textContent = call.vars ? call.label + casVarName() : call.label;
+    b.textContent = call.id;
     b.setAttribute('aria-disabled', have ? 'false' : 'true');
-    b.title = have ? call.hint : 'this build has no ' + call.rust + '()';
-    b.classList.toggle('is-last', casLastOp === call.id);
+    b.title = have ? call.sig + ' — ' + call.hint
+                   : 'this build has no ' + call.rust + '()';
     b.addEventListener('click', (e) => {
       if (e && typeof e.preventDefault === 'function') e.preventDefault();
       if (!have) { casFoot('this build has no ' + call.rust + '()', true); return; }
-      runCas(call.id);
+      typeCommand(call.id);
     });
     el.computeOps.append(b);
   }
+
+  for (let level = 1; level <= DITTO_MAX; level++) {
+    const mark = '%'.repeat(level);
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'casop casop--ditto';
+    b.dataset.ditto = String(level);
+    b.textContent = mark;
+    b.title = mark + ' — ' + (level === 1 ? 'the previous result'
+      : level === 2 ? 'the result before that' : 'the one before that');
+    b.addEventListener('click', (e) => {
+      if (e && typeof e.preventDefault === 'function') e.preventDefault();
+      insertDitto(level);
+    });
+    el.computeOps.append(b);
+  }
+
+  syncCasDitto();
 }
+
+/** The ditto keys only offer what there is to reach. */
+function syncCasDitto() {
+  if (!el.computeOps) return;
+  const have = casResults().length;
+  for (const b of Array.from(el.computeOps.querySelectorAll('.casop--ditto'))) {
+    const level = Number(b.dataset.ditto || 0);
+    b.setAttribute('aria-disabled', level <= have ? 'false' : 'true');
+  }
+}
+
+/** Everything that depends on which calls this build has. */
+function syncCas() {
+  syncCasVerbs();
+  syncChooser();
+  syncComputeNote();
+  if (casMounted) {
+    syncCasNames();
+    renderCasOps();
+    syncCasSig();
+  }
+}
+
+// ---------------------------------------------------------------------------
 
 /** Built once, the first time the route is taken. */
 function mountCompute() {
@@ -5292,20 +6564,41 @@ function mountCompute() {
   try {
     casInput = new MathField(el.computeField, {
       value: '',
-      ariaLabel: 'expression to compute',
+      ariaLabel: 'a line of the worksheet',
       touchDriven: touchMode,
-      onEnter: () => { runCas(casLastOp); },
+      onEnter: () => { submitWorksheet(); },
+      onChange: () => { dittoMark = null; syncCasSig(); },
       onFocus: () => { if (touchMode) openKeyboard(); },
       onBlur: () => onRowBlurred(),
     });
   } catch (err) {
-    console.error('[numpla] the compute field would not mount', err);
+    console.error('[numpla] the worksheet prompt would not mount', err);
     casInput = null;
   }
+
+  // The two keys the worksheet owns. Capture phase, on the HOST, which runs
+  // before the field's own listener - the same trick a read-only result uses.
+  if (casInput && el.computeField) {
+    el.computeField.addEventListener('keydown', (e) => {
+      if (!e || (e.key !== '%' && e.key !== '=')) return;
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
+      if (e.key === '=') {
+        // Only when it is genuinely ours; otherwise the field's row rule wins.
+        if (!casTypeEquals()) return;
+      } else {
+        insertDitto(null);
+      }
+      if (typeof e.preventDefault === 'function') e.preventDefault();
+      if (typeof e.stopPropagation === 'function') e.stopPropagation();
+    }, true);
+  }
+
+  syncCasNames();
   renderCasOps();
   renderCasLog();
   syncComputeNote();
-  casFoot('Enter runs the operation you last used.');
+  syncCasSig();
+  casFoot('Enter runs the line. Try solve(2x = 2, x).');
 }
 
 // ---------------------------------------------------------------------------
@@ -5379,6 +6672,8 @@ function setRoute(next, remember) {
     closeViews();
     closeSettings();
     mountCompute();
+    syncCasNames();
+    syncCasSig();
     if (casInput) { try { casInput.focus(); } catch (err) { /* best effort */ } }
   } else if (route === 'solve') {
     // The pane may have been display:none, so its box is new to the plot.
@@ -5424,15 +6719,21 @@ function wireRoutes() {
     });
   }
 
-  if (el.computeVar) {
-    el.computeVar.addEventListener('input', () => { if (casMounted) renderCasOps(); });
+  if (el.computeRun) {
+    el.computeRun.addEventListener('click', (e) => {
+      if (e && typeof e.preventDefault === 'function') e.preventDefault();
+      submitWorksheet();
+    });
   }
   if (el.computeClear) {
     el.computeClear.addEventListener('click', (e) => {
       if (e && typeof e.preventDefault === 'function') e.preventDefault();
       casLog.length = 0;
+      casSeq = 0;
+      dittoMark = null;
       renderCasLog();
-      casFoot('history cleared');
+      renderCasOps();
+      casFoot('the worksheet is empty');
     });
   }
 }
@@ -5455,6 +6756,8 @@ async function boot() {
     funcNames = typeof mf.functionNamesIn === 'function'
       ? mf.functionNamesIn
       : () => [];
+    mfKit.curList = typeof mf.curList === 'function' ? mf.curList : null;
+    mfKit.parseSource = typeof mf.parseSource === 'function' ? mf.parseSource : null;
   } catch (err) {
     fail('Could not load ./mathfield.js.', err);
     return;
@@ -5515,8 +6818,9 @@ async function boot() {
     probedApis = { field: probeFieldApi(model), seed: probeSeedApi(model) };
     fieldApi = probedApis.field;
     seedApi = probedApis.seed;
-    probedCas = probeCasApi(model);
+    probedCas = probeCasApi(model, mod.Model);
     casApi = probedCas;
+    syncCasVerbs();
   } catch (err) {
     fail('The WASM module does not match docs/wasm-api.md.', err);
     return;

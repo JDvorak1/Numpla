@@ -157,13 +157,14 @@ impl Model {
 
     // ---- the compute pane -------------------------------------------------
     //
-    // All four take `&self`: algebra never disturbs the document or the curve
-    // on screen, and the signature is where that promise is kept.
+    // All of them take `&self`: algebra never disturbs the document or the
+    // curve on screen, and the signature is where that promise is kept.
     //
-    // Each returns a CasReply as a JSON string — `{ ok, input, output, steps?,
+    // Most return a CasReply as a JSON string — `{ ok, input, output, steps?,
     // error?, pending? }` — and `output` is Numpla source that parses, so the
-    // shell can offer "paste into document" on any answer. See
-    // `docs/wasm-api.md`.
+    // shell can offer "paste into document" on any answer. `cas_solve` and
+    // `cas_equal` return their own shapes, because a solution set and a list of
+    // alternative forms are not one expression. See `docs/wasm-api.md`.
     //
     // The document is in scope: a function defined in a row can be used in the
     // pane, and `cas_eval` reads the document's parameter values.
@@ -188,10 +189,85 @@ impl Model {
         self.inner.cas_expand(expr)
     }
 
-    /// Evaluate to a number where the document supplies enough values, and to
-    /// the simplified expression where it does not — with a step naming the
-    /// value that is missing.
+    /// Factor over the rationals. Complete for a polynomial in one variable;
+    /// a common factor in more than one; `x^2 - 2` comes back unchanged,
+    /// because it does not factor over the rationals and `sqrt(2)` is `solve`'s
+    /// answer rather than `factor`'s.
+    pub fn cas_factor(&self, expr: &str) -> String {
+        self.inner.cas_factor(expr)
+    }
+
+    /// The best exact form the CAS can reach, with the document's values put
+    /// in. `sqrt(2)` stays `sqrt(2)`; an expression that still reads a name
+    /// with no value comes back symbolic with a step saying which name.
     pub fn cas_eval(&self, expr: &str) -> String {
         self.inner.cas_eval(expr)
+    }
+
+    /// A number, always. When it cannot be one — a name in the expression has
+    /// no value — it comes back `ok: false` with the sentence saying which.
+    pub fn cas_evalf(&self, expr: &str) -> String {
+        self.inner.cas_evalf(expr)
+    }
+
+    /// Substitute a name: `cas_subs("x = 3", "x^2 + 1")` is `10`.
+    pub fn cas_subs(&self, assignment: &str, expr: &str) -> String {
+        self.inner.cas_subs(assignment, expr)
+    }
+
+    /// Solve one equation for one unknown. Returns a **CasSolveReply** as JSON:
+    /// `{ ok, input, variable, solutions: [{ expr, verified, value? }],
+    /// everyValue?, method?, note?, error?, pending? }`.
+    ///
+    /// `var` may be `""` when the equation has exactly one unknown, which is
+    /// what makes `solve(2x = 2)` answerable without naming `x`. What it will
+    /// not do it refuses by name — a trigonometric equation has infinitely many
+    /// solutions, and a cubic with no rational root has no readable ones.
+    pub fn cas_solve(&self, equation: &str, var: &str) -> String {
+        self.inner.cas_solve(equation, var)
+    }
+
+    /// Every equivalent form the CAS can find, for the user to choose from.
+    /// Returns a **CasFormsReply** as JSON: `{ ok, input, forms: [{ expr,
+    /// label, kind, condition?, note? }], value?, error?, pending? }`.
+    ///
+    /// `kind` is the field that matters: `"exact"`, `"conditional"` (with the
+    /// condition it depends on), `"decimal"`, or `"identification"` — a closed
+    /// form recognised from the *number*, which is evidence and not a proof.
+    /// Render that difference; it is the reason the field exists.
+    pub fn cas_equal(&self, expr: &str) -> String {
+        self.inner.cas_equal(expr)
+    }
+
+    /// `sum(e, k, a, b)`: a closed form where one exists, the series added up
+    /// where the limits are numbers, and otherwise a refusal naming the shape.
+    pub fn cas_sum(&self, expr: &str, index: &str, from: &str, to: &str) -> String {
+        self.inner.cas_sum(expr, index, from, to)
+    }
+
+    /// `product(e, k, a, b)`, on the same terms as `cas_sum`.
+    pub fn cas_product(&self, expr: &str, index: &str, from: &str, to: &str) -> String {
+        self.inner.cas_product(expr, index, from, to)
+    }
+
+    /// One worksheet line as typed — `solve(2x = 2, x)`, `equal(1^(1/2))`, or a
+    /// bare expression, which means `eval`.
+    ///
+    /// `history` is a JSON array of previous results, most recent first, for
+    /// `%`, `%%`, `%%%`; pass `"[]"` when there is none. Returns a
+    /// **CasCommandReply**: `{ command, source, reply }`, where `command` says
+    /// which of the three reply shapes `reply` is. Switch on it rather than
+    /// sniffing fields.
+    ///
+    /// The line parsing lives in Rust so that the shell and the CAS cannot
+    /// disagree about what `sum(e, k, a, b)` means.
+    pub fn cas_command(&self, line: &str, history: &str) -> String {
+        self.inner.cas_command(line, history)
+    }
+
+    /// The command names and signatures, as JSON — so tab completion is built
+    /// from the implementation rather than from a copy of it.
+    pub fn cas_commands() -> String {
+        numpla_model::Model::cas_commands_json()
     }
 }

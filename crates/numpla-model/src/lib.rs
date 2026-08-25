@@ -679,14 +679,17 @@ impl Model {
 
     // ---- the compute pane ------------------------------------------------
     //
-    // Four calls, all `&self`: algebra reads the document and never disturbs
-    // it. That is stated in the signature rather than in a comment so the
-    // compiler keeps the promise — asking to differentiate something must never
-    // be able to throw away the curve on screen.
+    // All `&self`: algebra reads the document and never disturbs it. That is
+    // stated in the signature rather than in a comment so the compiler keeps
+    // the promise — asking to solve something must never be able to throw away
+    // the curve on screen.
     //
-    // Each returns `CasReply` as JSON. `output` is Numpla source that parses;
-    // see `cas` for the three decisions about what "the document's scope" means
-    // here, and `docs/wasm-api.md` for the wire shape.
+    // Most return `CasReply` as JSON, whose `output` is Numpla source that
+    // parses. `cas_solve` and `cas_equal` return their own shapes, because a
+    // solution set and a list of alternative forms are not one expression and
+    // flattening them into one would make the pane parse a string back out.
+    // See `cas` for what "the document's scope" means here, and
+    // `docs/wasm-api.md` for the wire shapes.
 
     /// Fold arithmetic, apply the identity and zero laws, collect like terms.
     pub fn cas_simplify(&self, expr: &str) -> String {
@@ -703,10 +706,87 @@ impl Model {
         to_json(&cas::expand_expr(&self.doc, expr))
     }
 
-    /// Evaluate to a number where the document gives enough to do so, and to
-    /// the simplified expression where it does not.
+    /// The best exact form the CAS can reach, with the document's values in it.
+    ///
+    /// `sqrt(2)` comes back as `sqrt(2)`, not as a decimal: that is the whole
+    /// difference from `cas_evalf`, and it is why there are two verbs.
     pub fn cas_eval(&self, expr: &str) -> String {
         to_json(&cas::eval_expr(&self.doc, expr))
+    }
+
+    /// A number, always — or a sentence naming what stopped it being one.
+    pub fn cas_evalf(&self, expr: &str) -> String {
+        to_json(&cas::evalf_expr(&self.doc, expr))
+    }
+
+    /// Factor over the rationals.
+    pub fn cas_factor(&self, expr: &str) -> String {
+        to_json(&cas::factor_expr(&self.doc, expr))
+    }
+
+    /// Substitute a name: `cas_subs("x = 3", "x^2 + 1")` is `10`.
+    pub fn cas_subs(&self, assignment: &str, expr: &str) -> String {
+        to_json(&cas::subs_expr(&self.doc, assignment, expr))
+    }
+
+    /// Solve one equation for one unknown. Returns `CasSolveReply` as JSON.
+    ///
+    /// `var` may be empty when the equation has exactly one unknown — which is
+    /// what makes `solve(2x = 2)` answerable without naming `x`.
+    pub fn cas_solve(&self, equation: &str, var: &str) -> String {
+        to_json(&cas::solve_expr(&self.doc, equation, var))
+    }
+
+    /// Every equivalent form the CAS can find. Returns `CasFormsReply` as JSON.
+    pub fn cas_equal(&self, expr: &str) -> String {
+        to_json(&cas::equal_forms(&self.doc, expr))
+    }
+
+    /// `sum(e, k, a, b)`: a closed form, a number, or a refusal that names the
+    /// shape it could not close.
+    pub fn cas_sum(&self, expr: &str, index: &str, from: &str, to: &str) -> String {
+        to_json(&cas::series_expr(
+            &self.doc,
+            cas::SeriesKind::Sum,
+            [expr, index, from, to],
+        ))
+    }
+
+    /// `product(e, k, a, b)`, on the same terms as `cas_sum`.
+    pub fn cas_product(&self, expr: &str, index: &str, from: &str, to: &str) -> String {
+        to_json(&cas::series_expr(
+            &self.doc,
+            cas::SeriesKind::Product,
+            [expr, index, from, to],
+        ))
+    }
+
+    /// One worksheet line, as typed: `solve(2x = 2, x)`, `equal(1^(1/2))`, or a
+    /// bare expression. Returns `CasCommandReply` as JSON.
+    ///
+    /// `history` is a JSON array of the previous results, most recent first,
+    /// for `%`, `%%` and `%%%`. An empty string or `[]` means there is none.
+    /// The dispatch lives here rather than in the shell so that one parser
+    /// decides what a line means; see `cas::command`.
+    pub fn cas_command(&self, line: &str, history: &str) -> String {
+        let history: Vec<String> = serde_json::from_str(history).unwrap_or_default();
+        to_json(&cas::command(&self.doc, line, &history))
+    }
+
+    /// The commands the pane understands, with their signatures, as JSON
+    /// `[{ "name": .., "signature": .. }]`.
+    ///
+    /// Exported so the pane's tab completion is built from the implementation
+    /// rather than from a copy of it — a completion that offers a verb the CAS
+    /// does not have is worse than no completion.
+    pub fn cas_commands_json() -> String {
+        let list: Vec<_> = cas::COMMANDS
+            .iter()
+            .map(|(name, signature)| {
+                serde_json::json!({ "name": name, "signature": signature })
+            })
+            .collect();
+        to_json(&list)
     }
 
     /// Everything downstream of a solution, dropped together.

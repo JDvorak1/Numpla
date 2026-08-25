@@ -1996,18 +1996,30 @@ body.ready.route-chooser .chooser__inner {
 }
 
 /* ============================================================
-   THE COMPUTE PANE
+   THE COMPUTE PANE — a worksheet
 
-   Input on top, history below, and the history scrolls - the
-   same layout rule as the system pane: nothing outside a
-   scroller may change size because a result arrived.
+   A document, not a form: the sheet scrolls, the prompt sits
+   under it, and the two never trade places. Same layout rule
+   as the system pane — nothing outside a scroller may change
+   size because a result arrived, so the prompt, the signature
+   line, the command strip and the foot all keep their height
+   whatever comes back.
+
+   The colour that carries the meaning: the accent for an
+   answer, red for a refusal, AMBER for a numeric
+   identification. That third one is the whole point of the
+   `equal` list — a match to fifteen figures is a suggestion
+   and not a theorem, and it must never look like one.
    ============================================================ */
 
 .compute {
-  grid-template-rows: auto auto minmax(0, 1fr) auto;
+  grid-template-rows: auto minmax(0, 1fr) auto auto;
   min-height: 0;
   background: var(--paper);
   overflow: hidden;
+  --numeric:      #9a6a12;
+  --numeric-tint: rgba(176, 128, 34, .10);
+  --numeric-line: rgba(176, 128, 34, .38);
 }
 
 .compute__head {
@@ -2039,13 +2051,289 @@ body.ready.route-chooser .chooser__inner {
 }
 .compute__note.is-bad { color: var(--error); }
 
-.compute__io {
-  display: grid;
-  gap: 10px;
-  padding: 16px 18px 14px;
-  border-bottom: 1px solid var(--line-soft);
+/* -- the sheet ---------------------------------------------- */
+
+.compute__sheet {
+  overflow-y: auto;
+  padding: 14px 18px 20px;
+  display: flex;
+  flex-direction: column;
+  scrollbar-width: thin;
+  scrollbar-color: #dde1e6 transparent;
+}
+.compute__sheet::-webkit-scrollbar { width: 10px; }
+.compute__sheet::-webkit-scrollbar-thumb {
+  background: #e3e7ec;
+  border-radius: 8px;
+  border: 3px solid var(--paper);
 }
 
+.casempty {
+  margin: auto;
+  max-width: 46ch;
+  text-align: center;
+  color: var(--faint);
+  font-size: 12.5px;
+  line-height: 1.7;
+}
+
+/* One entry of the document: what was typed, and what came back under it.
+   No card and no box - a worksheet is ruled paper, and a page of boxes reads
+   as a list of widgets rather than as something you wrote. */
+.casitem {
+  display: grid;
+  grid-template-columns: 3.2em minmax(0, 1fr) auto;
+  grid-template-areas:
+    "op   in   acts"
+    "sign out  out";
+  align-items: baseline;
+  column-gap: 8px;
+  row-gap: 4px;
+  padding: 10px 0 12px;
+  border-bottom: 1px solid var(--line-soft);
+}
+.casitem:last-child { border-bottom: 0; }
+.casitem:hover .casitem__edit,
+.casitem:hover .casitem__use { opacity: 1; }
+
+.casitem__op {
+  grid-area: op;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  letter-spacing: .04em;
+  color: var(--faint);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.casitem__in   { grid-area: in;  min-width: 0; overflow-x: auto; }
+.casitem__sign {
+  grid-area: sign;
+  justify-self: end;
+  padding-right: 2px;
+  color: var(--accent);
+  font-size: 15px;
+  line-height: 1.2;
+}
+.casitem__out  { grid-area: out; min-width: 0; overflow-x: auto; }
+
+/* The two ways back into the prompt: the answer, and the line itself. Quiet
+   until the entry is under the pointer - a worksheet with two buttons on
+   every line is a form again. Always visible to the keyboard and to touch. */
+.casitem__edit,
+.casitem__use {
+  appearance: none;
+  min-height: 24px;
+  padding: 0 9px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--paper);
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 11px;
+  cursor: pointer;
+  white-space: nowrap;
+  opacity: 0;
+  transition: opacity 120ms var(--ease), color 120ms var(--ease),
+              background-color 120ms var(--ease), border-color 120ms var(--ease);
+}
+.casitem__acts {
+  grid-area: acts;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+.casitem__edit:hover,
+.casitem__use:hover {
+  color: var(--paper);
+  background: var(--accent);
+  border-color: var(--accent);
+}
+.casitem__edit:focus-visible,
+.casitem__use:focus-visible { opacity: 1; outline: 2px solid var(--accent); outline-offset: 2px; }
+.casitem__use[hidden] { display: none; }
+
+.casitem__err {
+  grid-area: out;
+  font-size: 12.5px;
+  color: var(--error);
+}
+
+/* What the answer assumes, what it does not contain, or that there is none:
+   "assuming a is not zero", "no solutions — quadratic formula". An assumption
+   the reader cannot see is one they cannot check, so it is on the line. */
+.casitem__note {
+  grid-column: 1 / -1;
+  margin: 2px 0 0;
+  padding-left: 4em;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--muted);
+}
+/* gray, not red: a half-typed line is unfinished, not wrong. */
+.casitem__err.is-pending { color: var(--muted); }
+.casitem.is-error .casitem__sign { color: var(--error); }
+.casitem.is-error .casitem__op { color: var(--error); }
+.casitem.is-pending .casitem__sign,
+.casitem.is-pending .casitem__op { color: var(--faint); }
+
+/* A read-only rendering of the same math the prompt draws: a field with its
+   own editing switched off, not a second renderer. */
+.mf--static .mf { border: 0; background: transparent; padding: 0; cursor: default; }
+.casitem .mf { font-size: 15px; }
+.casitem__in .mf { color: var(--text-2); }
+
+/* -- equal: the choice list ---------------------------------- */
+
+.casforms {
+  grid-area: out;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.casform {
+  display: grid;
+  grid-template-columns: 1.2em minmax(0, 1fr) auto auto;
+  align-items: baseline;
+  gap: 4px 8px;
+  padding: 5px 8px 5px 0;
+  border-radius: var(--r-sm);
+  cursor: pointer;
+}
+.casform:hover { background: var(--paper-2); }
+.casform:hover .casform__use { opacity: 1; }
+
+.casform__rel {
+  justify-self: end;
+  font-size: 14px;
+  color: var(--accent);
+}
+.casform__math { min-width: 0; overflow-x: auto; }
+.casform__math .mf { font-size: 15px; }
+
+.casform__label {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+.casform__flag {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  letter-spacing: .02em;
+  padding: 1px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  color: var(--faint);
+  white-space: nowrap;
+}
+
+/* The crate's own sentence about why a form was offered — what an
+   identification agreed to, and the reminder that agreeing is not proving.
+   It is the justification, so it is on the row and not in a tooltip. */
+.casform__note {
+  grid-column: 2 / -1;
+  margin: 0;
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--muted);
+}
+
+/* Exact: quiet. It is the ordinary case, and a badge on every row would make
+   the one that matters invisible. */
+.casform.is-exact .casform__flag {
+  color: var(--accent);
+  border-color: var(--accent-line);
+  background: var(--accent-tint);
+}
+
+/* Conditional: equal WHERE ITS CONDITION HOLDS, and the condition is the flag
+   rather than a footnote. An equals sign without its condition is the same
+   lie as an identification without its "≈". */
+.casform.is-conditional .casform__flag {
+  color: var(--text-2);
+  border-color: var(--line-strong);
+  background: var(--paper);
+}
+
+/* Anything written with ≈ is an approximation, and the relation says so
+   before any of the words do. */
+.casform.is-approx .casform__rel { color: var(--muted); }
+.casform.is-decimal .casform__math .mf { color: var(--text-2); }
+
+/* A NUMERIC IDENTIFICATION IS NOT A PROVEN IDENTITY. It is written with ≈
+   rather than =, it is amber rather than green, and it says so in words. A
+   match to fifteen figures sold as an equality is the one lie a CAS must
+   never tell, and this is the pixel where that promise is kept. */
+.casform.is-identification { background: var(--numeric-tint); }
+.casform.is-identification:hover { background: var(--numeric-tint); }
+.casform.is-identification .casform__rel { color: var(--numeric); }
+.casform.is-identification .casform__label { color: var(--numeric); }
+.casform.is-identification .casform__note { color: var(--numeric); }
+.casform.is-identification .casform__flag {
+  color: var(--numeric);
+  border-color: var(--numeric-line);
+  background: var(--paper);
+}
+.casform.is-identification .casform__math .mf { color: var(--text-2); }
+
+.casform__use {
+  appearance: none;
+  min-height: 24px;
+  padding: 0 9px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--paper);
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 11px;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 120ms var(--ease), color 120ms var(--ease),
+              background-color 120ms var(--ease), border-color 120ms var(--ease);
+}
+.casform__use:hover {
+  color: var(--paper);
+  background: var(--accent);
+  border-color: var(--accent);
+}
+.casform.is-identification .casform__use:hover {
+  background: var(--numeric);
+  border-color: var(--numeric);
+}
+.casform__use:focus-visible { opacity: 1; outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/* -- the prompt ---------------------------------------------- */
+
+.compute__io {
+  display: grid;
+  gap: 8px;
+  padding: 12px 18px 12px;
+  border-top: 1px solid var(--line);
+  background: var(--paper-2);
+}
+
+.compute__prompt {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+/* The gutter reads [3] while the sheet's last line reads [2]: the number this
+   line WILL be. It is the one place a worksheet says where you are. */
+.compute__gutter {
+  flex: 0 0 auto;
+  min-width: 2.6em;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--accent);
+  text-align: right;
+}
+
+.compute__field { flex: 1 1 auto; min-width: 0; }
 .compute__field .mf {
   min-height: 44px;
   padding: 9px 12px;
@@ -2059,25 +2347,61 @@ body.ready.route-chooser .chooser__inner {
   box-shadow: 0 0 0 3px var(--accent-tint);
 }
 
-.compute__row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-.compute__ops { display: inline-flex; gap: 6px; flex-wrap: wrap; }
+.compute__run {
+  flex: 0 0 auto;
+  appearance: none;
+  min-height: 34px;
+  padding: 0 14px;
+  border: 1px solid var(--accent-line);
+  border-radius: 999px;
+  background: var(--accent-tint);
+  color: var(--accent);
+  font-family: var(--mono);
+  font-size: 12px;
+  cursor: pointer;
+  transition: color 120ms var(--ease), background-color 120ms var(--ease);
+}
+.compute__run:hover { color: var(--paper); background: var(--accent); }
+.compute__run:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/* The signature, while you are choosing. A fixed height, because a line that
+   appears and disappears would move the prompt under the caret. */
+.compute__sig {
+  margin: 0;
+  min-height: 17px;
+  padding-left: 3.4em;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* -- the command strip --------------------------------------- */
+
+.compute__ops {
+  display: flex;
+  gap: 5px;
+  flex-wrap: wrap;
+  padding-left: 3.4em;
+}
 
 .casop {
   appearance: none;
-  min-height: 32px;
-  padding: 0 13px;
+  min-height: 26px;
+  padding: 0 10px;
   border: 1px solid var(--line);
   border-radius: 999px;
   background: var(--paper);
   color: var(--text-2);
   font-family: var(--mono);
-  font-size: 12.5px;
+  font-size: 11.5px;
   cursor: pointer;
   transition: color 120ms var(--ease), background-color 120ms var(--ease),
               border-color 120ms var(--ease);
 }
 .casop:hover { color: var(--accent); border-color: var(--accent-line); background: var(--accent-tint); }
-.casop.is-last { color: var(--accent); border-color: var(--accent-line); }
 .casop[aria-disabled="true"] {
   color: #c3c8d0;
   cursor: not-allowed;
@@ -2086,112 +2410,16 @@ body.ready.route-chooser .chooser__inner {
 .casop[aria-disabled="true"]:hover { color: #c3c8d0; border-color: var(--line); background: var(--paper-2); }
 .casop:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
-.compute__var {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  margin-left: auto;
-  font-family: var(--mono);
-  font-size: 12px;
-  color: var(--muted);
-}
-.compute__var input {
-  width: 46px;
-  padding: 5px 7px;
-  font-family: var(--mono);
-  font-size: 12.5px;
-  color: var(--text);
-  background: var(--paper);
-  border: 1px solid var(--line);
-  border-radius: var(--r-sm);
-}
-.compute__var input:focus {
-  outline: none;
+/* The ditto keys. Set apart, because they are not commands: they are the
+   worksheet's own grammar, and on a phone they are the only way to reach a
+   previous result at all. */
+.casop--ditto {
+  margin-left: 4px;
+  color: var(--accent);
   border-color: var(--accent-line);
-  box-shadow: 0 0 0 3px var(--accent-tint);
+  border-style: dashed;
 }
-
-.compute__log {
-  overflow-y: auto;
-  padding: 12px 18px 18px;
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  scrollbar-width: thin;
-  scrollbar-color: #dde1e6 transparent;
-}
-.compute__log::-webkit-scrollbar { width: 10px; }
-.compute__log::-webkit-scrollbar-thumb {
-  background: #e3e7ec;
-  border-radius: 8px;
-  border: 3px solid var(--paper);
-}
-
-.casempty {
-  margin: 26px auto;
-  max-width: 44ch;
-  text-align: center;
-  color: var(--faint);
-  font-size: 12.5px;
-  line-height: 1.6;
-}
-
-.casitem {
-  display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto;
-  grid-template-areas:
-    "op   in   use"
-    "sign out  out";
-  align-items: center;
-  gap: 6px 10px;
-  padding: 10px 12px;
-  border: 1px solid var(--line);
-  border-radius: var(--r-sm);
-  background: var(--paper-2);
-}
-
-.casitem__op {
-  grid-area: op;
-  font-family: var(--mono);
-  font-size: 11px;
-  letter-spacing: .08em;
-  color: var(--muted);
-  white-space: nowrap;
-}
-.casitem__in   { grid-area: in;  min-width: 0; overflow-x: auto; }
-.casitem__sign { grid-area: sign; color: var(--accent); font-size: 14px; text-align: center; }
-.casitem__out  { grid-area: out; min-width: 0; overflow-x: auto; }
-
-.casitem__use {
-  grid-area: use;
-  appearance: none;
-  min-height: 26px;
-  padding: 0 10px;
-  border: 1px solid var(--line);
-  border-radius: 999px;
-  background: var(--paper);
-  color: var(--muted);
-  font-family: var(--mono);
-  font-size: 11.5px;
-  cursor: pointer;
-  white-space: nowrap;
-}
-.casitem__use:hover { color: var(--paper); background: var(--accent); border-color: var(--accent); }
-.casitem__use:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-.casitem__use[hidden] { display: none; }
-
-.casitem__err {
-  grid-area: out;
-  font-size: 12.5px;
-  color: var(--error);
-}
-.casitem.is-error { border-color: var(--error-line); background: var(--error-tint); }
-
-/* A read-only rendering of the same math the input surface draws: a field with
-   its own editing switched off, not a second renderer. */
-.mf--static .mf { border: 0; background: transparent; padding: 0; cursor: default; }
-.casitem .mf { font-size: 15px; }
-.casitem__in .mf { color: var(--text-2); }
+.casop--ditto + .casop--ditto { margin-left: 0; }
 
 .compute__foot {
   margin: 0;
@@ -2204,15 +2432,43 @@ body.ready.route-chooser .chooser__inner {
 }
 .compute__foot.is-bad { color: var(--error); }
 
+/* The math keyboard is fixed to the bottom of the viewport, and in this route
+   the PROMPT is at the bottom of the pane - so the pane gives the panel its
+   height rather than letting it sit on top of the line being typed. The same
+   deal the row list makes with --kb-pad, and for the same reason: the sheet
+   is a scroller and can give the room up. */
+body.kb-open.route-compute .compute { padding-bottom: var(--kb-pad); }
+
 /* -- the phone --------------------------------------------- */
 
 body.is-narrow .chooser { padding: 16px; }
 body.is-narrow .chooser__cards { grid-template-columns: minmax(0, 1fr); gap: 12px; }
 body.is-narrow .choice { padding: 18px 16px; }
 body.is-narrow .compute__head { height: 56px; padding: 0 12px; }
-body.is-narrow .compute__io { padding: 12px; }
-body.is-narrow .compute__log { padding: 10px 12px 16px; }
+body.is-narrow .compute__io { padding: 10px 12px; }
+body.is-narrow .compute__sheet { padding: 10px 12px 16px; }
+body.is-narrow .compute__sig,
+body.is-narrow .compute__ops { padding-left: 0; }
+body.is-narrow .compute__gutter { min-width: 2.2em; }
+
+/* The strip is the phone's Tab key, so it must be reachable with a thumb and
+   it must not eat the sheet: one row, scrolled sideways. */
+body.is-narrow .compute__ops,
+body.is-touch .compute__ops {
+  flex-wrap: nowrap;
+  overflow-x: auto;
+  scrollbar-width: none;
+  padding-bottom: 2px;
+}
+body.is-narrow .compute__ops::-webkit-scrollbar,
+body.is-touch .compute__ops::-webkit-scrollbar { display: none; }
 body.is-narrow .casop,
-body.is-touch .casop { min-height: var(--tap); padding: 0 14px; }
+body.is-touch .casop { min-height: var(--tap); padding: 0 14px; flex: 0 0 auto; }
+
+/* Nothing may be hover-only on a screen with no pointer. */
+body.is-narrow .casitem__edit,
 body.is-narrow .casitem__use,
-body.is-touch .casitem__use { min-height: 34px; }
+body.is-narrow .casform__use,
+body.is-touch .casitem__edit,
+body.is-touch .casitem__use,
+body.is-touch .casform__use { opacity: 1; min-height: 32px; }

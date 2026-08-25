@@ -680,36 +680,80 @@ measured on is the same bug as a stale sample.
   list means the document has not named a quantity to watch yet — the useful
   prompt is a row, e.g. `E = 0.5(x'^2 + x^2)`, not a dialog.
 
-## The compute pane — `simplify`, `diff`, `expand`, `eval`
+## The compute pane — a worksheet
 
-Numpla's second half: type an expression, get it simplified, differentiated or
-multiplied out. Four calls, added after v1 and self-contained — nothing above
-this section changes.
+Numpla's second half: type a line, get an answer beneath it, type the next one.
+Self-contained — nothing above this section changes.
 
 ```rust
 #[wasm_bindgen]
 impl Model {
-    /// Fold arithmetic, apply the identity and zero laws, collect like
-    /// terms, order commutative operands canonically.
+    // One worksheet line, as typed. This is the call the pane makes.
+    pub fn cas_command(&self, line: &str, history: &str) -> String;
+    pub fn cas_commands() -> String;   // names + signatures, for completion
+
+    // ...and the individual verbs, for a caller that has already parsed.
+    pub fn cas_solve(&self, equation: &str, var: &str) -> String;   // CasSolveReply
+    pub fn cas_equal(&self, expr: &str) -> String;                  // CasFormsReply
+    pub fn cas_eval(&self, expr: &str) -> String;                   // CasReply
+    pub fn cas_evalf(&self, expr: &str) -> String;
     pub fn cas_simplify(&self, expr: &str) -> String;
-
-    /// Differentiate with respect to `var`.
-    pub fn cas_diff(&self, expr: &str, var: &str) -> String;
-
-    /// Multiply out products over sums.
     pub fn cas_expand(&self, expr: &str) -> String;
-
-    /// Numeric where the document supplies enough values; the simplified
-    /// expression, plus a step saying which name is missing, where it does not.
-    pub fn cas_eval(&self, expr: &str) -> String;
+    pub fn cas_factor(&self, expr: &str) -> String;
+    pub fn cas_diff(&self, expr: &str, var: &str) -> String;
+    pub fn cas_subs(&self, assignment: &str, expr: &str) -> String;
+    pub fn cas_sum(&self, expr: &str, index: &str, from: &str, to: &str) -> String;
+    pub fn cas_product(&self, expr: &str, index: &str, from: &str, to: &str) -> String;
 }
 ```
 
-All four take `&self`. Algebra never disturbs the document, the stored solution
-or the conservation series — that is in the signature so the compiler keeps it,
-and it means the pane can be driven on every keystroke beside a running plot.
+All of them take `&self`. Algebra never disturbs the document, the stored
+solution or the conservation series — that is in the signature so the compiler
+keeps it, and it means the pane can be driven on every keystroke beside a
+running plot.
 
-### The reply
+**Every string that comes back is Numpla source that parses.** `output`, every
+`steps[i].expr`, every solution, every alternative form. This is a guarantee,
+not an aspiration: it is asserted over the whole corpus in `numpla-cas`'s
+property test, because an answer you cannot paste back into your document is not
+an answer.
+
+### `cas_command` — one line, dispatched
+
+```jsonc
+{
+  "command": "solve",              // which verb ran; the shape of `reply` follows
+  "source": "solve(2x = 2, x)",    // the line after `%` was substituted
+  "reply": { /* one of the three shapes below */ }
+}
+```
+
+**Switch on `command`, not on the fields of `reply`.** `"solve"` gives a
+`CasSolveReply`, `"equal"` gives a `CasFormsReply`, everything else gives a
+`CasReply`.
+
+`history` is a JSON array of previous results, **most recent first** — pass
+`"[]"` when there is none. It is what `%` reads: `%` is the previous result,
+`%%` the one before, `%%%` the one before that, Maple's own convention.
+Substitution happens *before parsing* and the replacement is bracketed, so `%`
+is genuinely the previous expression:
+
+| history | line | `source` |
+|---|---|---|
+| `["3x^2", "x^3"]` | `solve(% = 12, x)` | `solve((3x^2) = 12, x)` |
+| `["3x^2", "x^3"]` | `eval(%%)` | `eval((x^3))` |
+| `["3x^2"]` | `eval(%%)` | refused: reaching past the end is an error, not an empty substitution |
+
+A line with no recognised command is `eval` — "Enter evaluates". That is
+unambiguous because every command name is multi-letter and every identifier in
+this language is a single letter, so `f(x)` can never be mistaken for a verb.
+
+`cas_commands()` returns `[{ "name": "solve", "signature": "solve(equation, var)" }, ...]`
+in menu order. Build tab completion from it rather than from a copy.
+
+### `CasReply` — the shape for the single-expression verbs
+
+Unchanged from v1:
 
 ```jsonc
 {
@@ -725,17 +769,6 @@ and it means the pane can be driven on every keystroke beside a running plot.
 }
 ```
 
-**`output` is Numpla source and it parses.** So is every `steps[i].expr`. This
-is a guarantee, not an aspiration: the whole corpus is round-tripped through the
-parser in `numpla-cas`'s property test, because an answer you cannot paste back
-into your document is not an answer. Offer "paste into document" on any reply
-with `ok: true`.
-
-`steps` is present only when there is working worth showing, and every entry is
-an expression the code actually computed on the way to the answer — never a
-reconstructed narration. `cas_simplify` therefore usually has no steps: it
-rewrites the whole tree at once rather than applying named laws in sequence.
-
 `pending: true` is the gray-not-red rule at this boundary. A half-typed
 expression is not wrong, it is unfinished; render it muted and do not report it
 as an error. `ok: false` with `pending` absent is a real refusal and carries a
@@ -746,6 +779,226 @@ sentence in `error`.
 | `ok: true` | An answer. `output` is source. |
 | `ok: false`, `pending: true` | Still typing. Mute the pane; say nothing. |
 | `ok: false` | A considered refusal. Show `error` as a sentence. |
+
+### `CasSolveReply` — `solve`
+
+```jsonc
+{
+  "ok": true,
+  "input": "x^2 - 2x - 1 = 0",
+  "variable": "x",              // echoed: it may have been chosen for you
+  "solutions": [
+    { "expr": "-sqrt(2) + 1", "verified": "numeric", "value": -0.41421356237309515 },
+    { "expr": "sqrt(2) + 1",  "verified": "numeric", "value": 2.414213562373095 }
+  ],
+  "method": "quadratic formula",
+  "everyValue": false,          // omitted unless true
+  "note": null,                 // omitted when there is nothing assumed
+  "error": null,
+  "pending": false
+}
+```
+
+- **`solutions` is complete or the reply is a refusal.** There is no partial
+  answer: a solver that returned *some* of the roots would be worse than one
+  that returned none, so anything it cannot finish comes back `ok: false`.
+- **An empty list with `ok: true` means there are none.** `x^2 + 1 = 0` has no
+  real solutions, and that is an answer. Render it as one.
+- **`everyValue: true`** means `x = x`: the list is not the answer and must not
+  be shown as one.
+- **`verified`** is `"exact"` when substituting the root back and simplifying
+  gives literally zero, `"numeric"` when it vanishes to within rounding. A
+  radical is normally `"numeric"`, because cancelling `sqrt(u)^2` is a rewrite
+  this CAS refuses to make. It is never anything else — a root that failed would
+  be a bug, and the property test asserts it never happens.
+- **`value`** is the root as a decimal, when it has one. Absent for `b/a`.
+- **`note`** is what the answer assumes: *"assuming a is not zero — if it is, the
+  equation is either an identity or has no solutions"*. Show it. An assumption
+  the reader cannot see is one they cannot check.
+- **`var` may be `""`** when the equation has exactly one unknown, which is what
+  makes `solve(2x = 2)` answerable. Two unknowns and no name is a refusal that
+  lists them.
+
+#### What `solve` answers
+
+| | |
+|---|---|
+| linear, numeric or symbolic | `2x = 2`, `a x = b` (with the `a != 0` note) |
+| quadratic, numeric or symbolic | `x^2 = 2` → `-sqrt(2)`, `sqrt(2)`; a double root is *one* root |
+| any polynomial, through its rational roots | found exactly by the rational root theorem in integer arithmetic, divided out, and the remaining linear or quadratic factor finished |
+| biquadratic | `x^4 + b x^2 + c`, as a quadratic in `x^2` |
+| anything the unknown occurs in **once** | `a e^(b x) = c`, `ln x = c`, `a x^n = c`, `2^x = 8`, `sqrt(x + 1) = 3`, `abs(x - 1) = 2`, `1/x = 4`, `log(2, x) = 5` — by inverting the operations from the outside in, each with its own domain check |
+| products | `exp(x)(x - 1) = 0` is `x = 1`: `exp` is never zero, which is a fact and not an omission |
+
+Domain checks are real answers: `sqrt(x) = -1` and `exp(x) = -1` come back with
+an empty solution list, not with a spurious root.
+
+#### What `solve` refuses, by name
+
+- **A cubic or quartic with no rational root.** Cardano's formula is real and
+  this CAS will not print it: its nested radicals are not something a person can
+  check, and in the casus irreducibilis they express a real root as a sum of
+  complex numbers. `x^3 - 6x - 6 = 0` is refused with that sentence.
+- **Degree five and above** with no rational root, for Abel's reason.
+- **Trigonometric equations.** `sin(x) = 0` has infinitely many solutions and
+  this returns finite sets; picking one and calling it the answer would be wrong
+  in the way that matters.
+- **The unknown appearing more than once** in something that is not a
+  polynomial: `x + ln(x) = 1` has no inversion to run.
+- **`floor`, `ceil`, `round`, `sign`**: whole intervals map to one value, so the
+  solution is an interval rather than a list.
+- **Complex roots.** `x^2 = -1` has none *over the reals*, which is the field
+  `numpla-expr` evaluates in, and the message says so.
+- **A power with a symbolic exponent, or a branch condition on a symbol.**
+  `x^n = c` with `n` unknown cannot be inverted without knowing whether `n` is
+  odd; `exp(x) = c` with `c` symbolic has a solution only when `c > 0`, and
+  guessing which is how a solver invents roots.
+
+### `CasFormsReply` — `equal`
+
+Every way of writing the expression that the CAS can find, as a list to choose
+from. This is the centrepiece: `simplify` decides for you, `equal` shows the
+alternatives.
+
+```jsonc
+{
+  "ok": true,
+  "input": "1^(1/2)",
+  "forms": [
+    { "expr": "1",       "label": "simplify",                    "kind": "exact" },
+    { "expr": "sqrt(1)", "label": "a half power as a square root","kind": "exact" }
+  ],
+  "value": 1.0,                 // the input's value, when it has one
+  "error": null,
+  "pending": false
+}
+```
+
+**`kind` is the field that matters**, and the UI must render the four apart:
+
+| `kind` | Claim | Render as |
+|---|---|---|
+| `"exact"` | Equal to the input wherever the input has a value at all. | An equals sign. |
+| `"conditional"` | Equal **where `condition` holds**, and carries it. | An equals sign *plus the condition*, never without. |
+| `"decimal"` | The floating-point value. An approximation. | `≈`. |
+| `"identification"` | A closed form that **matches the number** to near machine precision. **Not proved.** | `≈`, or an explicit "recognised as". Never a bare `=`. |
+
+`condition` is present for exactly the `conditional` forms and is a sentence:
+`"x > 0 and y > 0"`. `note` carries what an identification agreed to and the
+reminder that it is a match rather than a derivation.
+
+The list is capped at 32, deduplicated by printed source, and never contains the
+input itself — those are the other ways of writing it. First label wins on a
+tie, so the order is the order of preference.
+
+#### Where the forms come from
+
+- `simplify`, `expand`, `factor` — the existing rewrites are candidates too.
+- Radical ↔ exponent: `sqrt(u)` ↔ `u^(1/2)`, and `sqrt(u^2)` → `abs(u)` (which
+  is unconditional, unlike `sqrt(u^2) = u`).
+- The logarithm laws in both directions: `ln(ab)` ↔ `ln a + ln b`,
+  `ln(u^n)` ↔ `n ln u`, `log(b, u)` ↔ `ln u / ln b`, `ln(exp u)` → `u`. Each
+  carries its condition where it has one — `ln(u v)` splits only *given* `u > 0`
+  and `v > 0`, because `ln((-2)(-3))` is a number and `ln(-2) + ln(-3)` is not.
+- The exponent laws that hold for **real** numbers rather than only positive
+  ones: integer exponents (`(uv)^n` ↔ `u^n v^n`, `(u^m)^n` → `u^(mn)`),
+  positive numeric bases (`2^u` → `exp(u ln 2)`), and `exp(u) exp(v)` ↔
+  `exp(u + v)`. The non-integer version of `(u^a)^b` is offered too, marked
+  conditional on `u > 0`.
+- Trigonometric identities: Pythagorean (`sin^2 + cos^2` → `1`, `1 - sin^2` →
+  `cos^2`, and the hyperbolic one), double angle (three forms for `cos 2u`),
+  angle addition, sum-to-product, `tan` ↔ `sin/cos`, and the exponential
+  definitions of `sinh` and `cosh`.
+- Rationalising a denominator (`1/sqrt(2)` → `sqrt(2)/2`, and by the conjugate,
+  conditionally), a common denominator, and partial fractions where the
+  denominator's roots are rational and simple.
+- The numeric value, and every closed form recognised from it.
+
+Every rule is tried at every node, so `ln(x*y) + 1` gets the same candidates
+`ln(x*y)` does, rebuilt in place.
+
+#### Identification — the tolerance, and why it is what it is
+
+When the expression is a number, `equal` searches a table of closed forms for
+anything matching it: fractions, `pi` and its powers, `e`, `sqrt(n)`, cube
+roots, `ln(n)`, `pi^2/6` and the other zeta values that are rational multiples
+of powers of pi, the golden ratio, small rational multiples of all of those, and
+two-term combinations `p/q + (r/s)·C`. About twenty thousand candidates.
+
+| input | `expr` | `note` begins |
+|---|---|---|
+| `1.6449340668482264` | `pi^2/6` | pi squared over six, which is zeta(2) |
+| `1.618033988749895` | `(1 + sqrt(5))/2` | the golden ratio |
+| `0.3333333333333333` | `1/3` | a fraction |
+| `2.7182818284590455` | `e` | e |
+| `3.1415926` | *(nothing)* | seven correct digits of pi is not pi |
+
+**A match requires relative agreement to `1e-12`**, and that number is the whole
+safety argument. From below: a value computed in `f64` through several
+operations loses a few ulps, so a true match arrives at about `1e-15` and can
+degrade to `1e-13`; demanding more would reject real identities. From above:
+near a value of order one, roughly three thousand candidates land within a factor
+of two, so neighbours are about `3e-4` apart and the chance an unrelated number
+falls within `1e-12` of one is around **seven in a billion** per query.
+Loosening to `1e-9` would buy nothing — no true identity needs it — and would
+raise the coincidence rate a thousandfold. Values below `1e-6` and above `1e12`
+are not identified at all: there are no digits down there to match on.
+
+Every candidate is re-evaluated from the expression that will actually be shown,
+so what you render is what was checked. **It is still evidence and not a proof,
+and a false identity is the worst thing a CAS can hand somebody** — it looks
+like the answer, it gets copied into the next document, and nothing downstream
+ever questions it again. That is why `kind` exists. Render it.
+
+### `eval` and `evalf` are two different questions
+
+| Call | `sqrt(8)` | `2 + 3*4` | `x + 1` |
+|---|---|---|---|
+| `cas_eval` | `2sqrt(2)` | `14` | `x + 1`, with a step saying `x` has no value |
+| `cas_evalf` | `2.8284271247461903` | `14` | `ok: false` — "`evalf` has to produce a number, and `x` has no value in this document" |
+
+`eval` is the best **exact** form the CAS can reach with the document's values
+put in. `sqrt(2)` is already its own best exact form; replacing it with a
+seventeen-digit decimal throws away the only exact spelling the document can
+hold, and does it silently. `evalf` is the verb that always answers with a
+number, and says which name stopped it when it cannot.
+
+An expression that still reads a name with no value — a state variable, say,
+which only has values along a solution — is **not** an error under `eval`. It
+comes back `ok: true` with the simplified expression and one step naming what is
+missing:
+
+```jsonc
+{ "ok": true, "input": "x + x", "output": "2x",
+  "steps": [ { "rule": "x has no value in this document, so this stays symbolic",
+               "expr": "2x" } ] }
+```
+
+### `sum` and `product`
+
+Three answers, in this order: a closed form where one exists, the series added
+up where the limits are numbers, and otherwise a refusal that names the shape.
+`steps[0].rule` says which — `"power sums"`, `"geometric series"`, `"added up
+term by term"` — and a second step carries any assumption.
+
+| Call | `output` |
+|---|---|
+| `cas_sum("k", "k", "1", "n")` | `n * (n + 1)/2` |
+| `cas_sum("k^2", "k", "1", "10")` | `385` |
+| `cas_sum("2^k", "k", "0", "n")` | `2^(n + 1) - 1` |
+| `cas_sum("1/k", "k", "1", "4")` | `1/3 + 1.75` |
+| `cas_product("2", "k", "1", "n")` | `2^n` |
+| `cas_product("k", "k", "1", "5")` | `120` |
+
+Closed forms: any polynomial in the index up to degree three (by the power sums,
+written from `a` to `b` rather than from 1, so an offset lower limit is right),
+geometric `r^k` and `exp(c k)`, and for products a factor free of the index and a
+geometric one. An empty range is `0` for a sum and `1` for a product.
+
+`cas_product("k", "k", "1", "n")` is refused, and the sentence says why: that is
+`n!`, and Numpla has no factorial to write the answer with. Every string this
+API returns is source you can paste back, and `!` is not part of the language —
+with numeric limits it gives you the number instead.
 
 ### The document is in scope
 
@@ -761,69 +1014,78 @@ Parameters are the other half of that, and they behave differently on purpose:
 | `cas_simplify` | `2k * x` — you are manipulating the expression you typed |
 | `cas_eval` | `6x` — every value the document has is put in; `x` has none, so a step says so |
 
-`cas_eval` is the only one that reads parameter *values*. Folding today's slider
-position into an expression somebody is rearranging would quietly destroy the
-thing they were working on.
-
-An expression that still reads a name with no value — a state variable, say,
-which only has values along a solution — is **not** an error. It comes back
-`ok: true` with the simplified expression and one step naming what is missing:
-
-```jsonc
-{ "ok": true, "input": "x + x", "output": "2x",
-  "steps": [ { "rule": "x has no value in this document, so this stays symbolic",
-               "expr": "2x" } ] }
-```
+Folding today's slider position into an expression somebody is rearranging would
+quietly destroy the thing they were working on.
 
 ### Worked examples
 
 | Call | `output` |
 |---|---|
 | `cas_simplify("2x + 3x")` | `5x` |
-| `cas_simplify("x/3 + x/3")` | `2x/3` |
-| `cas_diff("x^3", "x")` | `3x^2` |
-| `cas_diff("x^x", "x")` | `x^x * (ln(x) + 1)` |
+| `cas_simplify("ln(x) + ln(y)")` | `ln(x * y)` |
 | `cas_expand("(x + 1)^3")` | `x^3 + 3x^2 + 3x + 1` |
-| `cas_eval("2 + 3*4")` | `14` |
+| `cas_expand("-(x + y)")` | `-x - y` |
+| `cas_factor("2x^2 - 5x + 3")` | `(x - 1) * (2x - 3)` |
+| `cas_factor("x^2 - 2")` | `x^2 - 2` — it does not factor over the rationals |
+| `cas_diff("x^x", "x")` | `x^x * (ln(x) + 1)` |
+| `cas_subs("x = 3", "x^2 + 1")` | `10` |
 
-### What it will not do, and says so
+### What the whole pane will not do, and says so
 
-The refusals are answers. Each comes back `ok: false` with a sentence, never
-with a plausible expression:
+Beyond `solve`'s list above:
 
 - **`x'`, `x''`.** A primed name already means "derivative with respect to the
   document's independent variable"; differentiating it again would be guessing
-  what it is a derivative *of*.
+  what it is a derivative *of*. A primed *row* is an ODE and belongs in the
+  document, where it can be integrated.
 - **A noise source.** `smooth(t)` is a lattice sample and `white(t)` is not even
   continuous. There is nothing to differentiate.
 - **`mod(u, v)` with a moving modulus**, and any name the document has not
   defined as a function.
-- **A row.** `x' = -y` has an `=` in it, so it belongs in the document where it
-  can be solved. The pane says so rather than computing with one side of it.
-
-And four whole capabilities are out of scope rather than half-implemented, so
-there is no call to make: **symbolic integration, equation solving, limits and
-series, and symbolic matrices**. The reasons are in `numpla-cas`'s crate docs.
+- **Symbolic integration**, **limits and series expansions**, and **symbolic
+  matrices**: still out of scope rather than half-implemented, and there is no
+  call to make. The reasons are in `numpla-cas`'s crate docs.
 
 ### Why you can trust the answer
 
 Every rewrite preserves value. A simplifier that is merely plausible is worse
 than none, because you cannot tell when it lied — so `numpla-cas` is built
-around a property test rather than a rule list: a corpus of over a hundred
-expressions is evaluated before and after every rewrite at many pseudo-random
-points, and any disagreement fails the build. Symbolic derivatives are checked
-against a Richardson-extrapolated central difference over the same corpus.
+around a property test rather than a rule list. Over a corpus of more than a
+hundred expressions, evaluated at many pseudo-random points:
+
+1. `simplify`, `expand` and `factor` do not change the value.
+2. Everything printed is source that parses, prints identically the second time
+   round, and still has the same value.
+3. Symbolic derivatives agree with a Richardson-extrapolated central difference.
+4. **Every candidate `equal` returns really equals the input** — the exact ones
+   everywhere the input has a value, the conditional ones at every sampled point
+   where their condition holds, and the identifications against the number they
+   claim. An "equal" list containing something unequal is worse than no list.
+5. **Every root `solve` returns satisfies its equation**, substituted back and
+   checked symbolically or numerically, and the *count* of roots is asserted
+   wherever it is known independently.
+6. Every closed form for a sum or product agrees with the same series added up
+   one term at a time, at several limits including the empty one.
 
 Two rewrites *do* differ from the input at isolated points, and every CAS makes
 them: `0 * u` becomes `0`, and `u/u` cancels to `1`. Both differ only where the
-input itself is not a finite number.
+input itself is not a finite number. Merging `ln u + ln v` into `ln(u v)` is a
+third of a different kind: the same real number, but the product can overflow
+where the two logarithms were ordinary, so the rewrite is bounded to small
+coefficients and the disagreement — where it happens at all — is the
+floating-point range and not the algebra.
 
 ### Notes for the shell
 
-- Drive it per keystroke if you like; all four calls are cheap and none of them
+- Drive it per keystroke if you like; every call is cheap and none of them
   touches the solution.
 - Match `input` against what you sent before rendering — replies from a fast
   typist can arrive out of order.
 - `pending` means muted, never red. It is the same rule the row list follows.
 - Show `steps` folded away by default. The unsimplified derivative is what
   somebody checking their own working wants, and it is noise for everyone else.
+- Render `equal`'s `kind` and `condition`. A conditional form shown without its
+  condition, or an identification shown as an identity, is the one way this API
+  can be used to say something false.
+- Offer "paste into document" on any answer, any solution and any form: all of
+  them are source.

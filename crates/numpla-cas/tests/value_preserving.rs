@@ -6,14 +6,25 @@
 //! corpus of expressions is evaluated before and after each rewrite at many
 //! pseudo-random points, and any disagreement fails the build.
 //!
-//! Four properties, over one corpus:
+//! Seven properties, over one corpus:
 //!
 //! 1. `simplify` does not change the value.
 //! 2. `expand` does not change the value.
-//! 3. everything printed is Numpla source that parses, prints identically the
+//! 3. `factor` does not change the value.
+//! 4. everything printed is Numpla source that parses, prints identically the
 //!    second time round, and still has the same value — a result you cannot
 //!    paste back into your document is not a result.
-//! 4. `diff` agrees with a high-order numerical derivative.
+//! 5. `diff` agrees with a high-order numerical derivative.
+//! 6. **every candidate `equal` returns really equals the input.** An "equal"
+//!    list containing something unequal is worse than no list, so this is the
+//!    property the whole feature rests on. Candidates that carry a
+//!    [`numpla_cas::Condition`] are checked at the sample points where that
+//!    condition holds and skipped elsewhere — which is what makes a conditional
+//!    identity honest rather than merely hedged. Candidates that are numeric
+//!    identifications are checked against the value they claim to match.
+//! 7. **every root `solve` returns satisfies the equation**, symbolically where
+//!    the algebra closes and numerically where it does not, and the number of
+//!    roots is what it should be wherever that is known.
 //!
 //! # Sampling, domains, and why points get skipped
 //!
@@ -57,7 +68,7 @@
 //! large is skipped: a pole or a corner sits inside the stencil, and there is
 //! no derivative there to be right about.
 
-use numpla_cas::{diff, expand, simplify, to_source};
+use numpla_cas::{diff, expand, factor, simplify, to_source, FormKind, RootCheck};
 use numpla_expr::{parse, BinOp, Env, Expr, Stmt, Value};
 
 // ---- the corpus ---------------------------------------------------------
@@ -398,6 +409,11 @@ fn expand_preserves_value() {
     check_rewrite("expand", expand);
 }
 
+#[test]
+fn factor_preserves_value() {
+    check_rewrite("factor", factor);
+}
+
 /// Everything the CAS can produce must be source a person can paste back.
 ///
 /// Three things at once, because they are one promise: the text parses, the
@@ -410,10 +426,13 @@ fn every_result_is_source_that_round_trips() {
     for (src, domain) in CORPUS {
         let input = tree(src);
         let vars = variables(&input);
-        let mut results = vec![simplify(&input), expand(&input)];
+        let mut results = vec![simplify(&input), expand(&input), factor(&input)];
         for v in &vars {
             results.push(diff(&input, v).unwrap_or_else(|e| panic!("diff of `{}`: {}", src, e)));
         }
+        // Every alternative form is an answer somebody may paste back, so it is
+        // held to exactly the same standard as the primary one.
+        results.extend(numpla_cas::equal(&input).into_iter().map(|f| f.expr));
 
         for result in &results {
             let text = to_source(result);
@@ -748,5 +767,396 @@ fn amplification(e: &Expr, vars: &[String], point: &[f64]) -> f64 {
                 },
             }
         }
+    }
+}
+
+// ---- property 6: the `equal` list ----------------------------------------
+//
+// The rule from `docs/compute.md`, in code: *every candidate must equal the
+// input*. A choice list is only useful if you can pick from it without
+// checking, and one wrong entry costs you that for every entry — so this is
+// the property the feature stands or falls on.
+//
+// The interesting part is the conditional candidates. `sqrt(u)^2 = u` is true
+// where `u >= 0` and meaningless elsewhere, and the honest way to offer it is
+// with the condition attached rather than to drop it or to pretend. That is
+// only honest if the condition is *checked*, which is what the `holds` call
+// below does: a conditional candidate is compared at every sampled point where
+// its condition holds, and nowhere else.
+//
+// Tolerance follows the same running-error bound the random-tree test uses:
+// putting a sum over a common denominator or splitting a logarithm
+// reassociates the arithmetic, and a point where that has thrown away every
+// digit says nothing about the algebra. Those points are skipped rather than
+// asserted about.
+#[test]
+fn every_equal_candidate_really_equals_the_input() {
+    let mut exact = 0usize;
+    let mut conditional = 0usize;
+    let mut numeric = 0usize;
+
+    for (src, domain) in CORPUS {
+        let input = tree(src);
+        let vars = variables(&input);
+        for form in numpla_cas::equal(&input) {
+            let text = to_source(&form.expr);
+            match form.kind {
+                FormKind::Decimal | FormKind::Identification => {
+                    // These only ever appear for an expression that is already
+                    // a number, and the claim is about that number.
+                    let want = at(&input, &[], &[]).expect("a numeric candidate needs a value");
+                    let got = at(&form.expr, &[], &[]).unwrap_or_else(|| {
+                        panic!("`{}` offered for `{}` has no value", text, src)
+                    });
+                    let tol = if form.kind == FormKind::Identification {
+                        numpla_cas::identify::TOLERANCE
+                    } else {
+                        TOL
+                    };
+                    assert!(
+                        close(want, got, tol),
+                        "`{}` was offered as {} for `{}` but is {} rather than {}",
+                        text,
+                        form.kind.as_str(),
+                        src,
+                        got,
+                        want
+                    );
+                    numeric += 1;
+                }
+                FormKind::Exact | FormKind::Conditional => {
+                    let mut rng = Rng(0xEA11_0000_5A5A_1234);
+                    for _ in 0..SAMPLES {
+                        let point: Vec<f64> = vars.iter().map(|_| rng.sample(*domain)).collect();
+                        let Some(want) = at_regular(&input, &vars, &point) else {
+                            continue;
+                        };
+                        // A conditional candidate makes no claim outside its
+                        // condition, so outside it there is nothing to check.
+                        if let Some(condition) = &form.condition {
+                            if !condition.holds(&env_at(&vars, &point)) {
+                                continue;
+                            }
+                        }
+                        let bound = tolerance_at(&[&input, &form.expr], &vars, &point);
+                        if bound > UNCOMPARABLE {
+                            continue;
+                        }
+                        let got = at(&form.expr, &vars, &point).unwrap_or_else(|| {
+                            panic!(
+                                "`{}` was offered as an equal form of `{}` but has no value at {:?}, where the input is {}",
+                                text, src, point, want
+                            )
+                        });
+                        assert!(
+                            close(want, got, bound),
+                            "`{}` was offered as an equal form of `{}` but is {} rather than {} at {:?}{}",
+                            text,
+                            src,
+                            got,
+                            want,
+                            point,
+                            match &form.condition {
+                                Some(c) => format!(" (condition: {})", c.describe()),
+                                None => String::new(),
+                            }
+                        );
+                        if form.condition.is_some() {
+                            conditional += 1;
+                        } else {
+                            exact += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Each class has to be doing work. A conditional candidate whose condition
+    // never holds at any sample point is a candidate nobody has checked, and
+    // that is the exact failure mode this whole property exists to prevent.
+    assert!(exact > 1000, "only compared {} exact candidates", exact);
+    assert!(
+        conditional > 100,
+        "only compared {} conditional candidates - either the rules stopped producing them or their conditions never hold on the corpus",
+        conditional
+    );
+    assert!(numeric > 0, "no numeric candidates were checked");
+}
+
+/// A conditional candidate must be *equal* where its condition holds, and the
+/// condition must be doing something — a guard that is always true is a label,
+/// not a condition.
+#[test]
+fn a_condition_is_the_thing_that_makes_a_candidate_true() {
+    let input = tree("ln(x*y)");
+    let split = numpla_cas::equal(&input)
+        .into_iter()
+        .find(|f| to_source(&f.expr) == "ln(x) + ln(y)")
+        .expect("the product law is offered for ln(x*y)");
+    let condition = split.condition.expect("...with a condition");
+
+    let vars = vec!["x".to_string(), "y".to_string()];
+    // Inside the condition: equal.
+    let inside = [2.0, 3.0];
+    assert!(condition.holds(&env_at(&vars, &inside)));
+    assert!(close(
+        at(&input, &vars, &inside).unwrap(),
+        at(&split.expr, &vars, &inside).unwrap(),
+        TOL
+    ));
+    // Outside it: the input is a perfectly good number and the candidate is
+    // not. This is the point of the condition, and the reason the rewrite is
+    // not in `simplify`.
+    let outside = [-2.0, -3.0];
+    assert!(!condition.holds(&env_at(&vars, &outside)));
+    assert!(at(&input, &vars, &outside).is_some());
+    assert!(at(&split.expr, &vars, &outside).is_none());
+}
+
+// ---- property 7: solutions ------------------------------------------------
+
+/// One equation, and what is known about its answer.
+struct Solvable {
+    /// Source, as it would be typed.
+    src: &'static str,
+    var: &'static str,
+    /// How many solutions there are, where that is known independently of the
+    /// solver.
+    count: usize,
+}
+
+const EQUATIONS: &[Solvable] = &[
+    // The complaint that started all of this.
+    Solvable { src: "2x = 2", var: "x", count: 1 },
+    Solvable { src: "3x + 1 = 7", var: "x", count: 1 },
+    Solvable { src: "x/4 - 1 = 0", var: "x", count: 1 },
+    Solvable { src: "a*x = b", var: "x", count: 1 },
+    Solvable { src: "a*x + b = 0", var: "x", count: 1 },
+    // Quadratics: two roots, one root, no roots - all three are answers.
+    Solvable { src: "x^2 = 4", var: "x", count: 2 },
+    Solvable { src: "x^2 = 2", var: "x", count: 2 },
+    Solvable { src: "x^2 - 3x + 2 = 0", var: "x", count: 2 },
+    Solvable { src: "x^2 - 2x - 1 = 0", var: "x", count: 2 },
+    Solvable { src: "2x^2 - 5x + 3 = 0", var: "x", count: 2 },
+    Solvable { src: "x^2 + 2x + 1 = 0", var: "x", count: 1 },
+    Solvable { src: "x^2 + 1 = 0", var: "x", count: 0 },
+    Solvable { src: "x^2 + x = 0", var: "x", count: 2 },
+    // Higher degree, through the rational roots.
+    Solvable { src: "x^3 - x = 0", var: "x", count: 3 },
+    Solvable { src: "x^3 - 6x^2 + 11x - 6 = 0", var: "x", count: 3 },
+    Solvable { src: "x^3 - 2x^2 - x + 2 = 0", var: "x", count: 3 },
+    Solvable { src: "x^3 - 3x^2 + 3x - 1 = 0", var: "x", count: 1 },
+    Solvable { src: "x^4 - 5x^2 + 4 = 0", var: "x", count: 4 },
+    Solvable { src: "x^4 - 1 = 0", var: "x", count: 2 },
+    Solvable { src: "x^4 - 5x^2 + 5 = 0", var: "x", count: 4 },
+    // One occurrence of the unknown: invert the operations around it.
+    Solvable { src: "ln(x) = 0", var: "x", count: 1 },
+    Solvable { src: "ln(x) = 2", var: "x", count: 1 },
+    Solvable { src: "2exp(3x) = 8", var: "x", count: 1 },
+    Solvable { src: "exp(x) = 5", var: "x", count: 1 },
+    Solvable { src: "2^x = 8", var: "x", count: 1 },
+    Solvable { src: "x^5 = 32", var: "x", count: 1 },
+    Solvable { src: "3x^3 = 24", var: "x", count: 1 },
+    Solvable { src: "x^4 = 16", var: "x", count: 2 },
+    Solvable { src: "sqrt(x + 1) = 3", var: "x", count: 1 },
+    Solvable { src: "abs(x - 1) = 2", var: "x", count: 2 },
+    Solvable { src: "1/x = 4", var: "x", count: 1 },
+    Solvable { src: "log(2, x) = 5", var: "x", count: 1 },
+    // Domains that rule everything out, which is an answer and not a failure.
+    Solvable { src: "sqrt(x) = -1", var: "x", count: 0 },
+    Solvable { src: "exp(x) = -1", var: "x", count: 0 },
+    // A product is zero where a factor is.
+    Solvable { src: "exp(x)(x - 1) = 0", var: "x", count: 1 },
+    Solvable { src: "(x - 1)(x - 2)(x - 3) = 0", var: "x", count: 3 },
+];
+
+/// Every root, put back into the equation it came from.
+///
+/// This is `solve`'s own version of the value-preservation rule: a solver is
+/// exactly as trustworthy as its residuals. Symbolic zero where the algebra
+/// closes, numeric zero where it does not — and the second case is not a
+/// weakening, it is `sqrt(2)^2 -> 2` being a rewrite this crate deliberately
+/// refuses to make, so the check falls back to arithmetic that cannot lie
+/// about it either.
+#[test]
+fn every_root_satisfies_its_equation() {
+    let mut exact = 0usize;
+    let mut numeric = 0usize;
+    for case in EQUATIONS {
+        let (stmt, errs) = parse(case.src);
+        assert!(errs.is_empty(), "{}: {:?}", case.src, errs);
+        let (lhs, rhs) = numpla_cas::solve::equation_of(&stmt)
+            .unwrap_or_else(|| panic!("{} is not an equation", case.src));
+        let answer = numpla_cas::solve(&lhs, &rhs, case.var)
+            .unwrap_or_else(|e| panic!("{}: {}", case.src, e));
+
+        assert_eq!(
+            answer.roots.len(),
+            case.count,
+            "{} should have {} solutions, got {:?}",
+            case.src,
+            case.count,
+            answer.roots.iter().map(to_source).collect::<Vec<_>>()
+        );
+        for root in &answer.roots {
+            // A root has to be source too: it is the first thing anybody pastes.
+            let text = to_source(root);
+            let (parsed, errs) = parse(&text);
+            assert!(errs.is_empty(), "root `{}` of `{}`: {:?}", text, case.src, errs);
+            assert!(matches!(parsed, Stmt::Expr(_)), "root `{}` is not an expression", text);
+
+            match numpla_cas::check_root(&lhs, &rhs, case.var, root) {
+                RootCheck::Exact => exact += 1,
+                RootCheck::Numeric => numeric += 1,
+                RootCheck::Failed => panic!(
+                    "`{} = {}` does not hold at {} = {}",
+                    to_source(&lhs),
+                    to_source(&rhs),
+                    case.var,
+                    text
+                ),
+            }
+        }
+    }
+    assert!(exact > 20, "only {} roots vanished symbolically", exact);
+    assert!(numeric > 0, "no root needed the numeric check");
+}
+
+/// The refusals are part of the contract too: each one comes back as a sentence
+/// rather than as a plausible answer.
+#[test]
+fn what_solve_refuses_it_refuses_by_name() {
+    for (src, var, expected) in [
+        ("sin(x) = 0", "x", "infinitely many"),
+        ("cos(x) = 0.5", "x", "infinitely many"),
+        ("x^3 - 6x - 6 = 0", "x", "no rational roots"),
+        ("x^5 - x - 1 = 0", "x", "no rational roots"),
+        ("x + ln(x) = 1", "x", "more than once"),
+        ("floor(x) = 2", "x", "interval"),
+    ] {
+        let (stmt, _) = parse(src);
+        let (lhs, rhs) = numpla_cas::solve::equation_of(&stmt).unwrap();
+        match numpla_cas::solve(&lhs, &rhs, var) {
+            Err(numpla_cas::CasError::Unsupported(message)) => assert!(
+                message.contains(expected),
+                "`{}` was refused with `{}`, which does not mention `{}`",
+                src,
+                message,
+                expected
+            ),
+            other => panic!("`{}` was not refused: {:?}", src, other),
+        }
+    }
+}
+
+// ---- sums and products ----------------------------------------------------
+
+/// A closed form has to agree with the sum it is a closed form *of*.
+///
+/// The formulas are the part of this crate most likely to be wrong in a way
+/// nothing else notices — an off-by-one in a limit produces an expression that
+/// looks entirely plausible — so every one of them is checked against the same
+/// series added up one term at a time, at several limits including the empty
+/// one.
+#[test]
+fn every_closed_form_agrees_with_the_series_it_closes() {
+    let cases: &[(&str, &str)] = &[
+        ("1", "k"),
+        ("7", "k"),
+        ("k", "k"),
+        ("k^2", "k"),
+        ("k^3", "k"),
+        ("2k + 1", "k"),
+        ("k^3 - 2k^2 + k - 5", "k"),
+        ("2^k", "k"),
+        ("(1/3)^k", "k"),
+        ("3 * 2^k", "k"),
+        ("exp(k)", "k"),
+    ];
+    let mut checked = 0usize;
+    for (summand, k) in cases {
+        let e = tree(summand);
+        for lo in [0i64, 1, 3] {
+            for hi in [lo - 1, lo, lo + 1, lo + 5, lo + 9] {
+                let a = Expr::Num(lo as f64);
+                let b = Expr::Num(hi as f64);
+                let closed = numpla_cas::sum(&e, k, &a, &b).unwrap_or_else(|err| {
+                    panic!("sum({}, {}, {}, {}): {}", summand, k, lo, hi, err)
+                });
+                let mut want = 0.0f64;
+                for i in lo..=hi {
+                    let mut env = Env::new();
+                    env.set(k, i as f64);
+                    want += match numpla_expr::eval(&e, &env) {
+                        Ok(Value::Scalar(x)) => x,
+                        other => panic!("{} at {} = {}: {:?}", summand, k, i, other),
+                    };
+                }
+                let got = at(&closed.expr, &[], &[]).unwrap_or_else(|| {
+                    panic!(
+                        "sum({}, {}, {}, {}) gave `{}`",
+                        summand,
+                        k,
+                        lo,
+                        hi,
+                        to_source(&closed.expr)
+                    )
+                });
+                assert!(
+                    close(want, got, 1e-9),
+                    "sum({}, {}, {}, {}) is `{}` = {}, but adding it up gives {}",
+                    summand,
+                    k,
+                    lo,
+                    hi,
+                    to_source(&closed.expr),
+                    got,
+                    want
+                );
+                checked += 1;
+            }
+        }
+    }
+
+    // The same for products, where the shapes with closed forms are fewer.
+    for (factor_src, k) in [("3", "k"), ("2^k", "k"), ("(1/2)^k", "k")] {
+        let e = tree(factor_src);
+        for hi in [1i64, 2, 4, 6] {
+            let closed = numpla_cas::product(&e, k, &Expr::Num(1.0), &Expr::Num(hi as f64))
+                .unwrap_or_else(|err| panic!("product({}, {}, 1, {}): {}", factor_src, k, hi, err));
+            let mut want = 1.0f64;
+            for i in 1..=hi {
+                let mut env = Env::new();
+                env.set(k, i as f64);
+                want *= numpla_expr::eval(&e, &env).unwrap().scalar().unwrap();
+            }
+            let got = at(&closed.expr, &[], &[]).expect("a closed product has a value");
+            assert!(
+                close(want, got, 1e-9),
+                "product({}, {}, 1, {}) is `{}` = {}, but multiplying it out gives {}",
+                factor_src,
+                k,
+                hi,
+                to_source(&closed.expr),
+                got,
+                want
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked > 50, "only checked {} series", checked);
+}
+
+/// A symbolic closed form has to be right for *every* upper limit, not only the
+/// ones that were tried while writing it.
+#[test]
+fn a_symbolic_closed_form_is_right_at_every_limit() {
+    for (summand, expected_at_10) in [("k", 55.0), ("k^2", 385.0), ("k^3", 3025.0)] {
+        let closed = numpla_cas::sum(&tree(summand), "k", &Expr::Num(1.0), &tree("n")).unwrap();
+        let vars = vec!["n".to_string()];
+        assert_eq!(at(&closed.expr, &vars, &[10.0]), Some(expected_at_10), "{}", summand);
+        // ...and at the empty limit, where the sum is zero by definition.
+        assert_eq!(at(&closed.expr, &vars, &[0.0]), Some(0.0), "{}", summand);
     }
 }

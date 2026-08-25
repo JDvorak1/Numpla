@@ -1762,32 +1762,98 @@ const docCompiles = () => !rowEls().some((r) => r.classList.contains('is-error')
 }
 
 // ---------------------------------------------------------------------------
-// THE COMPUTE PANE
+// THE COMPUTE PANE — a worksheet, not a form
 //
-// The second route: a Maple-like pane over the CAS calls. Built here against a
-// stub when the build has none, because the pane is the shell's job and the
-// calls are the crate's — the same way the field and seed calls are tested.
+// The second route: input, its result beneath it, then the next input — a
+// scrolling document you can go back through. Commands are TYPED
+// (`solve(2x = 2, x)`), `%` is the previous result, Tab completes a command
+// with the caret inside its parentheses, and `equal` comes back as a choice
+// list in which a numeric identification is visibly not a proof.
+//
+// Driven against stubs, because the pane is the shell's job and the calls are
+// the crate's — the same way the field and seed calls are tested. Two stubs,
+// because there are two ways in: `cas_command(line, history)`, where the crate
+// reads the line, and the individual verbs, where this shell does. Both must
+// work, because `app/pkg/` can be older than the crate. The last section then
+// runs the whole thing against whatever the real build actually exports.
 // ---------------------------------------------------------------------------
 
 {
-  const reply = (input, output) => JSON.stringify({ ok: true, input, output });
-  const stubCas = {
-    simplify: (e) => reply(e, e === '2x' ? '2x' : e),
-    diff: (e, v) => reply(e, '2' + v),
-    expand: (e) => reply(e, e + '+1'),
-    eval: (e) => JSON.stringify({ ok: false, input: e, output: '',
-                                  error: 'no number in ' + e }),
+  // A result put back into the line goes through the parser and back out, so
+  // what returns is the same EXPRESSION and not necessarily the same string:
+  // `pi^2/6` comes back as `(pi^2)/(6)`. Comparing through the same round trip
+  // is what makes these assertions about meaning rather than about spelling.
+  const mfMod = await import(new URL('./mathfield.js', APP).href);
+  const norm = (src) => mfMod.toSource(mfMod.parseSource(String(src)));
+
+  const reply = (input, output, extra) =>
+    JSON.stringify({ ok: true, input, output, ...(extra || {}) });
+
+  // Every argument every call received, in order, so "the right thing was
+  // sent" is checkable rather than inferred from the answer.
+  const calls = [];
+  const rec = (name, fn) => (...args) => { calls.push([name, ...args]); return fn(...args); };
+
+  // The real shapes, from docs/wasm-api.md: a solve answers with SOLUTIONS and
+  // how far each was checked; an equal answers with FORMS and what each claims.
+  const SOLVE = (e, v) => JSON.stringify({
+    ok: true, input: e, variable: v || 'x', method: 'quadratic formula',
+    solutions: [
+      { expr: '-2', verified: 'exact', value: -2 },
+      { expr: 'sqrt(2)', verified: 'numeric', value: 1.4142135623730951 },
+    ],
+  });
+
+  const EQUAL = (e) => JSON.stringify({
+    ok: true, input: e, value: 1.6449340668482264,
+    forms: [
+      { expr: '1', label: 'simplify', kind: 'exact' },
+      { expr: 'sqrt(1)', label: 'a half power as a square root', kind: 'exact' },
+      { expr: 'ln(2) + ln(3)', label: 'the logarithm of a product',
+        kind: 'conditional', condition: 'u > 0 and v > 0' },
+      { expr: '1.6449340668482264', label: 'the value, to machine precision',
+        kind: 'decimal' },
+      { expr: 'pi^2/6', label: 'recognised from the number', kind: 'identification',
+        note: 'pi squared over six, which is zeta(2) — agrees with ' +
+              '1.6449340668482264 to 17 significant digits. This is a numeric ' +
+              'match, not a proof.' },
+    ],
+  });
+
+  // A build with every verb but NO cas_command: this shell reads the line.
+  const verbCas = {
+    eval:     rec('eval',     (e) => reply(e, '7')),
+    evalf:    rec('evalf',    (e) => reply(e, '3.14159265')),
+    solve:    rec('solve',    (e, v) => SOLVE(e, v)),
+    equal:    rec('equal',    (e) => EQUAL(e)),
+    simplify: rec('simplify', (e) => reply(e, '5x')),
+    expand:   rec('expand',   (e) => reply(e, 'x^(2) + 2x + 1')),
+    factor:   rec('factor',   (e) => reply(e, '(x + 1)^(2)')),
+    diff:     rec('diff',     (e, v) => reply(e, '3' + v + '^(2)')),
+    sum:      rec('sum',      (e, k, a, b) => reply(e, '2' + k)),
+    product:  rec('product',  (e, k, a, b) => reply(e, '3' + k)),
+    subs:     rec('subs',     (s, e) => reply(e, '9')),
+  };
+
+  // The build that shipped before any of it: the original four verbs.
+  const oldCas = {
+    eval: verbCas.eval, simplify: verbCas.simplify,
+    expand: verbCas.expand, diff: verbCas.diff,
   };
 
   const real = inspect.probe().cas;
-  inspect.setCasApi(real ? null : stubCas);
-  ok('the CAS calls are available' + (real ? ' (real WASM)' : ' (stubbed)'),
+  inspect.setCasApi(verbCas);
+  ok('the CAS calls are available' + (real ? ' (a real build is here too)' : ''),
      inspect.cas().available, JSON.stringify(inspect.cas().ops));
-  ok('all four operations are offered',
-     inspect.cas().ops.length === 4, JSON.stringify(inspect.cas().ops));
+  ok('and without cas_command the SHELL reads the line',
+     inspect.cas().dispatch === 'the shell', inspect.cas().dispatch);
 
   ok('the Compute card is live once the calls are there',
      $('choice-compute').getAttribute('aria-disabled') === 'false');
+  ok('and the card names the worksheet rather than four buttons',
+     /solve\(2x = 2, x\)/.test($('choice-compute-why').textContent),
+     $('choice-compute-why').textContent.slice(0, 80));
+
   click($('choice-compute'));
   await settle(10);
   ok('choosing Compute opens the compute pane',
@@ -1795,103 +1861,791 @@ const docCompiles = () => !rowEls().some((r) => r.classList.contains('is-error')
      inspect.route());
   ok('and the workspace is no longer the route',
      !doc.body.classList.contains('route-solve'));
-  ok('the input surface is a MathField, like every other input here',
+  ok('the prompt is a MathField, like every other input here',
      $('compute-field').querySelectorAll('.mf').length === 1);
 
-  const ops = () => $('compute-ops').querySelectorAll('.casop');
-  ok('one button per operation', ops().length === 4,
-     ops().map((b) => b.dataset.op).join(', '));
-  ok('the differentiation button names its variable',
-     /^d\/dx$/.test(ops().find((b) => b.dataset.op === 'diff').textContent),
-     ops().find((b) => b.dataset.op === 'diff').textContent);
+  const sheet = () => $('compute-log').querySelectorAll('.casitem');
+  ok('the sheet starts empty and says what this is',
+     sheet().length === 0 && /bare expression with no command is eval/
+       .test($('compute-log').textContent),
+     $('compute-log').textContent.slice(0, 70));
+  ok('and the gutter is offering line 1',
+     $('compute-gutter').textContent === '[1]', $('compute-gutter').textContent);
 
-  $('compute-var').value = 'u';
-  dispatch($('compute-var'), 'input', { type: 'input', target: $('compute-var') });
-  await settle(5);
-  ok('and follows it when it changes',
-     /^d\/du$/.test(ops().find((b) => b.dataset.op === 'diff').textContent),
-     ops().find((b) => b.dataset.op === 'diff').textContent);
-  $('compute-var').value = 'x';
-  dispatch($('compute-var'), 'input', { type: 'input', target: $('compute-var') });
-  await settle(5);
-
-  const items = () => $('compute-log').querySelectorAll('.casitem');
-  ok('the history starts empty and says what this is',
-     items().length === 0 && /integration/.test($('compute-log').textContent),
-     $('compute-log').textContent.slice(0, 60));
-
-  // Type through the field's own typing path, not by writing its source.
-  inspect.clearCas();
-  // Whatever the field's own round-trip spells this as IS the input: the point
-  // is that the CAS is handed the field's source, not a string the test made up.
-  const typed = inspect.typeCas('x^2');
-  ok('typing reaches the field', typed.length > 0 && inspect.cas().input === typed,
-     JSON.stringify(typed));
-
-  click(ops().find((b) => b.dataset.op === 'diff'));
-  await settle(10);
-  ok('an operation adds one entry to the history', items().length === 1,
-     items().length + ' entries');
-
-  const log = inspect.cas().log;
-  ok('the entry keeps the input it was given', log[0].input === typed,
-     JSON.stringify(log[0]));
-  ok('and carries the answer', log[0].output === '2x', JSON.stringify(log[0]));
-  // The shim has no descendant selectors, so reach the field through its host -
-  // which is the point anyway: the answer is a real MathField, not text.
+  // The shim has no descendant selectors, so reach a field through its host —
+  // which is the point anyway: input and result are real MathFields.
   const partOf = (item, cls) => {
     const host = item.querySelector(cls);
     return host ? host.querySelector('.mf') : null;
   };
-  ok('the answer is rendered as mathematics, not as a line of text',
-     partOf(items()[0], '.casitem__out') !== null,
-     items()[0].textContent.slice(0, 60));
-  ok('the input is rendered the same way',
-     partOf(items()[0], '.casitem__in') !== null);
 
-  // THE ROUND TRIP: a result is Numpla source, so it goes back into the input.
-  const use = items()[0].querySelector('.casitem__use');
-  ok('a result offers to go back into the input', !!use && !use.hidden);
+  // -- 1. COMMANDS ARE TYPED --------------------------------------------
+
+  calls.length = 0;
+  const e1 = inspect.runCompute('diff(x^3, x)');
+  ok('TYPING A COMMAND RUNS IT', !!e1 && e1.op === 'diff' && e1.output === '3x^(2)',
+     JSON.stringify(e1 && { op: e1.op, output: e1.output }));
+  ok('and its arguments reach the call, in order',
+     calls.length === 1 && calls[0][0] === 'diff' &&
+     calls[0][1] === 'x^3' && calls[0][2] === 'x',
+     JSON.stringify(calls));
+  ok('the worksheet grew a line for it', sheet().length === 1);
+  ok('the line is numbered', sheet()[0].dataset.n === '1', sheet()[0].dataset.n);
+  ok('and the gutter has moved on to line 2',
+     $('compute-gutter').textContent === '[2]', $('compute-gutter').textContent);
+  ok('the input is rendered as mathematics, not as a line of text',
+     partOf(sheet()[0], '.casitem__in') !== null);
+  ok('and the result beneath it likewise',
+     partOf(sheet()[0], '.casitem__out') !== null);
+
+  calls.length = 0;
+  const bare = inspect.runCompute('2 + 3*4');
+  ok('A BARE EXPRESSION WITH NO COMMAND IS eval',
+     !!bare && bare.op === 'eval' && bare.output === '7',
+     JSON.stringify(bare && { op: bare.op, output: bare.output }));
+  ok('and it is the whole expression that is sent, untouched',
+     calls.length === 1 && calls[0][1] === '2 + 3*4', JSON.stringify(calls));
+
+  const notACall = inspect.runCompute('solve(x) + 1');
+  ok('a command that is not the whole line is read as an expression',
+     notACall.op === 'eval', notACall.op);
+
+  calls.length = 0;
+  const inferred = inspect.runCompute('solve(2x = 2)');
+  ok('the unknown may be left out', inferred.op === 'solve' && !inferred.error,
+     JSON.stringify({ op: inferred.op, error: inferred.error }));
+  ok('and it is inferred from the expression, not guessed silently',
+     calls[0][2] === 'x' &&
+     inspect.cas().log.find((e) => e.n === inferred.n).inferred === 'x',
+     JSON.stringify(calls));
+
+  calls.length = 0;
+  const wrongArity = inspect.runCompute('sum(k, k)');
+  ok('a command called with the wrong number of arguments refuses by signature',
+     !!wrongArity.error && /sum\(k, k, 1, n\)/.test(wrongArity.error) &&
+     /4 arguments/.test(wrongArity.error), wrongArity.error);
+  ok('and nothing was sent to the CAS for it', calls.length === 0);
+
+  calls.length = 0;
+  inspect.runCompute('sum(k, k, 1, n)');
+  ok('and with the right number it goes through with all four',
+     calls.length === 1 && calls[0].slice(1).join('|') === 'k|k|1|n',
+     JSON.stringify(calls));
+
+  // -- 2. % — THE DITTO OPERATOR ----------------------------------------
+
+  const dittoNow = () => inspect.cas().ditto;
+
+  ok('% is the previous result',
+     dittoNow()[0] &&
+     dittoNow()[0].n === inspect.cas().log.filter((e) => e.output).pop().n,
+     JSON.stringify(dittoNow()[0]));
+  ok('%% is the one before, and %%% the one before that',
+     dittoNow()[1] && dittoNow()[2] &&
+     dittoNow()[0].n > dittoNow()[1].n && dittoNow()[1].n > dittoNow()[2].n,
+     JSON.stringify(dittoNow()));
+  ok('and the three of them are results, never refused lines',
+     dittoNow().every((d) => {
+       const e = inspect.cas().log.find((x) => x.n === d.n);
+       return e && e.output && !e.error;
+     }), JSON.stringify(dittoNow()));
+
+  const prevOut = dittoNow()[0].output;
+  const prevSrc = dittoNow()[0].source;
+  const sub1 = inspect.expandDitto('solve(% = 12)');
+  ok('% IS SUBSTITUTED BEFORE THE LINE IS SENT',
+     sub1.text === 'solve(' + prevSrc + ' = 12)' && sub1.missing === 0,
+     JSON.stringify(sub1));
+  const sub2 = inspect.expandDitto('%% + %');
+  ok('and %% and % resolve to different results',
+     sub2.text === dittoNow()[1].source + ' + ' + prevSrc,
+     JSON.stringify(sub2));
+
+  calls.length = 0;
+  const dittoRun = inspect.runCompute('solve(% = 12)');
+  ok('SO diff(x^3, x) THEN solve(% = 12) RETYPES NOTHING',
+     dittoRun.op === 'solve' && calls[0][1] === prevSrc + ' = 12',
+     JSON.stringify(calls));
+  ok('and the line the sheet keeps is the substituted one',
+     dittoRun.input === 'solve(' + prevSrc + ' = 12)', dittoRun.input);
+
+  // WHAT % MEANS AFTER A FAILURE: it does not move. A refusal produced no
+  // expression, so the ditto steps straight over it — Maple's own behaviour.
+  const beforeFail = dittoNow()[0].n;
+  const failed = inspect.runCompute('solve(2x = 2, x, x)');
+  ok('a refused line is still written into the worksheet',
+     !!failed.error && !failed.output, failed.error);
+  ok('AFTER A FAILURE % DOES NOT MOVE — IT STEPS OVER THE REFUSAL',
+     dittoNow()[0] && dittoNow()[0].n === beforeFail,
+     JSON.stringify(dittoNow()[0]));
+  ok('and the refusal is on its own line, marked as one',
+     sheet()[sheet().length - 1].classList.contains('is-error') &&
+     sheet()[sheet().length - 1].querySelector('.casitem__err') !== null);
+
+  const tooFar = inspect.expandDitto('%%%%');
+  ok('% never reaches further back than Maple lets it', tooFar.missing === 4,
+     JSON.stringify(tooFar));
+  const tooFarRun = inspect.runCompute('%%%% + 1');
+  ok('and asking it to says so, in a sentence',
+     !!tooFarRun.error && /%/.test(tooFarRun.error), tooFarRun.error);
+
+  // The `%` key itself. `%` is not a character a math field types — it is not
+  // mathematics — so the pane claims the key before the field ever sees it.
+  inspect.clearCas();
+  dispatch($('compute-field'), 'keydown', { key: '%' });
+  await settle(5);
+  ok('THE % KEY ITSELF SUBSTITUTES THE PREVIOUS RESULT',
+     inspect.cas().input === norm(dittoNow()[0].source),
+     JSON.stringify(inspect.cas().input));
+  dispatch($('compute-field'), 'keydown', { key: '%' });
+  await settle(5);
+  ok('and pressing the key again walks back, it does not stack a second copy',
+     inspect.cas().input === norm(dittoNow()[1].source),
+     JSON.stringify(inspect.cas().input));
+  ok('and the pane says which entry it reached',
+     /^%% is \[\d+\]/.test($('compute-foot').textContent),
+     $('compute-foot').textContent.slice(0, 40));
+
+  inspect.clearCas();
+  const d1 = inspect.pressDitto(null);
+  ok('PRESSING % PUTS THE PREVIOUS RESULT IN THE LINE',
+     d1.level === 1 && d1.input === norm(dittoNow()[0].source),
+     JSON.stringify(d1));
+  const d2 = inspect.pressDitto(null);
+  ok('and pressing it again walks back to %%',
+     d2.level === 2 && d2.input === norm(dittoNow()[1].source),
+     JSON.stringify(d2));
+  const d3 = inspect.pressDitto(null);
+  ok('and again to %%%',
+     d3.level === 3 && d3.input === norm(dittoNow()[2].source),
+     JSON.stringify(d3));
+
+  // The chips reach the same three levels, which is how a phone gets there:
+  // there is no `%` on a mathematics keyboard.
+  const dittoChips = () => $('compute-ops').querySelectorAll('.casop--ditto');
+  ok('the strip carries the three ditto keys', dittoChips().length === 3,
+     dittoChips().map((b) => b.textContent).join(' '));
+  inspect.clearCas();
+  click(dittoChips()[1]);
+  await settle(5);
+  ok('and tapping %% reaches the second result',
+     inspect.cas().input === norm(dittoNow()[1].source),
+     inspect.cas().input);
+
+  // -- 3. TAB COMPLETION, THROUGH THE FIELD'S OWN MACHINERY --------------
+
+  inspect.clearCas();
+  inspect.typeCas('sol');
+  ok('the signature is shown while you are choosing',
+     /solve\(2x = 2, x\)/.test(inspect.cas().sig), inspect.cas().sig);
+
+  const tabbed = inspect.tabCas();
+  ok('TAB COMPLETES A COMMAND', tabbed.input === 'solve()', JSON.stringify(tabbed));
+  const caret = inspect.casCaret();
+  ok('WITH THE CARET INSIDE THE PARENTHESES',
+     !!caret && caret.path.length === 1 && caret.path[0][1] === 'body' &&
+     caret.index === 0, JSON.stringify(caret));
+  inspect.typeCas('2');
+  ok('so the next thing typed lands inside the call',
+     inspect.cas().input === 'solve(2)', inspect.cas().input);
+  ok('and the signature follows the caret into the call',
+     /solve\(2x = 2, x\)/.test(inspect.cas().sig), inspect.cas().sig);
+
+  inspect.clearCas();
+  inspect.typeCas('ev');
+  inspect.tabCas();
+  ok('an ambiguous prefix does not pick for you',
+     inspect.cas().input !== 'eval()', inspect.cas().input);
+  ok('and the signature strip offers every match',
+     /evalf\(e\)/.test(inspect.cas().sig) && /eval\(e\)/.test(inspect.cas().sig),
+     inspect.cas().sig);
+
+  inspect.clearCas();
+  const before = inspect.cas().log.length;
+  const chip = $('compute-ops').querySelectorAll('.casop')
+    .find((b) => b.dataset.op === 'factor');
+  click(chip);
+  await settle(5);
+  ok('A COMMAND CHIP TYPES THE COMMAND, IT DOES NOT RUN IT',
+     inspect.cas().input === 'factor()' && inspect.cas().log.length === before,
+     inspect.cas().input);
+  ok('and it leaves the caret inside the parentheses too',
+     inspect.casCaret().path.length === 1 && inspect.casCaret().index === 0,
+     JSON.stringify(inspect.casCaret()));
+
+  // An EQUATION inside a command. The field's own rule is that `=` splits a
+  // row, so typing one steps out of whatever structure the caret is in — right
+  // for `dx/dt = -y`, wrong for `solve(2x = 2, x)`. In the worksheet the
+  // equation is an argument, and it stays where it was typed.
+  inspect.clearCas();
+  inspect.typeCas('sol');
+  inspect.tabCas();
+  inspect.typeCas('2x = 2, x');
+  ok('AN EQUATION CAN BE TYPED INSIDE A COMMAND',
+     inspect.cas().input === 'solve(2x = 2, x)', JSON.stringify(inspect.cas().input));
+  calls.length = 0;
+  inspect.enterCompute();
+  ok('and it reaches the call as two arguments, equation and unknown',
+     calls.length === 1 && calls[0][1] === '2x = 2' && calls[0][2] === 'x',
+     JSON.stringify(calls));
+
+  inspect.clearCas();
+  inspect.typeCas('x^2 = 3');
+  ok('while an = outside a command still splits the line, as the field says',
+     inspect.cas().input === 'x^(2) = 3', JSON.stringify(inspect.cas().input));
+
+  // Tab into a command, then `%` INSIDE its parentheses: the ditto splices
+  // into whatever list the caret is standing in, not onto the end of the line.
+  inspect.clearCas();
+  inspect.typeCas('sol');
+  inspect.tabCas();
+  inspect.pressDitto(1);
+  inspect.typeCas(' = 12');
+  ok('TAB THEN % BUILDS solve(% = 12) WITH NOTHING RETYPED',
+     inspect.cas().input === norm('solve(' + dittoNow()[0].source + ' = 12)'),
+     JSON.stringify(inspect.cas().input));
+  calls.length = 0;
+  inspect.enterCompute();
+  ok('and running it sends the substituted equation, not a %',
+     calls.length === 1 && calls[0][0] === 'solve' && !/%/.test(calls[0][1]),
+     JSON.stringify(calls));
+
+  // -- 4. ENTER RUNS THE LINE -------------------------------------------
+
+  inspect.clearCas();
+  inspect.typeCas('evalf(');
+  inspect.typeCas('pi');
+  const linesBefore = sheet().length;
+  const entered = inspect.enterCompute();
+  ok('ENTER RUNS THE LINE', !!entered && entered.op === 'evalf' &&
+     entered.output === '3.14159265', JSON.stringify(entered));
+  ok('and the worksheet grew by exactly one', sheet().length === linesBefore + 1);
+  ok('and the prompt is empty, ready for the next line',
+     inspect.cas().input === '', JSON.stringify(inspect.cas().input));
+
+  inspect.typeCas('2');
+  click($('compute-run'));
+  await settle(5);
+  ok('the enter button runs the line too', sheet().length === linesBefore + 2);
+
+  // -- 5. GOING BACK THROUGH THE DOCUMENT --------------------------------
+
+  const last = sheet()[sheet().length - 1];
+  const use = last.querySelector('.casitem__use');
+  ok('a result offers to go back into the line', !!use && !use.hidden);
   click(use);
   await settle(5);
-  ok('A RESULT ROUND-TRIPS BACK INTO THE INPUT', inspect.cas().input === '2x',
+  ok('A RESULT ROUND-TRIPS BACK INTO THE LINE',
+     inspect.cas().input === '7', JSON.stringify(inspect.cas().input));
+
+  inspect.clearCas();
+  click(last.querySelector('.casitem__out'));
+  await settle(5);
+  ok('EVERY RESULT IS SELECTABLE: clicking the answer inserts it',
+     inspect.cas().input === '7', JSON.stringify(inspect.cas().input));
+
+  const edit = last.querySelector('.casitem__edit');
+  ok('and the input of an old line is one click away too', !!edit);
+  click(edit);
+  await settle(5);
+  ok('AN OLD LINE CAN BE PULLED BACK INTO THE PROMPT',
+     inspect.cas().input === '2', JSON.stringify(inspect.cas().input));
+
+  // -- 6. equal — THE CHOICE LIST, AND WHAT EACH FORM CLAIMS -------------
+
+  inspect.clearCas();
+  const eqBeforeDitto = dittoNow()[0].n;
+  const eq = inspect.runCompute('equal(1^(1/2))');
+  ok('equal COMES BACK AS A LIST OF CANDIDATE FORMS',
+     !!eq.forms && eq.forms.length === 5, JSON.stringify(eq.forms && eq.forms.length));
+
+  const eqItem = sheet()[sheet().length - 1];
+  const forms = () => eqItem.querySelectorAll('.casform');
+  const kindRow = (k) => forms().find((f) => f.dataset.kind === k);
+  const textOf = (row, cls) => {
+    const n = row.querySelector(cls);
+    return n ? n.textContent : null;
+  };
+
+  ok('and the list is rendered, one row per form', forms().length === 5,
+     forms().length + ' rows');
+  ok('every form carries the label that says how it was obtained',
+     forms().every((f) => (textOf(f, '.casform__label') || '').length > 0),
+     forms().map((f) => textOf(f, '.casform__label')).join(' / '));
+  ok('and every form is rendered as mathematics',
+     forms().every((f) => partOf(f, '.casform__math') !== null));
+
+  ok('THE FOUR CLAIMS ARE RENDERED APART',
+     forms().map((f) => f.dataset.kind).join(',') ===
+       'exact,exact,conditional,decimal,identification',
+     forms().map((f) => f.dataset.kind).join(','));
+
+  ok('an exact form is an equals sign, and says only "exact"',
+     textOf(kindRow('exact'), '.casform__rel') === '=' &&
+     textOf(kindRow('exact'), '.casform__flag') === 'exact');
+
+  ok('A CONDITIONAL FORM CARRIES ITS CONDITION, NEVER WITHOUT IT',
+     textOf(kindRow('conditional'), '.casform__flag') === 'where u > 0 and v > 0',
+     textOf(kindRow('conditional'), '.casform__flag'));
+
+  ok('a decimal is written with ≈, and says it is an approximation',
+     textOf(kindRow('decimal'), '.casform__rel') === '≈' &&
+     kindRow('decimal').classList.contains('is-approx') &&
+     textOf(kindRow('decimal'), '.casform__flag') === 'an approximation',
+     textOf(kindRow('decimal'), '.casform__flag'));
+
+  const ident = () => kindRow('identification');
+  ok('A NUMERIC IDENTIFICATION IS MARKED AS ONE', !!ident());
+  ok('and it is NOT written as an equality',
+     textOf(ident(), '.casform__rel') === '≈' &&
+     ident().classList.contains('is-approx'),
+     textOf(ident(), '.casform__rel'));
+  ok('and it says in words that it is not a proof',
+     /not a proven identity/.test(textOf(ident(), '.casform__flag')),
+     textOf(ident(), '.casform__flag'));
+  ok("and it shows the crate's own sentence about what it agreed to",
+     /This is a numeric match, not a proof/.test(textOf(ident(), '.casform__note')),
+     String(textOf(ident(), '.casform__note')).slice(0, 60));
+  ok('a screen reader is told what the relation is, not left a glyph',
+     ident().querySelector('.casform__rel').getAttribute('aria-label') ===
+       'approximately equal' &&
+     kindRow('exact').querySelector('.casform__rel').getAttribute('aria-label') ===
+       'equals');
+
+  ok('the pane says how many of them are only numeric',
+     /1 of them numeric identifications, not proofs/.test($('compute-foot').textContent),
+     $('compute-foot').textContent.slice(0, 100));
+
+  // ...and counts in English rather than in template slots: a list of one
+  // identification is "a numeric identification, not a proof".
+  inspect.setCasApi({ ...verbCas, equal: () => JSON.stringify({ ok: true, forms: [
+    { expr: 'pi^2/6', label: 'recognised from the number', kind: 'identification' },
+  ] }) });
+  inspect.runCompute('equal(1.6449340668482264)');
+  ok('and a single one is a numeric identification, not "1 of them"',
+     /a numeric identification, not a proof/.test($('compute-foot').textContent),
+     $('compute-foot').textContent.slice(0, 100));
+  inspect.setCasApi(verbCas);
+
+  // PICKING ONE PUTS IT IN THE INPUT.
+  click(forms()[1].querySelector('.casform__use'));
+  await settle(5);
+  ok('PICKING A FORM PUTS IT INTO THE LINE',
+     inspect.cas().input === 'sqrt(1)', JSON.stringify(inspect.cas().input));
+
+  click(ident().querySelector('.casform__use'));
+  await settle(5);
+  ok('and picking the numeric one says so as it lands',
+     inspect.cas().input === norm('pi^2/6') &&
+     /NUMERIC identification, not a proven identity/.test($('compute-foot').textContent),
+     $('compute-foot').textContent.slice(0, 100));
+  ok('the pick is recorded as an identification, not as an identity',
+     inspect.cas().lastPick && inspect.cas().lastPick.kind === 'identification',
+     JSON.stringify(inspect.cas().lastPick));
+
+  click(kindRow('conditional').querySelector('.casform__use'));
+  await settle(5);
+  ok('and picking a conditional one repeats its condition',
+     /valid where u > 0 and v > 0/.test($('compute-foot').textContent),
+     $('compute-foot').textContent.slice(0, 100));
+
+  ok('equal does not move % — a list is not a result',
+     dittoNow()[0] && dittoNow()[0].n === eqBeforeDitto,
+     JSON.stringify(dittoNow()[0]));
+
+  // An empty list is an ANSWER — there was no other way of writing it — and
+  // saying "no answer" would be a different, wrong claim.
+  inspect.setCasApi({ ...verbCas, equal: () => JSON.stringify({ ok: true, forms: [] }) });
+  const noForms = inspect.runCompute('equal(2x)');
+  ok('an equal with no alternatives says there were none, and is not an error',
+     !noForms.error && /no other way of writing it/.test(noForms.note || ''),
+     JSON.stringify(noForms));
+
+  // A reply that spells its candidates some other way is still read: a shell
+  // that hard-codes one spelling of a shape breaks on a build it was not
+  // compiled against.
+  inspect.setCasApi({
+    ...verbCas,
+    equal: () => JSON.stringify({ ok: true, candidates: [
+      { output: 'x + x', how: 'expand' },
+      { output: '1.4142135', numeric: true, label: 'looks like sqrt(2)' },
+      '2x',
+    ] }),
+  });
+  const loose = inspect.runCompute('equal(2x)');
+  ok('a differently-spelled candidate list is still read',
+     !!loose.forms && loose.forms.length === 3, JSON.stringify(loose.forms));
+  ok('a bare string candidate is taken as an expression',
+     loose.forms[2].expr === '2x', JSON.stringify(loose.forms[2]));
+  ok('and "numeric" spelled another way is still an identification',
+     loose.forms[1].kind === 'identification' && loose.forms[0].kind === 'unknown',
+     loose.forms.map((f) => f.kind).join(', '));
+  ok('a candidate that claims neither claims NEITHER — no invented exactness',
+     sheet()[sheet().length - 1].querySelectorAll('.casform')
+       .filter((f) => f.dataset.kind === 'exact').length === 0);
+  inspect.setCasApi(verbCas);
+
+  // The label says where a form came from and the badge says what it is worth.
+  // When the label has already said it, saying it twice reads as a stutter.
+  inspect.setCasApi({ ...verbCas, equal: () => JSON.stringify({ ok: true, forms: [
+    { expr: '1', label: 'exact, by the Pythagorean identity', kind: 'exact' },
+  ] }) });
+  inspect.runCompute('equal(sin(x)^2 + cos(x)^2)');
+  ok('and a badge that only repeats the label is dropped, not stuttered',
+     sheet()[sheet().length - 1].querySelector('.casform__flag') === null,
+     String(sheet()[sheet().length - 1].textContent).slice(0, 90));
+  inspect.setCasApi(verbCas);
+
+  // -- 7. solve — THE SOLUTIONS ARE A LIST TOO ---------------------------
+
+  inspect.clearCas();
+  const sol = inspect.runCompute('solve(x^2 = 4, x)');
+  ok('a solve answers with its solutions, as rows to pick from',
+     !!sol.forms && sol.forms.length === 2, JSON.stringify(sol.forms));
+  ok('and % after a solve is still an EXPRESSION — a list when there are several',
+     sol.output === '[-2, sqrt(2)]', JSON.stringify(sol.output));
+  const solItem = sheet()[sheet().length - 1];
+  const solRows = () => solItem.querySelectorAll('.casform');
+  ok('each solution says how far it was checked',
+     solRows().map((r) => r.dataset.kind).join(',') === 'exact,checked',
+     solRows().map((r) => r.dataset.kind).join(','));
+  ok('a root checked only numerically says so, and is still an equality',
+     textOf(solRows()[1], '.casform__flag') === 'checked numerically' &&
+     textOf(solRows()[1], '.casform__rel') === '=',
+     textOf(solRows()[1], '.casform__flag'));
+  ok('and each solution is labelled with the method that found it',
+     textOf(solRows()[0], '.casform__label') === 'quadratic formula',
+     textOf(solRows()[0], '.casform__label'));
+  click(solRows()[0].querySelector('.casform__use'));
+  await settle(5);
+  ok('and one root can be taken on its own', inspect.cas().input === '-2',
      JSON.stringify(inspect.cas().input));
 
-  click(ops().find((b) => b.dataset.op === 'simplify'));
-  await settle(10);
-  const log2 = inspect.cas().log;
-  ok('and the next operation runs on it', log2.length === 2 && log2[1].input === '2x',
-     JSON.stringify(log2[1]));
-  ok('the history keeps both, oldest first',
-     items().length === 2 && items()[0].dataset.op === 'diff' &&
-     items()[1].dataset.op === 'simplify',
-     items().map((i) => i.dataset.op).join(', '));
+  // An empty list with ok: true means there are NONE. That is an answer.
+  inspect.setCasApi({ ...verbCas, solve: () => JSON.stringify({
+    ok: true, input: 'x^2 = -1', variable: 'x', solutions: [],
+    method: 'quadratic formula' }) });
+  const none = inspect.runCompute('solve(x^2 = -1, x)');
+  ok('NO SOLUTIONS IS AN ANSWER, NOT A REFUSAL',
+     !none.error && /no solutions/.test(none.note || ''), JSON.stringify(none));
+  ok('and it is not drawn as an error',
+     !sheet()[sheet().length - 1].classList.contains('is-error') &&
+     /no solutions/.test(sheet()[sheet().length - 1].textContent));
 
-  // A refusal from the CAS is reported on its entry, never thrown away. Driven
-  // by a stub that refuses, whichever build is underneath: what is under test
-  // is what the PANE does with `ok: false`, not what any one call answers.
-  inspect.setCasApi(stubCas);
+  // `x = x`: the list is not the answer and must not be shown as one.
+  inspect.setCasApi({ ...verbCas, solve: () => JSON.stringify({
+    ok: true, input: 'x = x', variable: 'x', everyValue: true,
+    solutions: [{ expr: '0', verified: 'exact' }] }) });
+  const every = inspect.runCompute('solve(x = x, x)');
+  ok('everyValue is not shown as a solution list',
+     !every.forms && !every.output && /every value of x/.test(every.note || ''),
+     JSON.stringify(every));
+
+  // What the answer assumes is shown. An assumption you cannot see is one you
+  // cannot check.
+  inspect.setCasApi({ ...verbCas, solve: () => JSON.stringify({
+    ok: true, input: 'a x = b', variable: 'x', method: 'linear',
+    note: 'assuming a is not zero',
+    solutions: [{ expr: 'b/a', verified: 'exact' }] }) });
+  const assumed = inspect.runCompute('solve(a x = b, x)');
+  ok('AN ASSUMPTION IS SHOWN, NOT SWALLOWED',
+     /assuming a is not zero/.test(assumed.note || '') &&
+     sheet()[sheet().length - 1].querySelector('.casitem__note') !== null,
+     JSON.stringify(assumed.note));
+  inspect.setCasApi(verbCas);
+
+  // -- 8. cas_command — THE CRATE READS THE LINE -------------------------
+  //
+  // When the build can dispatch a whole line, the shell hands it the line and
+  // the history and switches on the `command` that comes back. That is one
+  // reading of a worksheet line, in the crate, instead of two that can drift.
+
+  const seenLines = [];
+  const commandCas = {
+    ...verbCas,
+    command: (line, history) => {
+      seenLines.push([line, history]);
+      if (/^equal\(/.test(line)) {
+        return JSON.stringify({ command: 'equal', source: line,
+                                reply: JSON.parse(EQUAL(line)) });
+      }
+      if (/^solve\(/.test(line)) {
+        return JSON.stringify({ command: 'solve', source: 'solve((3x^2) = 12, x)',
+                                reply: JSON.parse(SOLVE('(3x^2) = 12', 'x')) });
+      }
+      return JSON.stringify({ command: 'eval', source: line,
+                              reply: { ok: true, input: line, output: '14' } });
+    },
+    commands: () => JSON.stringify([
+      { name: 'solve', signature: 'solve(equation, var)' },
+      { name: 'eval', signature: 'eval(e)' },
+      { name: 'zeta', signature: 'zeta(s)' },
+    ]),
+  };
+
+  inspect.setCasApi(commandCas);
   await settle(5);
-  click(ops().find((b) => b.dataset.op === 'eval'));
-  await settle(10);
-  const last = inspect.cas().log[inspect.cas().log.length - 1];
-  ok('a CAS refusal is kept and shown', !!last.error && !last.output,
-     JSON.stringify(last));
-  ok('the entry says so on its face',
-     items()[items().length - 1].classList.contains('is-error') &&
-     items()[items().length - 1].querySelector('.casitem__err') !== null);
-  ok('and a refused result offers nothing to insert',
-     items()[items().length - 1].querySelector('.casitem__use').hidden);
+  ok('WHEN THE BUILD CAN DISPATCH A LINE, THE CRATE READS IT',
+     inspect.cas().dispatch === 'cas_command', inspect.cas().dispatch);
+  ok('and the verb list comes FROM THE MODULE', inspect.cas().listed);
+  ok("so the module's own signature is what the pane shows",
+     inspect.cas().commands.find((c) => c.id === 'solve').sig ===
+       'solve(equation, var)',
+     JSON.stringify(inspect.cas().commands.find((c) => c.id === 'solve')));
+  ok('a verb only the module knows is offered anyway',
+     inspect.cas().commands.some((c) => c.id === 'zeta') &&
+     !!$('compute-ops').querySelectorAll('.casop').find((b) => b.dataset.op === 'zeta'),
+     inspect.cas().commands.map((c) => c.id).join(','));
+  inspect.clearCas();
+  inspect.typeCas('zet');
+  inspect.tabCas();
+  ok('AND IT COMPLETES, WITHOUT AN EDIT TO THIS SHELL',
+     inspect.cas().input === 'zeta()', JSON.stringify(inspect.cas().input));
+
+  inspect.clearCas();
+  seenLines.length = 0;
+  calls.length = 0;
+  const viaCmd = inspect.runCompute('diff(x^3, x)');
+  ok('a line goes to cas_command whole, exactly as typed',
+     seenLines.length === 1 && seenLines[0][0] === 'diff(x^3, x)' &&
+     calls.length === 0, JSON.stringify(seenLines));
+  ok('and the reply is read by the COMMAND it names, not by sniffing fields',
+     viaCmd.op === 'eval' && viaCmd.output === '14',
+     JSON.stringify({ op: viaCmd.op, output: viaCmd.output }));
+
+  seenLines.length = 0;
+  inspect.runCompute('solve(% = 12, x)');
+  const history = JSON.parse(seenLines[0][1]);
+  ok('THE HISTORY IS HANDED OVER, MOST RECENT FIRST',
+     Array.isArray(history) && history[0] === '14',
+     JSON.stringify(history));
+  ok('and the line the sheet keeps is the SOURCE the crate substituted',
+     inspect.cas().log[inspect.cas().log.length - 1].input ===
+       'solve((3x^2) = 12, x)',
+     inspect.cas().log[inspect.cas().log.length - 1].input);
+  ok('and a solve reply is read as solutions even through cas_command',
+     (inspect.cas().log[inspect.cas().log.length - 1].forms || []).length === 2);
+
+  inspect.setCasApi({ command: () => 'not json at all' });
+  const cmdGarbage = inspect.runCompute('2 + 2');
+  ok('a cas_command that does not answer in JSON is a refusal, not a crash',
+     !!cmdGarbage.error && /JSON/.test(cmdGarbage.error), cmdGarbage.error);
+  inspect.setCasApi({ command: () => { throw new Error('boom'); } });
+  const cmdThrew = inspect.runCompute('2 + 2');
+  ok('and one that throws likewise',
+     !!cmdThrew.error && /cas_command\(\)/.test(cmdThrew.error), cmdThrew.error);
+
+  // -- 9. A CALL MISSING FROM THE BUILD ----------------------------------
+
+  inspect.setCasApi(oldCas);
+  await settle(5);
+  ok('a build with only the original four still opens the pane',
+     inspect.cas().available && inspect.cas().ops.length === 4,
+     JSON.stringify(inspect.cas().ops));
+  ok('and the header names what it is missing, by its Rust name',
+     /no cas_/.test($('compute-note').textContent),
+     $('compute-note').textContent.slice(0, 90));
+  ok('but it does not shout about it — an old build is a fact, not a fault',
+     !$('compute-note').classList.contains('is-bad'));
+
+  const solveChip = () => $('compute-ops').querySelectorAll('.casop')
+    .find((b) => b.dataset.op === 'solve');
+  ok('a command the build lacks is offered as unavailable, not hidden',
+     !!solveChip() && solveChip().getAttribute('aria-disabled') === 'true');
+  ok('and the chip says which call would turn it on',
+     /cas_solve\(\)/.test(solveChip().title), solveChip().title);
+
+  const noSolve = inspect.runCompute('solve(2x = 2, x)');
+  ok('A MISSING CALL REFUSES BY NAME AND DOES NOT THROW',
+     !!noSolve.error && /cas_solve\(\)/.test(noSolve.error), noSolve.error);
+  ok('and the commands that ARE there still work',
+     inspect.runCompute('diff(x^3, x)').output === '3x^(2)');
+
+  inspect.setCasApi({ ...oldCas, diff: () => { throw new Error('boom'); },
+                      simplify: () => 'not json at all' });
+  const threw = inspect.runCompute('diff(x^3, x)');
+  ok('a call that throws becomes a refusal, not a blank screen',
+     !!threw.error && /cas_diff\(\)/.test(threw.error), threw.error);
+  const garbage = inspect.runCompute('simplify(2x)');
+  ok('and a reply that is not JSON says exactly that',
+     !!garbage.error && /JSON/.test(garbage.error), garbage.error);
+
+  // gray, not red: a half-typed expression is unfinished, never wrong.
+  inspect.setCasApi({ ...oldCas,
+    eval: (e) => JSON.stringify({ ok: false, pending: true, input: e,
+                                  error: 'expected an expression' }) });
+  const pend = inspect.runCompute('2 +');
+  ok('an unfinished expression is pending, not an error',
+     !!pend.pending && !sheet()[sheet().length - 1].classList.contains('is-error') &&
+     sheet()[sheet().length - 1].classList.contains('is-pending'),
+     JSON.stringify(pend));
+  ok('and the pane does not shout about it',
+     !$('compute-foot').classList.contains('is-bad'),
+     $('compute-foot').textContent.slice(0, 60));
+  inspect.setCasApi(verbCas);
+
+  // -- 10. THE WORKSHEET AS A DOCUMENT -----------------------------------
+
+  const ordered = inspect.cas().log;
+  ok('the worksheet keeps every line, oldest first',
+     ordered.length > 5 && ordered.every((e, i) => i === 0 || e.n > ordered[i - 1].n),
+     ordered.map((e) => e.n).join(','));
+  ok('and the sheet draws them in the same order',
+     sheet().map((i) => Number(i.dataset.n)).join(',') ===
+       ordered.map((e) => e.n).join(','));
+
+  // LAYOUT STABILITY: the prompt, the signature line, the strip and the foot
+  // are all outside the scroller, so a result arriving cannot move the line
+  // you are typing into. The sheet is the only thing that grows.
+  const promptEls = ['compute-gutter', 'compute-field', 'compute-run',
+                     'compute-sig', 'compute-ops', 'compute-foot'];
+  ok('the prompt lives outside the scroller, so results cannot move it',
+     promptEls.every((id) => {
+       const node = $(id);
+       for (let p = node; p; p = p.parentNode) if (p.id === 'compute-log') return false;
+       return !!node;
+     }), promptEls.join(', '));
+  ok('and the sheet is the scroller',
+     $('compute-log').classList.contains('compute__sheet'));
 
   click($('compute-clear'));
   await settle(5);
-  ok('the history can be emptied', items().length === 0 && inspect.cas().log.length === 0);
+  ok('the worksheet can be emptied',
+     sheet().length === 0 && inspect.cas().log.length === 0);
+  ok('and the numbering starts again at one',
+     $('compute-gutter').textContent === '[1]', $('compute-gutter').textContent);
+  ok('with nothing for % to reach',
+     inspect.cas().ditto.every((d) => d === null), JSON.stringify(inspect.cas().ditto));
+  const orphan = inspect.runCompute('% + 1');
+  ok('and % says so rather than sending a half-substituted line',
+     !!orphan.error && /previous result/.test(orphan.error), orphan.error);
 
   ok('the compute route is remembered too',
      localStorage.getItem('numpla.route') === 'compute',
      String(localStorage.getItem('numpla.route')));
 
-  // -- and what happens when the build has none of the calls ---------------
+  // -- 11. THE REFERENCE IS WHERE THE COMMANDS ARE LISTED ----------------
+
+  if ($('info-btn')) {
+    click($('info-btn'));
+    await settle(10);
+    $('info-search').value = 'evalf';
+    dispatch($('info-search'), 'input', { type: 'input', target: $('info-search') });
+    await settle(5);
+    ok('THE COMMANDS ARE IN THE REFERENCE, NOT IN A SECOND PLACE',
+       $('info-list').querySelectorAll('.entry').length > 0 &&
+       /evalf\(e\)/.test($('info-list').textContent),
+       $('info-list').textContent.slice(0, 90));
+
+    $('info-search').value = 'ditto';
+    dispatch($('info-search'), 'input', { type: 'input', target: $('info-search') });
+    await settle(5);
+    ok('and so is the ditto operator, with what it does after a failure',
+       /steps\s+straight over it/.test($('info-list').textContent),
+       $('info-list').textContent.slice(0, 120));
+
+    $('info-search').value = 'solve(';
+    dispatch($('info-search'), 'input', { type: 'input', target: $('info-search') });
+    await settle(5);
+    inspect.clearCas();
+    const solveEntry = $('info-list').querySelectorAll('.entry')
+      .find((e) => /solve\(2x = 2, x\)/.test(e.textContent));
+    ok('the reference offers to write a command into the worksheet', !!solveEntry);
+    if (solveEntry) {
+      // The entry itself, not its button: the shim has no real event
+      // propagation, so a click on the button would reach both.
+      click(solveEntry);
+      await settle(5);
+      ok('AND INSERTING FROM IT TYPES INTO THE LINE, NOT INTO THE DOCUMENT',
+         inspect.cas().input === 'solve()' && inspect.route() === 'compute',
+         JSON.stringify(inspect.cas().input));
+    }
+    if (!$('infopanel').hidden) { click($('info-close')); await settle(5); }
+  }
+
+  // -- 12. THE PHONE FOLLOWS INTO THE WORKSHEET --------------------------
+
+  const wasTouch = inspect.touch().on;
+  inspect.setTouch(true);
+  inspect.setKeyboard(true);
+  await settle(5);
+  ok('the math keyboard follows into the worksheet', inspect.keyboard().open);
+  inspect.clearCas();
+  inspect.press('7');
+  await settle(5);
+  ok('and it types into the prompt',
+     inspect.cas().input === '7', JSON.stringify(inspect.cas().input));
+  const kbBefore = inspect.cas().log.length;
+  inspect.press('newrow');
+  await settle(5);
+  ok('and ITS Enter runs the line, since there is no row below',
+     inspect.cas().log.length === kbBefore + 1 && inspect.cas().input === '',
+     JSON.stringify({ n: inspect.cas().log.length, input: inspect.cas().input }));
+  inspect.setKeyboard(false);
+  inspect.setTouch(wasTouch ? true : null);
+  await settle(5);
+
+  // -- 13. AND ON THE REAL BUILD -----------------------------------------
+  //
+  // Everything above is a stub, because the pane is the shell's job. This is
+  // not: it drives the worksheet through whatever app/pkg/ actually exports,
+  // so "the commands are typed" is proved against the real CAS.
+
+  inspect.setCasApi(null);
+  if (real) {
+    click($('choice-compute'));
+    await settle(10);
+    click($('compute-clear'));
+    await settle(5);
+    inspect.clearCas();
+
+    const rd = inspect.runCompute('diff(x^3, x)');
+    ok('the REAL build answers a typed diff() line',
+       !!rd && !rd.error && rd.output.length > 0,
+       JSON.stringify(rd && { op: rd.op, output: rd.output, error: rd.error }));
+    const re = inspect.runCompute('2 + 3*4');
+    ok('and a bare expression is eval, on the real thing too',
+       !!re && re.op === 'eval' && re.output === '14',
+       JSON.stringify(re && { op: re.op, output: re.output }));
+    const rp = inspect.runCompute('simplify(% + 1)');
+    ok('and % carries the real answer into the next real line',
+       !!rp && !rp.error && /14/.test(rp.input), JSON.stringify(rp));
+
+    const rs = inspect.runCompute('solve(2x = 2, x)');
+    ok('the REAL solve answers with its solutions',
+       !!rs && !rs.error && (rs.forms || []).length === 1 && rs.output === '1',
+       JSON.stringify(rs && { output: rs.output, forms: rs.forms }));
+
+    const rq = inspect.runCompute('equal(1^(1/2))');
+    ok('the REAL equal answers with a choice list',
+       !!rq && (rq.forms || []).length >= 2,
+       JSON.stringify(rq && rq.forms));
+    ok('and every one of its forms is exact, so every one is an equals sign',
+       (rq.forms || []).every((f) => f.kind === 'exact'),
+       (rq.forms || []).map((f) => f.kind).join(','));
+
+    const rid = inspect.runCompute('equal(1.6449340668482264)');
+    const idForm = (rid.forms || []).find((f) => f.kind === 'identification');
+    ok('THE REAL INVERSE LOOKUP COMES BACK AS AN IDENTIFICATION, NOT AN IDENTITY',
+       !!idForm && /not a proof/.test(idForm.note || ''),
+       JSON.stringify(rid && rid.forms));
+    ok('and the pane draws it with ≈ rather than =',
+       (() => {
+         const row = sheet()[sheet().length - 1]
+           .querySelectorAll('.casform').find((f) => f.dataset.kind === 'identification');
+         return !!row && row.querySelector('.casform__rel').textContent === '≈';
+       })());
+
+    ok('the REAL build lists its own verbs, so the strip comes from the module',
+       inspect.cas().listed && inspect.cas().dispatch === 'cas_command',
+       JSON.stringify({ listed: inspect.cas().listed, dispatch: inspect.cas().dispatch }));
+
+    click($('compute-clear'));
+    await settle(5);
+  }
+
+  // -- 14. AND WHEN THE BUILD HAS NONE OF THE CALLS ----------------------
+
   inspect.setCasApi(false);
   await settle(5);
   ok('losing the calls does not strand you in a dead pane',
@@ -1910,7 +2664,7 @@ const docCompiles = () => !rowEls().some((r) => r.classList.contains('is-error')
      inspect.route() === 'chooser', inspect.route());
 
   // Back to a working state for whatever comes next.
-  inspect.setCasApi(real ? null : stubCas);
+  inspect.setCasApi(verbCas);
   click($('choice-solve'));
   await settle(10);
   ok('and back to solve & simulate', inspect.route() === 'solve');

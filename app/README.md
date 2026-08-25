@@ -44,8 +44,8 @@ Numpla opens by asking which of two things you want.
 
 - **Solve & simulate** — the workspace: rows, sliders, the plot and everything
   on its strip.
-- **Compute** — a Maple-like pane over the CAS calls: type an expression and
-  simplify, differentiate, expand or evaluate it.
+- **Compute** — a Maple-like WORKSHEET over the CAS calls: type
+  `solve(2x = 2, x)`, get the answer beneath it, then type the next thing.
 
 **The start screen is not a second gate.** It lives inside the app shell, over
 the workspace's own grid row, painted on the loading screen's own background,
@@ -66,43 +66,223 @@ home is the one navigation convention everybody already has, and it costs no
 width and needs no label. The word beside it says which route you are in.
 
 **A route the build cannot serve is never offered as a live button.** If
-`app/pkg/` has none of the four CAS calls, the Compute card is rendered as
-unavailable and names the calls it wants, rather than opening a pane with four
-dead buttons; and a remembered `compute` route on such a build lands on `solve`.
+`app/pkg/` has none of the CAS calls, the Compute card is rendered as
+unavailable and names the calls it wants, rather than opening a pane where
+nothing can be run; and a remembered `compute` route on such a build lands on
+`solve`. A build that has *some* of them still gets the worksheet — see below.
 
-## Compute
+## Compute — a worksheet, not a form
 
-The pane is input on top, history below, and the history is the only thing that
-scrolls — the same layout rule the system pane obeys.
+The pane is a **document**: what you ran, with its result beneath it, then the
+next thing you ran, scrolling back as far as you like — and the live prompt
+under it. The sheet is the only thing that scrolls, and the prompt, the
+signature line, the command strip and the foot all sit outside it, so a result
+arriving can never move the line you are typing into. Same layout rule the
+system pane obeys.
 
-**The input is a `MathField`**, the same class every row in the system pane uses.
-There is exactly one way to type mathematics in this product; a text box would
-have been a second one. **Every result is rendered by another `MathField`** with
-its editing taken away (keys and clicks are stopped on the host, in the capture
-phase, so nothing reaches the field), which is why an answer comes back as
-mathematics rather than as a line of source — and why the input and the answer
-cannot disagree about what an expression looks like: they are drawn by the same
-code.
+**The prompt is a `MathField`**, the same class every row in the system pane
+uses. There is exactly one way to type mathematics in this product; a text box
+would have been a second one. **Every result is rendered by another `MathField`**
+with its editing taken away (keys and clicks are stopped on the host, in the
+capture phase, so nothing reaches the field), which is why an answer comes back
+as mathematics rather than as a line of source — and why the prompt and the
+answer cannot disagree about what an expression looks like: they are drawn by
+the same code.
+
+### Commands are typed, not clicked
+
+`solve(2x = 2, x)`. `diff(x^3, x)`. `evalf(pi)`. **Enter runs the line**, and a
+bare expression with no command is `eval`. The line is read as a command only
+when the call spans the whole of it — `solve(x) + 1` is arithmetic on something
+called `solve`, and it evaluates.
+
+| command | |
+|---|---|
+| `eval(e)` | the best exact form the CAS can reach — what a bare expression runs |
+| `evalf(e)` | a number, always |
+| `solve(2x = 2, x)` | the solutions; the unknown may be left out |
+| `equal(e)` | every equivalent form it can find, as a list to choose from |
+| `simplify(e)` `expand(e)` `factor(e)` | the rewrites |
+| `diff(x^3, x)` | differentiate; the variable may be left out |
+| `sum(k, k, 1, n)` `product(k, k, 1, n)` | closed form where one exists, else a number |
+| `subs(x = 3, e)` | substitution |
+
+**One list drives five things**: it binds the WASM calls, feeds the field's Tab
+completion, builds the command strip, shows the signature while you choose, and
+fills the reference panel's own group. Five copies of it would be five things
+to keep in step.
+
+**And the list comes from the module when the module can supply it.**
+`cas_commands()` returns the verb names and signatures in menu order; a verb
+added to `numpla-cas` therefore reaches the strip, the completion, the
+signature line and the reference without an edit here — the same rule
+`Model.methods()` already earns for the integrator. `CAS_CALLS` in `main.js`
+stays as the fallback, and as the place the *hints* live, because a signature
+tells you the shape of a call and a sentence tells you what it is for.
+
+#### Who reads the line
+
+Two ways in, and the shell takes the better one when it is there:
 
 | | |
 |---|---|
-| operations | `simplify`, `d/dx`, `expand`, `evaluate` — one button each, **built from the calls the build actually has**, so a WASM missing `cas_expand` shows three live buttons and says what the fourth needs |
-| the variable | `d/dx` reads a small field beside the buttons; the button relabels itself as you change it |
-| `Enter` | runs the operation you last used |
-| the history | one entry per run, oldest first, scrolling; `use` puts that answer back into the input |
-| a refusal | `ok: false` is kept as its own entry with the CAS's own sentence — a refusal is an answer, and throwing it away is how a tool becomes untrustworthy |
+| `cas_command(line, history)` | **the crate reads the line.** It parses, substitutes `%` from the history the pane hands over, checks the arity and dispatches, and answers `{ command, source, reply }`. The shell switches on `command` to know the reply's shape, and keeps `source` — the line after substitution — as what the sheet shows. |
+| the individual verbs | **the shell reads the line**, for a build with no `cas_command`. Same grammar, same defaults, same inferred variable — it is just this file's reading of a line instead of the crate's. |
+
+Reading a line at all is unambiguous for a reason worth writing down: every
+command name is multi-letter and every identifier in this language is a single
+letter, so `f(x)` can never be mistaken for a verb.
+
+**A left-out variable is inferred and named.** `solve(2x = 2)` sends `x`, and
+the entry records which one it used — a silent guess is exactly the thing this
+product does not do. Wrong arity is refused by signature before anything is
+sent.
+
+### Tab completes a command
+
+Typing `sol` and pressing Tab gives `solve(⎸)`, **caret inside the
+parentheses**. That is not a second completion system: the command names are
+handed to the field through `setDocumentNames({ functions: … })`, which is the
+same call and the same machinery the document's own function names use — and it
+is also what makes `solve(2x = 2, x)` *read* as a call rather than as five
+letters times a bracket.
+
+What the field's menu cannot show is the real signature — it renders a generic
+`solve(x)` for any name it is handed — so the signature is shown under the
+prompt instead, live: what Tab would complete, or, once the caret is inside a
+call, what that call takes.
+
+**`=` belongs inside the brackets here.** The field's own rule is that `=`
+splits a *row*, so typing one steps out of whatever structure the caret is in —
+exactly right for `dx/dt = -y`, and exactly wrong for `solve(2x = 2, x)`, where
+the equation is an *argument*. The worksheet is not a row list, so inside a
+command's round brackets the pane claims the key and puts the `=` where it was
+typed; everywhere else — at the top of the line, in an exponent, in a
+denominator — the field's rule stands untouched. `=` and `%` are the only two
+characters the pane claims, and both go through one `casType()`, so a
+keystroke, a tap on the math keyboard and the suite all take the same path.
+
+**The chips under the prompt are the phone's Tab key.** A phone has no Tab, so
+each chip *types* its command into the line with the caret inside the
+parentheses, exactly as Tab does. **A chip never runs anything.** A command the
+build lacks is shown disabled with the Rust call that would turn it on, rather
+than hidden.
+
+The chips are not where you *learn* what the commands are: that is the
+reference panel (`?`), which carries every one of them with a description, and
+inserting from it types into the line rather than into the document while
+`compute` is the route.
+
+### `%` — the ditto operator
+
+`%` is the previous result, `%%` the one before, `%%%` the one before that:
+Maple's own convention, and what makes a worksheet a worksheet. `diff(x^3, x)`
+then `solve(% = 12)` retypes nothing.
+
+Two things are true of it, and they are the same rule from either end:
+
+- **It is substituted before the line is sent.** `expandDitto()` runs on the
+  source string on its way to the CAS, so `%` is genuinely the previous
+  *expression* and never a reference resolved later.
+- **Pressing `%` substitutes it in the line, there and then**, so you can see
+  what you are about to compute with. Pressing it again while the line is
+  otherwise untouched walks further back — `%`, `%%`, `%%%` — replacing what
+  the last press left rather than stacking a second copy. `%` is not a
+  character a math field types (it is not mathematics), so the pane claims the
+  key in the capture phase before the field ever sees it; the three chips reach
+  the same levels for a screen with no `%` key.
+
+**After a failure, `%` does not move.** A line that refused produced no
+expression, and a ditto pointing at one would be a reference to nothing — so
+the history `%` walks is the history of *results*, and a refusal is stepped
+straight over. That is Maple's behaviour too. The pane says which entry it
+actually reached, by number, every time it is used. **`equal` does not move it
+either**: it answers with a list rather than one expression, and picking from
+the list is how you take one. A ditto with nothing to reach is a refusal with a
+sentence, never a guess.
+
+### `equal` — a choice list, and the difference between a proof and a match
+
+`equal(e)` comes back as a **list of candidate forms**, each carrying the label
+that says how it was obtained — `simplify`, `expand`, a logarithm law, a
+radical rewritten as an exponent — and a `kind` that says what it *claims*.
+
+**`kind` is the field that matters, and the four are rendered apart**, because
+a match sold as an identity is the one lie a CAS must never tell:
+
+| `kind` | claims | relation | how it reads |
+|---|---|---|---|
+| `exact` | equal wherever the input has a value at all | `=` | `exact`, in the accent |
+| `conditional` | equal **where its condition holds** | `=` | `where u > 0 and v > 0` — the condition *is* the badge, never a footnote |
+| `decimal` | the floating-point value | `≈` | `an approximation` |
+| `identification` | a closed form **matching the number** to near machine precision, **not proved** | `≈` | `numeric match — not a proven identity`, in amber on an amber ground, with the crate's own sentence under it: *"pi squared over six, which is zeta(2) — agrees to 17 significant digits. This is a numeric match, not a proof."* |
+
+A badge that only repeats the form’s own label is dropped rather than
+stuttered. Every `≈` carries `aria-label="approximately equal"`, so the distinction
+survives a screen reader rather than living only in a glyph. Picking one puts
+it in the line, and the foot repeats what it was. **A candidate that claims
+nothing is shown claiming nothing** — exactness is never inferred from silence.
+
+`solve` answers with the same kind of list: its **solutions** are rows to pick
+from, each labelled with the method that found them and each carrying
+`verified` — `exact` when substituting the root back gives literally zero,
+`checked numerically` when it vanishes to within rounding. That is a weaker
+claim and it is shown as one, but it is a *different* claim from an
+identification, so it does not borrow its words or its colour. An empty list
+with `ok: true` means there are **no solutions**, which is an answer and is
+drawn as one, not as a refusal; `everyValue` means the list is not the answer
+and it is not shown as one; and `note` — *"assuming a is not zero"* — is put on
+the line, because an assumption the reader cannot see is one they cannot check.
+
+The shapes are still read defensively (`readForms()`, `readSolutions()`): the
+crate settled on `forms` with `kind`, and a reply spelling it `candidates` with
+`exact: true` is read too. What is **never** guessed is the exactness — a form
+is called exact only when the reply says exact.
+
+### Going back through the document
+
+Every result is **selectable, insertable and reachable by `%`**. Clicking the
+answer itself puts it in the line — not only the small `use` button beside it —
+and `edit` pulls the *input* of an old line back into the prompt, which is the
+other half of what a worksheet is for.
 
 **Results are Numpla source, so they round-trip.** `output` goes back through
-the same parser the rows use, which is what makes `use` possible: differentiate,
-press `use`, simplify the derivative — without retyping anything.
+the same parser the rows use, which is what makes all of this possible:
+differentiate, press `use`, solve the derivative — without retyping anything.
 
-Not here, and said rather than half-done: symbolic integration, equation
-solving, limits, series, matrices.
+### Degrading
+
+Every call is **probed, never assumed** — `app/pkg/` can be older than the
+crate, exactly as it can for `vector_field` and `trajectory_from`.
+
+- A build with **none** of them does not get a Compute route: the card is
+  rendered unavailable and names the calls it wants, and a remembered `compute`
+  route lands on `solve`.
+- A build with **some** of them is still a worksheet. The header names what is
+  missing by its Rust name — **muted, never red**, because an old `app/pkg/` is
+  a fact and not a fault — the chips for those commands are disabled with the
+  reason, and typing one refuses by name (`this build has no cas_solve()`)
+  rather than throwing.
+- A build with **`cas_command` but no `cas_commands`** completes and dispatches
+  from `CAS_CALLS`; one with **`cas_commands` but no `cas_command`** lists the
+  module's verbs and calls them one at a time. Neither is a special case in the
+  code — each capability is asked for on its own.
+- A call that **throws**, or answers something that is not JSON, becomes a
+  refusal on its own line. A refusal is an answer, and throwing it away is how
+  a tool becomes untrustworthy.
+- `ok: false` with `pending: true` is **gray, not red**: a half-typed
+  expression is unfinished, not wrong, and the pane says so quietly.
+
+### The phone
 
 The math keyboard follows you into this pane. While `compute` is the route the
-keyboard's target is the pane's own input surface, wrapped in the one shape the
-keyboard knows, so a tap and a keystroke take the same path here as they do in a
-row — and `Enter` runs the operation instead of opening a row below.
+keyboard's target is the prompt, wrapped in the one shape the keyboard knows,
+so a tap and a keystroke take the same path here as they do in a row — and its
+`↵` runs the line instead of opening a row below. Because the prompt is at the
+*bottom* of the pane, `body.kb-open.route-compute .compute` gives the panel its
+height rather than letting it sit on top of the line being typed: the sheet is
+a scroller and can give the room up, which is the same deal the row list makes
+with `--kb-pad`.
 
 ## The six things this shell is built around
 
@@ -487,11 +667,14 @@ Rust. It is searchable by name *and* by description ("noise", "symplectic",
 | Notation | implicit multiplication, one-letter names, subscripts, primes, `^`, lists, the whole operator set, and the **call-versus-coefficient rule** |
 | The integrator | Tsit5 versus Verlet versus Yoshida4 — what each costs and buys; the same switch that is on the plot's strip |
 | Features | the window-is-the-span, one plot, the integrator switch, `show`, sliders, rows-in-any-order, gray-not-red, the issue bar |
+| Compute commands | the worksheet’s whole vocabulary — `solve` `eval` `evalf` `equal` `simplify` `expand` `factor` `diff` `sum` `product` `subs`, plus `Enter`, `Tab` and the `%` ditto. Rebuilt from the SAME list the pane completes and dispatches from, every time the panel is drawn — so a verb cannot exist in the worksheet and be missing here, not even one this shell has never heard of, which arrives through `cas_commands()` |
 
 **Every entry is insertable**, because a reference you can only read leaves you
 to retype what it just told you. A row kind writes a new row; anything else is
-typed into the row you were last in, at the caret; and everything can be copied.
-`↑` `↓` move, `Enter` takes the selected entry, `Esc` closes.
+typed into the row you were last in, at the caret — or, while `compute` is the
+route, into the worksheet’s prompt, since that is where there is something to
+type into. Everything can be copied. `↑` `↓` move, `Enter` takes the selected
+entry, `Esc` closes.
 
 The facts come from the source they document — `crates/numpla-expr/src/lexer.rs`
 and `eval.rs` for the builtins and their arities, `docs/noise.md` and
@@ -833,11 +1016,18 @@ of keys a metre apart.
 | `demoView()` | `{ want, pending }` — the view the last-loaded demo asked for |
 | `route()` | `chooser` \| `solve` \| `compute` |
 | `setRoute(name)` | go somewhere, as the cards do |
-| `cas()` | `{ available, ops, mounted, input, lastOp, log }` |
-| `setCasApi(next)` | `false` = "this build has none", an object = a stub, `null` = whatever the probe found |
-| `typeCas(text)` | type into the compute field, through the field's own typing path |
-| `clearCas()` | empty it |
-| `runCas(op)` | run one operation, exactly as its button does |
+| `cas()` | the whole worksheet: `{ available, ops, dispatch, listed, commands, mounted, input, lastOp, seq, sig, ditto, lastPick, log }`. `dispatch` is `cas_command` or `the shell`, and `listed` says whether the verb list came from `cas_commands()`; `commands` is every verb with its signature and whether this build has it; `sig` is the signature strip as drawn; `ditto` is what `%`, `%%` and `%%%` stand for, with the exact `source` each would insert; each `log` entry carries `n`, `inferred`, `pending`, `note`, and — for `equal` and `solve` — its `forms` with their `kind`: `exact` | `conditional` | `decimal` | `identification` | `checked` | `unknown` |
+| `setCasApi(next)` | `false` = "this build has none", an object = a stub, `null` = whatever the probe found. A stub that **omits** a key is a build that lacks that call |
+| `typeCas(text)` | type into the prompt, through the field's own typing path |
+| `clearCas()` | empty the prompt |
+| `runCompute(text)` | run a line; with no argument, whatever is in the prompt. It takes a literal `%`, which is how the substitution path is driven at all — `%` is not a character the field types |
+| `enterCompute()` | Enter: run the prompt and clear it |
+| `expandDitto(text)` | the `%` substitution on its own, before anything is parsed or sent: `{ text, missing }` |
+| `pressDitto(level)` | press `%`. A level goes straight there; `null` is what the key does — one back, then two, then three |
+| `tabCas()` | press Tab in the prompt, through the field's own command API: `{ input, menu }` |
+| `casCaret()` | `{ path, index }` — the only way to prove Tab left the caret **inside** the parentheses |
+| `typeCommand(id)` | tap a command chip: it types the command, it does not run it |
+| `pickForm(n, i)` | pick one of an `equal` entry's candidate forms, by entry number |
 
 `probe()` reports `cas` beside `field` and `seed`, so a suite can tell a build
 that has the CAS calls from one that does not — and drive the whole pane against
