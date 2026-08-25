@@ -7,10 +7,14 @@
 // Unit tests prove the parts; this proves the app.
 
 import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { install, buildFromHtml, doc, dispatch } from './dom-shim.mjs';
 
 const APP = new URL('./', import.meta.url);
-const p = (rel) => new URL(rel, APP).pathname.replace(/^\/([A-Za-z]:)/, '$1');
+// fileURLToPath rather than trimming `pathname` by hand: this suite runs on
+// Windows locally and on Linux in CI, and it also decodes percent-escapes, so a
+// checkout path containing a space does not silently become an unreadable file.
+const p = (rel) => fileURLToPath(new URL(rel, APP));
 
 install();
 buildFromHtml(p('index.html'));
