@@ -127,6 +127,25 @@ const el = {
 
   demosBtn: $('demos-btn'),
   demomenu: $('demomenu'),
+  newBtn:   $('new-btn'),
+
+  // the start screen and the two routes out of it
+  homeBtn:       $('home-btn'),
+  brandSlice:    $('brand-slice'),
+  chooser:       $('chooser'),
+  choiceSolve:   $('choice-solve'),
+  choiceCompute: $('choice-compute'),
+  choiceWhy:     $('choice-compute-why'),
+
+  // the compute pane
+  compute:      $('compute'),
+  computeField: $('compute-field'),
+  computeOps:   $('compute-ops'),
+  computeVar:   $('compute-var'),
+  computeLog:   $('compute-log'),
+  computeFoot:  $('compute-foot'),
+  computeNote:  $('compute-note'),
+  computeClear: $('compute-clear'),
 
   // narrow layout
   panetabs:  $('panetabs'),
@@ -193,6 +212,11 @@ function reveal() {
 
   status('ready');
   el.app.setAttribute('aria-hidden', 'false');
+
+  // Decided BEFORE `body.ready`, so the chooser's entrance animation belongs to
+  // the same frame the loader's exit does. The loading screen fades into the
+  // question rather than into a workspace that is then covered by one.
+  setRoute(initialRoute(), false);
 
   // two frames: let the first paint of the app happen at opacity 0 so the
   // transition has something to interpolate from.
@@ -808,7 +832,20 @@ function loadDemo(demo) {
   if (isFinite(t0) && isFinite(t1) && t1 > t0) {
     const win = plot.getWindow();
     plot.setWindow({ x0: t0, x1: t1, y0: win.y0, y1: win.y1 });
+    // ...and the span itself, not only the frame. A demo whose declared view is
+    // `phase`, `polar` or `field` arrives with `t-y` OFF, and with it off the
+    // horizontal axis is a state rather than time - so the window cannot say
+    // what to integrate and `spanFromFrame` falls back to the last span. That
+    // last span belonged to whatever was loaded before, which is exactly the
+    // wrong answer to "load this demo over the interval its author had in
+    // mind". Writing it here makes the fallback the demo's own interval.
+    state.t0 = t0;
+    state.t1 = t1;
   }
+
+  // THE ONE VIEW THIS DEMO IS ABOUT. Everything else goes off - see the note
+  // above `resetViewPolicy`. The menu still opens; this is arrival, not policy.
+  adoptDemoView(demo.view);
 
   // `show` names the series that ARE the picture - one line per string rather
   // than one per state. Everything is still solved; this only says what to draw.
@@ -824,6 +861,47 @@ function loadDemo(demo) {
   el.demosBtn.setAttribute('data-demo', demo.title);
   syncFrameButtons();
   scheduleRecompute(0);
+}
+
+// ---------------------------------------------------------------------------
+// New
+//
+// An empty document and the default frame, in one press. Deleting six rows one
+// at a time to get back to nothing is the kind of chore a product should not
+// ask for, and "start from nothing" is how half of all sessions begin.
+//
+// Everything a document accumulated goes with it: its sliders and their ranges,
+// its seeds, its `show` list, the demo it came from, the view policy, and the
+// frame. What survives is what belongs to the PERSON rather than to the
+// document - the pane width, the integrator, the route, the keyboard.
+// ---------------------------------------------------------------------------
+
+function newDocument() {
+  closeDemos();
+  closeSettings();
+  closeViews();
+  closeInfo();
+  closeHear();
+
+  pendingKnobs.clear();
+  promoted.clear();
+  knobRanges.clear();
+  for (const [name, s] of Array.from(sliders)) {
+    s.el.remove();
+    sliders.delete(name);
+  }
+
+  state.show = null;
+  clearSeeds();
+  resetViewPolicy();
+
+  clearRows();
+  buildRows([]);              // ensureTail leaves exactly one blank row
+  el.demosBtn.removeAttribute('data-demo');
+
+  resetFrames();              // -5..5 on both axes, and a re-solve behind it
+  scheduleRecompute(0);
+  focusTail();
 }
 
 // ---------------------------------------------------------------------------
@@ -1463,6 +1541,64 @@ function viewWhy(view) {
  */
 const viewsOff = new Set();
 
+// ---------------------------------------------------------------------------
+// WHAT A DOCUMENT ARRIVES AS
+//
+// The complaint this exists to answer: "the same graph is in every view". It
+// was true, and the plot was not at fault - the three views genuinely draw
+// different geometry. The POLICY was: everything the model supports turns
+// itself on, so `t-y` was drawn no matter which view you had come for.
+//
+// A demo now declares the one view it is about, and loading it turns THAT view
+// on and the others off. The menu is untouched: the user can switch anything
+// back on immediately afterwards, and their choice survives every recompile.
+// This changes what a demo arrives as, not what the menu can do.
+//
+// A demo with no `view` arrives as `time` - the t-y curve. It is the one view
+// every document can draw whatever its shape, and it is the view the demo used
+// to arrive with anyway; the point is that it arrives with exactly ONE.
+//
+// A plain document - the one at boot, one typed from nothing, one pushed in by
+// the suite - keeps the old policy: everything supported is on. Nobody chose
+// its subject, so nothing here may pretend to know it.
+// ---------------------------------------------------------------------------
+
+const DEFAULT_DEMO_VIEW = 'time';
+
+/** The view the last-loaded demo asked for, and whether it has been checked. */
+let demoView = null;
+let demoViewPending = false;
+
+/** Back to "everything supported is on" - a document with no declared subject. */
+function resetViewPolicy() {
+  viewsOff.clear();
+  demoView = null;
+  demoViewPending = false;
+}
+
+/** Exactly one view on, every other one off. */
+function chooseSingleView(view) {
+  viewsOff.clear();
+  for (const v of VIEWS) if (v !== view) viewsOff.add(v);
+}
+
+/**
+ * Loading a demo: the view it declares, or `time` when it declares none. The
+ * check against what the document can actually SUPPORT has to wait for the
+ * compile, so it happens once in updateCapabilities - a demo asking for a view
+ * this build or this document cannot draw degrades to `time` rather than
+ * arriving with an empty plot.
+ */
+function adoptDemoView(view) {
+  const want = typeof view === 'string' && VIEWS.indexOf(view) >= 0
+    ? view
+    : DEFAULT_DEMO_VIEW;
+  demoView = want;
+  demoViewPending = true;
+  chooseSingleView(want);
+  return want;
+}
+
 /** The views actually drawn: supported, and not switched off. */
 function activeViews() {
   return VIEWS.filter((v) => caps[v] && !viewsOff.has(v));
@@ -1568,6 +1704,17 @@ function updateCapabilities(names) {
   // The same condition as `phase`, for the same reason - the plane has two
   // axes - plus a build that can actually answer for the right-hand side.
   caps.field = plane && !!fieldApi;
+
+  // The one-shot check a demo's declared view has been waiting for. `field` on
+  // a build with no `vector_field`, or `phase` on a six-state string, cannot
+  // draw - and a demo that arrives with nothing on screen is worse than one
+  // that arrives with the wrong picture, so it falls back to the curve every
+  // document has.
+  if (demoViewPending) {
+    demoViewPending = false;
+    if (!caps[demoView]) chooseSingleView(DEFAULT_DEMO_VIEW);
+  }
+
   applyViews();
 }
 
@@ -2713,11 +2860,17 @@ globalThis.__numplaInspect = {
   /** True while a debounced recompute, resolve or field query is still queued. */
   pending: () => pendingWork.recompute || pendingWork.resolve || pendingWork.field,
   setDocument: (text) => {
+    // A document nobody chose the subject of: back to "everything supported is
+    // on", the same policy the boot document and the `new` button get.
+    resetViewPolicy();
     clearRows();
     buildRows(String(text).split(/\r?\n/));
     ensureTail();
     scheduleRecompute(0);
   },
+
+  /** Which view a demo asked for, and whether it is still to be checked. */
+  demoView: () => ({ want: demoView, pending: demoViewPending }),
 
   /** Which views are drawable, and which are drawing. */
   views: () => ({ on: activeViews(), caps: { ...caps } }),
@@ -2739,7 +2892,53 @@ globalThis.__numplaInspect = {
   })),
 
   /** Which optional WASM calls this build actually has. */
-  probe: () => ({ field: !!fieldApi, seed: !!seedApi }),
+  probe: () => ({ field: !!fieldApi, seed: !!seedApi, cas: !!casApi }),
+
+  // --- the start screen and the two routes --------------------------------
+
+  /** 'chooser' | 'solve' | 'compute'. */
+  route: () => route,
+
+  /** Go somewhere without pressing the card - the same call the card makes. */
+  setRoute: (name) => setRoute(name, false),
+
+  /** The compute pane as it stands: what it can do, what is typed, what it said. */
+  cas: () => ({
+    available: !!casApi,
+    ops: CAS_CALLS.filter((c) => casApi && casApi[c.id]).map((c) => c.id),
+    mounted: casMounted,
+    input: casInput ? casInput.source : '',
+    lastOp: casLastOp,
+    log: casLog.map((e) => ({ op: e.op, input: e.input, output: e.output, error: e.error })),
+  }),
+
+  /**
+   * Swap the CAS calls out. `false` is "this build has none", an object is a
+   * stub, and null/undefined restores whatever the real probe found - the same
+   * three-way switch `setApis` gives the field and seed calls.
+   */
+  setCasApi: (next) => {
+    casApi = next === false ? null
+           : (next == null ? probedCas : next);
+    syncChooser();
+    syncComputeNote();
+    if (casMounted) renderCasOps();
+    if (!casApi && route === 'compute') setRoute('solve', false);
+    return !!casApi;
+  },
+
+  /** Type into the compute field, through the field's own typing path. */
+  typeCas: (text) => {
+    if (!casInput) return '';
+    try { casInput.insert(String(text)); } catch (err) { console.error(err); }
+    return casInput.source;
+  },
+
+  /** Empty it, the way selecting everything and deleting would. */
+  clearCas: () => { if (casInput) casInput.source = ''; return casInput ? casInput.source : ''; },
+
+  /** Run one operation, exactly as its button does. */
+  runCas: (op) => runCas(op),
 
   /**
    * Swap the optional calls out. The suite uses this twice: with `null`, to
@@ -2833,6 +3032,13 @@ globalThis.__numplaInspect = {
 
   /** The document as the compiler sees it. */
   source: () => docSource(),
+
+  /** What the compiler reported the document contains. */
+  names: () => ({
+    states: state.names.slice(),
+    params: state.params.slice(),
+    derived: state.derived.slice(),
+  }),
 
   /**
    * Hide the field's command API, or give it back. `false` shadows `insert`
@@ -4226,6 +4432,10 @@ function setKeyboardPage(page) {
 
 /** The row a key acts on: whichever one last had the caret. */
 function targetRow() {
+  // While `compute` is on screen there is no row list to type into; the pane's
+  // own input surface is the target, wrapped so the keyboard sees the one shape
+  // it knows. Same MathField, same command API, same keys.
+  if (route === 'compute' && casInput) return casRow();
   if (lastActiveRow && indexOfRow(lastActiveRow) >= 0) return lastActiveRow;
   ensureTail();
   return rows[rows.length - 1] || null;
@@ -4309,7 +4519,7 @@ function fieldNavigate(row, dir) {
   }
   // navHandled: the field may have walked out of its own edge already, by
   // calling onNavigate - which IS navigate(). Moving again would skip a row.
-  if (!moved && !navHandled) navigate(row, dir);
+  if (!moved && !navHandled && !row.compute) navigate(row, dir);
   navHandled = false;
   return true;
 }
@@ -4346,7 +4556,8 @@ function pressKey(key) {
 
   let handled = false;
   if (key.act === 'newrow') {
-    insertAfter(row);
+    // In the compute pane there is no row below: Enter runs the operation.
+    if (row.compute) runCas(casLastOp); else insertAfter(row);
     handled = true;
   } else if (key.cmd) {
     handled = fieldCommand(row.field, key.cmd, row);
@@ -4452,7 +4663,7 @@ function keyboardHeight() {
  * still reach the top of it.
  */
 function keepRowVisible(row) {
-  if (!kbOpen || !row || !row.el) return null;
+  if (!kbOpen || !row || !row.el || row.compute) return null;
   const scroller = el.rows;
   if (!scroller || typeof scroller.getBoundingClientRect !== 'function') return null;
   let r, sr;
@@ -4528,6 +4739,7 @@ function onRowBlurred() {
     const a = document.activeElement;
     if (a && typeof a.closest === 'function' && a.closest('.mathkb')) return;
     if (rows.some((r) => r.field && r.field.focused)) return;
+    if (casInput && casInput.focused) return;
     closeKeyboard();
   }, 0);
 }
@@ -4645,6 +4857,15 @@ function wire() {
 
   el.demosBtn.addEventListener('click', toggleDemos);
 
+  if (el.newBtn) {
+    el.newBtn.addEventListener('click', (e) => {
+      e.preventDefault();
+      newDocument();
+    });
+  }
+
+  wireRoutes();
+
   el.hearBtn.addEventListener('click', () => {
     if (el.hearPanel.hidden) openHear(); else closeHear();
   });
@@ -4750,6 +4971,473 @@ function wire() {
 }
 
 // ---------------------------------------------------------------------------
+// The CAS calls
+//
+// Probed, never assumed - app/pkg/ can be older than the crate, exactly as it
+// can for `vector_field` and `trajectory_from`. Each call returns JSON:
+//
+//     { ok, input, output, steps?, error? }
+//
+// and `output` is Numpla SOURCE, which is the whole reason a result can be
+// rendered as mathematics and pressed straight back into the input: it goes
+// through the same parser the rest of the product uses.
+//
+// A build with none of them does not get a Compute route. The chooser says so
+// on the card rather than opening a pane with four dead buttons.
+// ---------------------------------------------------------------------------
+
+const CAS_CALLS = [
+  { id: 'simplify', rust: 'cas_simplify', camel: 'casSimplify',
+    label: 'simplify', vars: false, hint: 'fold arithmetic, collect like terms, order canonically' },
+  { id: 'diff', rust: 'cas_diff', camel: 'casDiff',
+    label: 'd/d', vars: true, hint: 'differentiate with respect to one variable' },
+  { id: 'expand', rust: 'cas_expand', camel: 'casExpand',
+    label: 'expand', vars: false, hint: 'distribute products over sums' },
+  { id: 'eval', rust: 'cas_eval', camel: 'casEval',
+    label: 'evaluate', vars: false, hint: 'a number where there is one' },
+];
+
+/** Bind whichever of the four this build has. Null when it has none. */
+export function probeCasApi(model) {
+  if (!model) return null;
+  const api = {};
+  for (const c of CAS_CALLS) {
+    const name = typeof model[c.rust] === 'function' ? c.rust
+               : typeof model[c.camel] === 'function' ? c.camel
+               : null;
+    if (name) api[c.id] = (...args) => model[name](...args);
+  }
+  return Object.keys(api).length ? api : null;
+}
+
+let casApi = null;
+let probedCas = null;          // what the probe found, so a stub can be undone
+
+const CAS_MISSING =
+  'Not in this build: the compute core has no cas_simplify, cas_diff, ' +
+  'cas_expand or cas_eval. Rebuild it to turn this on.';
+
+// ---------------------------------------------------------------------------
+// The compute pane
+//
+// Input on top, history below. The input surface is a MathField - the same
+// class every row in the system pane uses - because there is exactly one way to
+// type mathematics in this product and a text box would be a second one. Every
+// result is rendered by another MathField, with its editing switched off, so
+// mathematics comes back as mathematics rather than as a line of source.
+//
+// What it does NOT do, and says so instead of half-doing it: symbolic
+// integration, equation solving, limits, series, matrices.
+// ---------------------------------------------------------------------------
+
+const CAS_LOG_MAX = 80;
+
+let casInput = null;           // the MathField the user types into
+let casMounted = false;
+let casLastOp = 'simplify';
+const casLog = [];             // { op, input, output, error }
+const casDisplays = [];        // the read-only fields currently in the log
+
+/** The pseudo-row the math keyboard types into while `compute` is on screen. */
+let casRowCache = null;
+function casRow() {
+  if (!casInput) return null;
+  if (!casRowCache || casRowCache.field !== casInput) {
+    casRowCache = { field: casInput, el: el.compute, compute: true };
+  }
+  return casRowCache;
+}
+
+function casVarName() {
+  const raw = el.computeVar ? String(el.computeVar.value || '').trim() : '';
+  return raw || 'x';
+}
+
+function casFoot(text, bad) {
+  if (!el.computeFoot) return;
+  el.computeFoot.textContent = text;
+  el.computeFoot.classList.toggle('is-bad', !!bad);
+}
+
+/** The header line: what this build can actually do, named. */
+function syncComputeNote() {
+  if (!el.computeNote) return;
+  if (!casApi) {
+    el.computeNote.textContent = CAS_MISSING;
+    el.computeNote.classList.add('is-bad');
+    return;
+  }
+  const have = CAS_CALLS.filter((c) => casApi[c.id]);
+  const missing = CAS_CALLS.filter((c) => !casApi[c.id]);
+  el.computeNote.textContent = have.map((c) => c.id).join(' · ') +
+    (missing.length ? ' — no ' + missing.map((c) => c.rust + '()').join(', ') : '');
+  el.computeNote.classList.toggle('is-bad', missing.length > 0);
+}
+
+/** The chooser's second card is only live on a build that can serve it. */
+function syncChooser() {
+  if (!el.choiceCompute) return;
+  const have = !!casApi;
+  el.choiceCompute.setAttribute('aria-disabled', have ? 'false' : 'true');
+  el.choiceCompute.classList.toggle('is-unavailable', !have);
+  if (el.choiceWhy) {
+    el.choiceWhy.textContent = have
+      ? 'Type an expression and simplify, differentiate, expand or evaluate it.'
+      : CAS_MISSING;
+  }
+}
+
+/**
+ * A rendering of Numpla source as mathematics, with the editing taken away.
+ * It is a MathField, not a second renderer: the input and the answer are drawn
+ * by the same code, so they cannot disagree about what an expression looks
+ * like. Keys and clicks are stopped on the HOST, in the capture phase, which
+ * runs before the field's own listeners - so nothing reaches it.
+ */
+function staticMath(host, source) {
+  if (!host) return null;
+  host.classList.add('mf--static');
+  let field = null;
+  try {
+    field = new MathField(host, { value: source, ariaLabel: 'mathematics' });
+  } catch (err) {
+    console.error('[numpla] could not render a CAS result', err);
+    host.textContent = source;
+    return null;
+  }
+  const stop = (e) => {
+    if (e && typeof e.preventDefault === 'function') e.preventDefault();
+    if (e && typeof e.stopPropagation === 'function') e.stopPropagation();
+  };
+  host.addEventListener('keydown', stop, true);
+  host.addEventListener('mousedown', stop, true);
+  if (field.el) {
+    field.el.tabIndex = -1;
+    field.el.setAttribute('aria-readonly', 'true');
+  }
+  casDisplays.push(field);
+  return field;
+}
+
+/** Put a result back where it came from: the input surface. */
+function useCasResult(source) {
+  if (!casInput || !source) return '';
+  try {
+    casInput.source = source;
+  } catch (err) {
+    console.error('[numpla] could not put the result back', err);
+    return '';
+  }
+  try { casInput.focus(); } catch (err) { /* best effort */ }
+  casFoot('the result is in the input — run another operation on it');
+  return casInput.source;
+}
+
+function casItemEl(entry) {
+  const item = document.createElement('div');
+  item.className = 'casitem';
+  item.dataset.op = entry.op;
+  if (entry.error) item.classList.add('is-error');
+
+  const op = document.createElement('span');
+  op.className = 'casitem__op';
+  const call = CAS_CALLS.find((c) => c.id === entry.op);
+  op.textContent = entry.op === 'diff' ? 'd/d' + (entry.varName || 'x')
+    : (call ? call.label : entry.op);
+
+  const inHost = document.createElement('div');
+  inHost.className = 'casitem__in';
+
+  const sign = document.createElement('span');
+  sign.className = 'casitem__sign';
+  sign.textContent = '=';
+  sign.setAttribute('aria-hidden', 'true');
+
+  const use = document.createElement('button');
+  use.type = 'button';
+  use.className = 'casitem__use';
+  use.textContent = 'use';
+  use.title = 'put this answer back into the input';
+  use.hidden = !entry.output;
+  use.addEventListener('click', (e) => {
+    if (e && typeof e.preventDefault === 'function') e.preventDefault();
+    useCasResult(entry.output);
+  });
+
+  item.append(op, inHost, use, sign);
+
+  if (entry.error) {
+    const err = document.createElement('div');
+    err.className = 'casitem__err';
+    err.textContent = entry.error;
+    item.append(err);
+    sign.textContent = '×';
+  } else {
+    const outHost = document.createElement('div');
+    outHost.className = 'casitem__out';
+    item.append(outHost);
+    staticMath(outHost, entry.output);
+  }
+
+  staticMath(inHost, entry.input);
+  return item;
+}
+
+function renderCasLog() {
+  if (!el.computeLog) return;
+  for (const f of casDisplays.splice(0)) {
+    try { f.destroy(); } catch (err) { /* it is going away anyway */ }
+  }
+  el.computeLog.textContent = '';
+
+  if (!casLog.length) {
+    const empty = document.createElement('p');
+    empty.className = 'casempty';
+    empty.textContent =
+      'Type an expression above and press one of the operations. ' +
+      'Answers are Numpla source, so any of them can go back into the input. ' +
+      'Not here, deliberately: symbolic integration, equation solving, limits, ' +
+      'series, matrices.';
+    el.computeLog.append(empty);
+    return;
+  }
+  for (const entry of casLog) el.computeLog.append(casItemEl(entry));
+  try {
+    if (typeof el.computeLog.scrollHeight === 'number') {
+      el.computeLog.scrollTop = el.computeLog.scrollHeight;
+    }
+  } catch (err) { /* no scroller in the test shim */ }
+}
+
+function pushCas(entry) {
+  casLog.push(entry);
+  while (casLog.length > CAS_LOG_MAX) casLog.shift();
+  renderCasLog();
+  casFoot(entry.error
+    ? entry.error
+    : entry.op + ' · ' + entry.input + '  =  ' + entry.output, !!entry.error);
+  return entry;
+}
+
+/** One operation, on whatever is in the input. Returns the log entry. */
+function runCas(opId) {
+  const call = CAS_CALLS.find((c) => c.id === opId) || CAS_CALLS[0];
+  if (!casApi || !casApi[call.id]) {
+    casFoot('this build has no ' + call.rust + '()', true);
+    return null;
+  }
+  const src = casInput ? String(casInput.source || '').trim() : '';
+  if (!src) {
+    casFoot('type an expression first');
+    return null;
+  }
+
+  casLastOp = call.id;
+  renderCasOps();
+
+  const varName = casVarName();
+  let raw;
+  try {
+    raw = call.vars ? casApi[call.id](src, varName) : casApi[call.id](src);
+  } catch (err) {
+    console.error('[numpla] ' + call.rust + ' threw', err);
+    return pushCas({ op: call.id, varName, input: src, output: '',
+                     error: call.rust + '() failed' });
+  }
+
+  const rep = parseJson(String(raw), call.rust);
+  if (!rep) {
+    return pushCas({ op: call.id, varName, input: src, output: '',
+                     error: call.rust + '() did not answer in JSON' });
+  }
+  const output = typeof rep.output === 'string' ? rep.output.trim() : '';
+  const failed = rep.ok === false || !output;
+  return pushCas({
+    op: call.id,
+    varName,
+    input: typeof rep.input === 'string' && rep.input ? rep.input : src,
+    output: failed ? '' : output,
+    error: failed
+      ? (typeof rep.error === 'string' && rep.error ? rep.error : 'no answer')
+      : '',
+  });
+}
+
+function renderCasOps() {
+  if (!el.computeOps) return;
+  el.computeOps.textContent = '';
+  for (const call of CAS_CALLS) {
+    const have = !!(casApi && casApi[call.id]);
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'casop';
+    b.dataset.op = call.id;
+    b.textContent = call.vars ? call.label + casVarName() : call.label;
+    b.setAttribute('aria-disabled', have ? 'false' : 'true');
+    b.title = have ? call.hint : 'this build has no ' + call.rust + '()';
+    b.classList.toggle('is-last', casLastOp === call.id);
+    b.addEventListener('click', (e) => {
+      if (e && typeof e.preventDefault === 'function') e.preventDefault();
+      if (!have) { casFoot('this build has no ' + call.rust + '()', true); return; }
+      runCas(call.id);
+    });
+    el.computeOps.append(b);
+  }
+}
+
+/** Built once, the first time the route is taken. */
+function mountCompute() {
+  if (casMounted || !MathField || !el.computeField) return;
+  casMounted = true;
+  try {
+    casInput = new MathField(el.computeField, {
+      value: '',
+      ariaLabel: 'expression to compute',
+      touchDriven: touchMode,
+      onEnter: () => { runCas(casLastOp); },
+      onFocus: () => { if (touchMode) openKeyboard(); },
+      onBlur: () => onRowBlurred(),
+    });
+  } catch (err) {
+    console.error('[numpla] the compute field would not mount', err);
+    casInput = null;
+  }
+  renderCasOps();
+  renderCasLog();
+  syncComputeNote();
+  casFoot('Enter runs the operation you last used.');
+}
+
+// ---------------------------------------------------------------------------
+// The routes
+//
+// Numpla opens by asking which of two things you want. The answer is a class on
+// <body>: exactly one of the workspace and the compute pane owns the grid's
+// second row, and the chooser floats over it.
+//
+// It is not a second gate in front of the loading screen. The loader hands over
+// to the app shell exactly as it always did - one eased fade - and what the app
+// shell shows first is the chooser, under a top bar that has already arrived,
+// on the loader's own background, rising on the same curve and the same delay
+// the workspace rises on. One motion, with a question in the middle of it.
+//
+// The choice is remembered, so it asks once rather than on every reload; the
+// logo is the way back to it.
+// ---------------------------------------------------------------------------
+
+const ROUTE_KEY = 'numpla.route';
+const ROUTES = ['solve', 'compute'];
+const ROUTE_NAME = { solve: 'solve & simulate', compute: 'compute' };
+
+let route = 'chooser';
+
+function storedRoute() {
+  try {
+    const v = localStorage.getItem(ROUTE_KEY);
+    return ROUTES.indexOf(v) >= 0 ? v : null;
+  } catch (err) {
+    return null;                       // private mode: ask every time
+  }
+}
+
+function rememberRoute(name) {
+  try { localStorage.setItem(ROUTE_KEY, name); } catch (err) { /* private mode */ }
+}
+
+/** The word under the logo says where you are, since the logo is the way back. */
+function syncBrand() {
+  if (el.brandSlice) {
+    el.brandSlice.textContent = route === 'chooser'
+      ? 'vertical slice'
+      : (ROUTE_NAME[route] || route);
+  }
+  if (el.homeBtn) {
+    el.homeBtn.setAttribute('aria-current', route === 'chooser' ? 'page' : 'false');
+    el.homeBtn.title = route === 'chooser'
+      ? 'the start screen'
+      : 'Back to the start screen';
+  }
+}
+
+/**
+ * Go somewhere. `compute` on a build with no CAS is not a place, so it lands on
+ * `solve` instead of opening a dead pane.
+ */
+function setRoute(next, remember) {
+  const want = next === 'compute' && !casApi ? 'solve' : next;
+  route = ROUTES.indexOf(want) >= 0 ? want : 'chooser';
+
+  const cls = document.body.classList;
+  cls.toggle('route-chooser', route === 'chooser');
+  cls.toggle('route-solve', route === 'solve');
+  cls.toggle('route-compute', route === 'compute');
+
+  if (remember && route !== 'chooser') rememberRoute(route);
+
+  if (route === 'compute') {
+    closeDemos();
+    closeViews();
+    closeSettings();
+    mountCompute();
+    if (casInput) { try { casInput.focus(); } catch (err) { /* best effort */ } }
+  } else if (route === 'solve') {
+    // The pane may have been display:none, so its box is new to the plot.
+    applyLayout();
+    scheduleDraw();
+    scheduleField(0);
+  } else {
+    closeKeyboard();
+    // The chooser is the only thing on screen; the keyboard should land on it.
+    if (el.choiceSolve) { try { el.choiceSolve.focus(); } catch (err) { /* best effort */ } }
+  }
+
+  syncBrand();
+  return route;
+}
+
+/** The first route of the session: the last one chosen, or the question. */
+function initialRoute() {
+  const stored = storedRoute();
+  if (!stored) return 'chooser';
+  if (stored === 'compute' && !casApi) return 'solve';
+  return stored;
+}
+
+function wireRoutes() {
+  syncChooser();
+  syncComputeNote();
+  syncBrand();
+
+  if (el.homeBtn) {
+    el.homeBtn.addEventListener('click', (e) => {
+      if (e && typeof e.preventDefault === 'function') e.preventDefault();
+      setRoute('chooser', false);
+    });
+  }
+
+  for (const btn of [el.choiceSolve, el.choiceCompute]) {
+    if (!btn) continue;
+    btn.addEventListener('click', (e) => {
+      if (e && typeof e.preventDefault === 'function') e.preventDefault();
+      if (btn.getAttribute('aria-disabled') === 'true') return;
+      setRoute(btn.dataset.route, true);
+    });
+  }
+
+  if (el.computeVar) {
+    el.computeVar.addEventListener('input', () => { if (casMounted) renderCasOps(); });
+  }
+  if (el.computeClear) {
+    el.computeClear.addEventListener('click', (e) => {
+      if (e && typeof e.preventDefault === 'function') e.preventDefault();
+      casLog.length = 0;
+      renderCasLog();
+      casFoot('history cleared');
+    });
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Boot
 // ---------------------------------------------------------------------------
 
@@ -4827,6 +5515,8 @@ async function boot() {
     probedApis = { field: probeFieldApi(model), seed: probeSeedApi(model) };
     fieldApi = probedApis.field;
     seedApi = probedApis.seed;
+    probedCas = probeCasApi(model);
+    casApi = probedCas;
   } catch (err) {
     fail('The WASM module does not match docs/wasm-api.md.', err);
     return;

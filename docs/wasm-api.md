@@ -35,6 +35,8 @@ Row kinds:
 |---|---|
 | `x' = <expr>` | ODE row. `x` becomes a state variable. |
 | `x'' = <expr>` | Second order. Lowered to two first-order states (see below). |
+| `dx/dt = <expr>` | The same ODE row in Leibniz notation. The denominator names the independent variable — see below. |
+| `d2x/dt2 = <expr>` | Second order, Leibniz. `d^2x/dt^2` spells the same thing. |
 | `x(0) = <number>` | Initial condition for state `x`. Defaults to 0 if absent, *and says so* — see "missing information". |
 | `k = <expr>` | Parameter/constant, visible to every row. |
 | `E = <expr reading states or t>` | **Derived row** — a function of the solution, not a constant. See below. |
@@ -42,9 +44,9 @@ Row kinds:
 
 ### Derived rows
 
-A `name = ...` row whose expression reads a state, a lowered velocity, `t`, or
-another derived row is not a constant: it has no value until there is a
-trajectory to read it along. The compiler recognises that and sets it aside.
+A `name = ...` row whose expression reads a state, a lowered velocity, the
+independent variable, or another derived row is not a constant: it has no value
+until there is a trajectory to read it along. The compiler recognises that and sets it aside.
 
 ```
 x'' = -x
@@ -75,7 +77,45 @@ state for `x'`, and `x'(0) = v` sets its initial condition. State order in all
 vectors is **declaration order of the ODE rows**, with each lowered velocity
 state placed immediately after its position state.
 
-Inside an ODE right-hand side, `t` is bound to the current time.
+Inside an ODE right-hand side, the independent variable is bound to the
+current value of the solver's parameter — `t` unless the document says
+otherwise, which is what the next section is about.
+
+### Leibniz notation, and the independent variable
+
+`dx/dt = -y` and `x' = -y` are the same row in every respect: the same parsed
+tree, the same state vector, the same trajectory to the last bit. A document
+may use either spelling, or both.
+
+The difference is that the Leibniz row says one extra thing — **the denominator
+names the independent variable**:
+
+```
+df/dx = 2x
+f(0) = 0
+```
+
+integrates `f` along `x` and gives `f = x²`. An integral is a differential
+equation you already know how to write, and the horizontal axis of that plot is
+`x`, not `t`.
+
+| | |
+|---|---|
+| spellings | `dx/dt`, `d2x/dt2`, `d^2x/dt^2`. Whitespace is irrelevant (`d x / d t` is the same row). Numerator and denominator orders must match; `d2x/dt` is reported. |
+| default | A document of `x' = ...` rows names no independent variable and gets `t`, exactly as before. |
+| one per document | Mixing `dx/dt` and `dy/ds` is an **error on both rows**, each naming the other's line. There is one solver parameter and one horizontal axis, so there is nothing to pick between. |
+| where it reaches | `Diagnostics.independent`. It is the environment key the solver binds every step, the name a right-hand side may legitimately read, and the label the horizontal axis deserves. |
+
+**`d` is still an ordinary name.** The notation is recognised only when it
+spans the *whole* left-hand side of an `=`, so `d = 0.25` is a parameter and
+`y' = -c y + d x y` reads `d` as the coefficient it is. A `dx/dt` written
+inside an expression, or without an `=`, stays the arithmetic it always was —
+reading it as a derivative there would need a symbolic derivative rather than
+a notation, and is deliberately not attempted.
+
+Every document whose meaning this changes was previously a red row (`dx/dt = 1`
+was an unsupported implicit equation), so the addition can only turn red rows
+green.
 
 ### Calls and coefficients
 
@@ -183,6 +223,10 @@ impl Model {
   "derived": ["E"],              // rows that are functions of the solution;
                                  // always present, [] when there are none.
                                  // These are the names `conservation` accepts.
+  "independent": "t",            // what the rows differentiate with respect
+                                 // to: the `t` of `dx/dt`, the `x` of `df/dx`.
+                                 // Always present; "t" when nothing said.
+                                 // Label the horizontal axis with it.
   "issues": [
     {
       "line": 3,                 // 0-based line in the source
@@ -606,6 +650,11 @@ measured on is the same bug as a stale sample.
   recompiling is the whole interaction.
 - `dt_max` is set internally from `t1 - t0` so a narrow feature cannot be
   stepped over — see `docs/solvers.md`.
+- Label the horizontal axis from `Diagnostics.independent`, never from a
+  hard-coded `t`. `SolveReport`'s `t0`/`t1`/`tEnd` keep their names — they are
+  the solver's parameter whatever the document calls it — but a document
+  written `df/dx = 2x` is drawing `f` against `x`, and an axis captioned `t`
+  would be describing a different picture.
 - `sample` is for drawing the whole curve; `eval` is for the scrubber playhead.
   Both span `[t0, tEnd]`. Read `tEnd` from the report rather than assuming `t1`,
   or a run that stopped early will be drawn as if it covered the window.
@@ -630,3 +679,151 @@ measured on is the same bug as a stale sample.
 - Offer the conservation monitor's menu from `Diagnostics.derived`. An empty
   list means the document has not named a quantity to watch yet — the useful
   prompt is a row, e.g. `E = 0.5(x'^2 + x^2)`, not a dialog.
+
+## The compute pane — `simplify`, `diff`, `expand`, `eval`
+
+Numpla's second half: type an expression, get it simplified, differentiated or
+multiplied out. Four calls, added after v1 and self-contained — nothing above
+this section changes.
+
+```rust
+#[wasm_bindgen]
+impl Model {
+    /// Fold arithmetic, apply the identity and zero laws, collect like
+    /// terms, order commutative operands canonically.
+    pub fn cas_simplify(&self, expr: &str) -> String;
+
+    /// Differentiate with respect to `var`.
+    pub fn cas_diff(&self, expr: &str, var: &str) -> String;
+
+    /// Multiply out products over sums.
+    pub fn cas_expand(&self, expr: &str) -> String;
+
+    /// Numeric where the document supplies enough values; the simplified
+    /// expression, plus a step saying which name is missing, where it does not.
+    pub fn cas_eval(&self, expr: &str) -> String;
+}
+```
+
+All four take `&self`. Algebra never disturbs the document, the stored solution
+or the conservation series — that is in the signature so the compiler keeps it,
+and it means the pane can be driven on every keystroke beside a running plot.
+
+### The reply
+
+```jsonc
+{
+  "ok": true,
+  "input": "sin(x^2)",          // echoed back, so a late answer can be matched
+  "output": "2x * cos(x^2)",    // Numpla source
+  "steps": [                    // optional: present when there is working
+    { "rule": "differentiate by x", "expr": "cos(x^2) * (2x^(2 - 1) * 1)" },
+    { "rule": "simplify",           "expr": "2x * cos(x^2)" }
+  ],
+  "error": null,                // omitted when ok
+  "pending": false              // omitted unless true
+}
+```
+
+**`output` is Numpla source and it parses.** So is every `steps[i].expr`. This
+is a guarantee, not an aspiration: the whole corpus is round-tripped through the
+parser in `numpla-cas`'s property test, because an answer you cannot paste back
+into your document is not an answer. Offer "paste into document" on any reply
+with `ok: true`.
+
+`steps` is present only when there is working worth showing, and every entry is
+an expression the code actually computed on the way to the answer — never a
+reconstructed narration. `cas_simplify` therefore usually has no steps: it
+rewrites the whole tree at once rather than applying named laws in sequence.
+
+`pending: true` is the gray-not-red rule at this boundary. A half-typed
+expression is not wrong, it is unfinished; render it muted and do not report it
+as an error. `ok: false` with `pending` absent is a real refusal and carries a
+sentence in `error`.
+
+| Reply | Means |
+|---|---|
+| `ok: true` | An answer. `output` is source. |
+| `ok: false`, `pending: true` | Still typing. Mute the pane; say nothing. |
+| `ok: false` | A considered refusal. Show `error` as a sentence. |
+
+### The document is in scope
+
+The pane parses with the document's function names, exactly as `set_source`
+does, and inlines those calls before the algebra starts. With `f(u) = u^2` in a
+row above, `cas_diff("f(x)", "x")` is `2x`. Without it, `f(x)` is `f` times `x`
+— the same rule as everywhere else (see "Calls and coefficients").
+
+Parameters are the other half of that, and they behave differently on purpose:
+
+| Call | `k = 3` in the document, expression `k*x + k*x` |
+|---|---|
+| `cas_simplify` | `2k * x` — you are manipulating the expression you typed |
+| `cas_eval` | `6x` — every value the document has is put in; `x` has none, so a step says so |
+
+`cas_eval` is the only one that reads parameter *values*. Folding today's slider
+position into an expression somebody is rearranging would quietly destroy the
+thing they were working on.
+
+An expression that still reads a name with no value — a state variable, say,
+which only has values along a solution — is **not** an error. It comes back
+`ok: true` with the simplified expression and one step naming what is missing:
+
+```jsonc
+{ "ok": true, "input": "x + x", "output": "2x",
+  "steps": [ { "rule": "x has no value in this document, so this stays symbolic",
+               "expr": "2x" } ] }
+```
+
+### Worked examples
+
+| Call | `output` |
+|---|---|
+| `cas_simplify("2x + 3x")` | `5x` |
+| `cas_simplify("x/3 + x/3")` | `2x/3` |
+| `cas_diff("x^3", "x")` | `3x^2` |
+| `cas_diff("x^x", "x")` | `x^x * (ln(x) + 1)` |
+| `cas_expand("(x + 1)^3")` | `x^3 + 3x^2 + 3x + 1` |
+| `cas_eval("2 + 3*4")` | `14` |
+
+### What it will not do, and says so
+
+The refusals are answers. Each comes back `ok: false` with a sentence, never
+with a plausible expression:
+
+- **`x'`, `x''`.** A primed name already means "derivative with respect to the
+  document's independent variable"; differentiating it again would be guessing
+  what it is a derivative *of*.
+- **A noise source.** `smooth(t)` is a lattice sample and `white(t)` is not even
+  continuous. There is nothing to differentiate.
+- **`mod(u, v)` with a moving modulus**, and any name the document has not
+  defined as a function.
+- **A row.** `x' = -y` has an `=` in it, so it belongs in the document where it
+  can be solved. The pane says so rather than computing with one side of it.
+
+And four whole capabilities are out of scope rather than half-implemented, so
+there is no call to make: **symbolic integration, equation solving, limits and
+series, and symbolic matrices**. The reasons are in `numpla-cas`'s crate docs.
+
+### Why you can trust the answer
+
+Every rewrite preserves value. A simplifier that is merely plausible is worse
+than none, because you cannot tell when it lied — so `numpla-cas` is built
+around a property test rather than a rule list: a corpus of over a hundred
+expressions is evaluated before and after every rewrite at many pseudo-random
+points, and any disagreement fails the build. Symbolic derivatives are checked
+against a Richardson-extrapolated central difference over the same corpus.
+
+Two rewrites *do* differ from the input at isolated points, and every CAS makes
+them: `0 * u` becomes `0`, and `u/u` cancels to `1`. Both differ only where the
+input itself is not a finite number.
+
+### Notes for the shell
+
+- Drive it per keystroke if you like; all four calls are cheap and none of them
+  touches the solution.
+- Match `input` against what you sent before rendering — replies from a fast
+  typist can arrive out of order.
+- `pending` means muted, never red. It is the same rule the row list follows.
+- Show `steps` folded away by default. The unsimplified derivative is what
+  somebody checking their own working wants, and it is noise for everyone else.

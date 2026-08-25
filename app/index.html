@@ -7,7 +7,12 @@
 <meta name="color-scheme" content="light">
 <link rel="stylesheet" href="./mathfield.css">
 <link rel="stylesheet" href="./styles.css">
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23ffffff'/%3E%3Crect x='.5' y='.5' width='31' height='31' rx='7.5' fill='none' stroke='%23dfe2e8'/%3E%3Cpath d='M5 21C10 21 10 11 16 11S22 21 27 21' fill='none' stroke='%230f7d70' stroke-width='2.5' stroke-linecap='round'/%3E%3C/svg%3E">
+<!-- The mark is a TRAJECTORY, not an ornament: a dot at the initial condition,
+     one big overshoot, a smaller return, and away off the top right. Asymmetric
+     on purpose - a symmetric bump has no direction, and direction is the whole
+     subject. Three points define it, so it survives 16px. The same curve is in
+     the top bar and on the loading screen, at 32 and at 120 units. -->
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23ffffff'/%3E%3Crect x='.5' y='.5' width='31' height='31' rx='7.5' fill='none' stroke='%23dfe2e8'/%3E%3Cpath d='M5.9 22.4C9.6 22.4 10.1 8 13.9 8S19.7 20.8 21.9 20.8S26.4 17.6 27.7 13.9' fill='none' stroke='%230f7d70' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3Ccircle cx='5.9' cy='22.4' r='2.1' fill='%230f7d70'/%3E%3C/svg%3E">
 </head>
 <body>
 
@@ -16,8 +21,8 @@
   <div class="loader__inner">
     <svg class="loader__mark" viewBox="0 0 120 120" aria-hidden="true">
       <circle class="loader__ring" cx="60" cy="60" r="47"/>
-      <path class="loader__spiral" pathLength="1" d="M63.0 60.0L63.4 60.4L63.7 60.9L63.9 61.4L64.0 62.0L64.0 62.6L64.0 63.2L63.8 63.9L63.5 64.6L63.1 65.2L62.6 65.8L62.0 66.3L61.4 66.8L60.6 67.2L59.7 67.5L58.8 67.8L57.9 67.8L56.9 67.8L55.9 67.7L54.9 67.4L53.9 67.0L52.9 66.4L52.0 65.7L51.2 64.9L50.4 64.0L49.7 62.9L49.2 61.8L48.8 60.5L48.5 59.2L48.4 57.9L48.5 56.5L48.7 55.1L49.1 53.7L49.7 52.3L50.4 51.0L51.4 49.8L52.4 48.7L53.7 47.6L55.0 46.7L56.5 46.0L58.1 45.4L59.8 45.0L61.5 44.9L63.3 44.9L65.1 45.1L66.9 45.5L68.6 46.2L70.3 47.1L71.9 48.2L73.4 49.4L74.7 50.9L75.9 52.5L76.9 54.3L77.7 56.2L78.2 58.2L78.6 60.3L78.7 62.5L78.5 64.7L78.1 66.9L77.4 69.0L76.5 71.1L75.3 73.0L73.9 74.9L72.2 76.6L70.4 78.1L68.3 79.4L66.1 80.4L63.8 81.3L61.4 81.8L58.9 82.1L56.3 82.0L53.7 81.7L51.2 81.1L48.7 80.2L46.4 78.9L44.1 77.4L42.0 75.7L40.2 73.6L38.5 71.4L37.1 69.0L36.0 66.3L35.2 63.6L34.7 60.7L34.5 57.8L34.7 54.9L35.2 52.0L36.1 49.1L37.3 46.3L38.8 43.6L40.7 41.1L42.8 38.9L45.2 36.8L47.8 35.1L50.7 33.6L53.7 32.5L56.8 31.7L60.1 31.3L63.4 31.3L66.7 31.6L70.0 32.3L73.2 33.4L76.3 34.9L79.2 36.8L81.9 39.0L84.4 41.5L86.5 44.2L88.4 47.3L89.9 50.5L91.0 54.0L91.7 57.5L92.0 61.2L91.9 64.9L91.4 68.6L90.4 72.2L89.0 75.7L87.3 79.0L85.1 82.2L82.5 85.1L79.7 87.7L76.5 90.0L73.0 91.9L69.4 93.4L65.5 94.5L61.6 95.1L57.5 95.3L53.5 95.0L49.4 94.2L45.5 93.0L41.7 91.4L38.1 89.2L34.7 86.7L31.7 83.8L28.9 80.5L26.6 77.0L24.6 73.1L23.1 69.0L22.1 64.8L21.6 60.4L21.6 56.0L22.0 51.6L23.0 47.2L24.5 43.0L26.5 38.9L29.0 35.1L31.8 31.5L35.1 28.3L38.8 25.5L42.8 23.1L47.1 21.1L51.5 19.7L56.2 18.8L60.9 18.4L65.7 18.5L70.5 19.2L75.1 20.5L79.7 22.3L84.0 24.6L88.0 27.4L91.8 30.6L95.1 34.3L98.0 38.4L100.4 42.8L102.4 47.4L103.7 52.3L104.6 57.4L104.8 62.5L104.4 67.6L103.5 72.7L102.0 77.7L99.9 82.5L97.2 87.0"/>
-      <circle class="loader__seed" cx="60" cy="60" r="2.6"/>
+      <path class="loader__spiral" pathLength="1" d="M22 84C36 84 38 30 52 30S74 78 82 78S99 66 104 52"/>
+      <circle class="loader__seed" cx="22" cy="84" r="3.2"/>
     </svg>
     <h1 class="loader__word">numpla</h1>
     <p class="loader__tag">Maple-class math with Desmos-class feel</p>
@@ -31,14 +36,20 @@
 <div id="app" class="app" aria-hidden="true">
 
   <header class="topbar">
-    <div class="brand">
+    <!-- The brand is the way back to the start screen. A logo that goes home is
+         the one navigation convention every user already has, so it costs no
+         width and needs no label. -->
+    <button class="brand" id="home-btn" type="button"
+            title="Back to the start screen">
       <svg class="brand__mark" viewBox="0 0 32 32" aria-hidden="true">
-        <path d="M4 22C10 22 10 10 16 10S22 22 28 22" fill="none" stroke="currentColor"
-              stroke-width="2.4" stroke-linecap="round"/>
+        <path d="M5.9 22.4C9.6 22.4 10.1 8 13.9 8S19.7 20.8 21.9 20.8S26.4 17.6 27.7 13.9"
+              fill="none" stroke="currentColor"
+              stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+        <circle cx="5.9" cy="22.4" r="2.1" fill="currentColor"/>
       </svg>
       <span class="brand__name">numpla</span>
-      <span class="brand__slice">vertical slice</span>
-    </div>
+      <span class="brand__slice" id="brand-slice">vertical slice</span>
+    </button>
     <!-- Narrow screens only. Below the breakpoint the two panes stop being side
          by side and become two full-bleed cards; this is the switch between
          them. A segmented control rather than a horizontal divider - see
@@ -49,14 +60,29 @@
       <button id="tab-system" class="panetab" type="button" role="tab"
               aria-selected="false" aria-controls="docpane" data-pane="system">system</button>
     </div>
-    <button id="demos-btn" class="demosbtn" type="button"
-            aria-haspopup="menu" aria-expanded="false" aria-controls="demomenu">
-      <svg class="icon" viewBox="0 0 16 16" aria-hidden="true">
-        <path d="M2 3.4h12M2 8h12M2 12.6h12" fill="none" stroke="currentColor"
-              stroke-width="1.6" stroke-linecap="round"/>
-      </svg>
-      Demos
-    </button>
+    <!-- The two document-level actions, together, in the top bar: start from
+         nothing, or start from somebody else's model. "New" sits beside "Demos"
+         because they answer the same question - what is in the document - and
+         because the top bar is the only place on screen that is about the
+         document as a whole rather than about one row. -->
+    <div class="topacts">
+      <button id="new-btn" class="demosbtn demosbtn--new" type="button"
+              title="Empty document, default frame">
+        <svg class="icon" viewBox="0 0 16 16" aria-hidden="true">
+          <path d="M8 3v10M3 8h10" fill="none" stroke="currentColor"
+                stroke-width="1.6" stroke-linecap="round"/>
+        </svg>
+        New
+      </button>
+      <button id="demos-btn" class="demosbtn" type="button"
+              aria-haspopup="menu" aria-expanded="false" aria-controls="demomenu">
+        <svg class="icon" viewBox="0 0 16 16" aria-hidden="true">
+          <path d="M2 3.4h12M2 8h12M2 12.6h12" fill="none" stroke="currentColor"
+                stroke-width="1.6" stroke-linecap="round"/>
+        </svg>
+        Demos
+      </button>
+    </div>
     <div class="telemetry" id="telemetry">
       <span class="stat" title="Accepted steps"><i>acc</i><b id="stat-accepted">—</b></span>
       <span class="stat" title="Rejected steps"><i>rej</i><b id="stat-rejected">—</b></span>
@@ -161,6 +187,80 @@
     </section>
 
   </main>
+
+  <!-- ── compute ──────────────────────────────────────────────────────
+       The second way in. A Maple-like pane driven by the CAS calls, in the
+       SAME grid cell as the workspace, so the two are alternatives and never
+       both on screen; which one is showing is a class on <body>.
+
+       The input surface is a MathField - the same class every row in the
+       system pane uses - because there is one way to type mathematics in this
+       product and a text box would be a second one. Results are rendered the
+       same way, from the Numpla source the CAS returns, which is also why a
+       result can be pressed straight back into the input. -->
+  <section class="compute" id="compute" aria-label="Compute">
+    <div class="compute__head">
+      <h2 class="compute__title">compute</h2>
+      <p class="compute__note" id="compute-note">simplify · differentiate · expand · evaluate</p>
+      <button id="compute-clear" class="framebtn" type="button"
+              title="Empty the history">clear</button>
+    </div>
+
+    <div class="compute__io">
+      <div class="compute__field" id="compute-field"></div>
+      <div class="compute__row">
+        <!-- Built in main.js, one button per call the build actually has, so a
+             WASM without `cas_expand` shows three buttons and says why. -->
+        <div class="compute__ops" id="compute-ops" role="group" aria-label="Operations"></div>
+        <label class="compute__var">
+          <span>d/d</span>
+          <input id="compute-var" type="text" value="x" spellcheck="false"
+                 autocomplete="off" aria-label="Differentiate with respect to">
+        </label>
+      </div>
+    </div>
+
+    <div class="compute__log" id="compute-log" role="log" aria-label="Results"></div>
+    <p class="compute__foot" id="compute-foot"></p>
+  </section>
+
+  <!-- ── the start screen ─────────────────────────────────────────────
+       Not a second gate bolted onto the loader: it lives INSIDE the app shell,
+       under a top bar that has already arrived, on the same ground colour the
+       loading screen used and rising on the same easing the workspace does. The
+       loader fades straight into it, and choosing fades it straight out. -->
+  <div class="chooser" id="chooser" role="group" aria-label="Choose what to do">
+    <div class="chooser__inner">
+      <p class="chooser__lead">What are you doing?</p>
+      <div class="chooser__cards">
+        <button class="choice" id="choice-solve" type="button" data-route="solve">
+          <span class="choice__mark" aria-hidden="true">
+            <svg viewBox="0 0 32 32">
+              <path d="M5.9 22.4C9.6 22.4 10.1 8 13.9 8S19.7 20.8 21.9 20.8S26.4 17.6 27.7 13.9"
+                    fill="none" stroke="currentColor" stroke-width="2.2"
+                    stroke-linecap="round" stroke-linejoin="round"/>
+              <circle cx="5.9" cy="22.4" r="2" fill="currentColor"/>
+            </svg>
+          </span>
+          <span class="choice__name">Solve &amp; simulate</span>
+          <span class="choice__why" id="choice-solve-why">Write a differential equation
+            and watch it: rows and sliders, phase portraits, vector fields, sound.</span>
+        </button>
+        <button class="choice" id="choice-compute" type="button" data-route="compute">
+          <span class="choice__mark" aria-hidden="true">
+            <svg viewBox="0 0 32 32">
+              <path d="M4 12h12M4 20h12M21 10l6 6-6 6" fill="none" stroke="currentColor"
+                    stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+          </span>
+          <span class="choice__name">Compute</span>
+          <span class="choice__why" id="choice-compute-why">Type an expression and
+            simplify, differentiate, expand or evaluate it.</span>
+        </button>
+      </div>
+      <p class="chooser__foot" id="chooser-foot">The logo brings you back here.</p>
+    </div>
+  </div>
 
 </div>
 

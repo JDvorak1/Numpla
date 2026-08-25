@@ -154,4 +154,44 @@ impl Model {
     pub fn conservation_series(&self) -> Vec<f64> {
         self.inner.conservation_series()
     }
+
+    // ---- the compute pane -------------------------------------------------
+    //
+    // All four take `&self`: algebra never disturbs the document or the curve
+    // on screen, and the signature is where that promise is kept.
+    //
+    // Each returns a CasReply as a JSON string — `{ ok, input, output, steps?,
+    // error?, pending? }` — and `output` is Numpla source that parses, so the
+    // shell can offer "paste into document" on any answer. See
+    // `docs/wasm-api.md`.
+    //
+    // The document is in scope: a function defined in a row can be used in the
+    // pane, and `cas_eval` reads the document's parameter values.
+
+    /// Fold arithmetic, apply the identity and zero laws, collect like terms,
+    /// and put commutative operands in a canonical order.
+    pub fn cas_simplify(&self, expr: &str) -> String {
+        self.inner.cas_simplify(expr)
+    }
+
+    /// Differentiate with respect to `var`.
+    ///
+    /// Refusals are answers too: `x'`, a noise source and a `mod` with a moving
+    /// modulus come back `ok: false` with a sentence saying why, rather than
+    /// with a plausible expression.
+    pub fn cas_diff(&self, expr: &str, var: &str) -> String {
+        self.inner.cas_diff(expr, var)
+    }
+
+    /// Multiply out products over sums.
+    pub fn cas_expand(&self, expr: &str) -> String {
+        self.inner.cas_expand(expr)
+    }
+
+    /// Evaluate to a number where the document supplies enough values, and to
+    /// the simplified expression where it does not — with a step naming the
+    /// value that is missing.
+    pub fn cas_eval(&self, expr: &str) -> String {
+        self.inner.cas_eval(expr)
+    }
 }

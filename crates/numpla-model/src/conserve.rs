@@ -81,6 +81,10 @@ fn sample_count(requested: usize, accepted_steps: usize) -> usize {
 struct Quantity<'a> {
     expr: &'a Expr,
     keys: &'a [String],
+    /// What the document integrates along — `t` unless a row said otherwise.
+    /// A quantity written in terms of it has to see the same name the solver
+    /// binds, or an energy row reading `x` would measure a constant.
+    indep: &'a str,
     derived: &'a [crate::document::Derived],
     env: RefCell<Env>,
     failure: RefCell<Option<String>>,
@@ -89,13 +93,14 @@ struct Quantity<'a> {
 impl<'a> Quantity<'a> {
     fn new(doc: &'a Document, expr: &'a Expr) -> Quantity<'a> {
         let mut env = doc.env.clone();
-        env.set("t", 0.0);
+        env.set(&doc.independent, 0.0);
         for (name, v) in doc.states.iter().zip(&doc.y0) {
             env.set(name, *v);
         }
         Quantity {
             expr,
             keys: &doc.states,
+            indep: &doc.independent,
             derived: &doc.derived,
             env: RefCell::new(env),
             failure: RefCell::new(None),
@@ -104,7 +109,7 @@ impl<'a> Quantity<'a> {
 
     fn at(&self, t: f64, y: &[f64]) -> f64 {
         let mut env = self.env.borrow_mut();
-        env.set("t", t);
+        env.set(self.indep, t);
         for (key, value) in self.keys.iter().zip(y) {
             env.set(key, *value);
         }

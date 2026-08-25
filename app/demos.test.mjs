@@ -5,16 +5,18 @@
 // parses is not good enough: the point of a demo is that something happens, so
 // each one has to prove that the right thing happens.
 //
-// Four layers, from cheap to meaningful:
+// Five layers, from cheap to meaningful:
 //
 //   1. shape       — ids, knob ranges, and that a knob names a row that exists
-//   2. compiles    — zero "error" and zero "pending" diagnostics
-//   3. interesting — solves, stays finite, and actually moves
-//   4. physics     — a named invariant or behaviour, written per demo
+//   2. view        — it declares the one view it is about
+//   3. compiles    — zero "error" and zero "pending" diagnostics
+//   4. interesting — solves, stays finite, and actually moves
+//   5. physics     — a named invariant or behaviour, written per demo
 //
-// Layer 4 is the one that matters. A generic "it varies" check passes on
-// nonsense; "this undamped oscillator conserves energy to one part in 10^4"
-// does not.
+// Layer 5 is the one that matters. A generic "it varies" check passes on
+// nonsense; "this integral is x^a to one part in 10^12", "this envelope has
+// exactly six nulls because the detuning says so", "these arrows ARE the
+// right-hand side" do not.
 
 import { readFileSync } from 'node:fs';
 import * as wasm from './pkg/numpla_wasm.js';
@@ -87,6 +89,23 @@ function run(source, [t0, t1], n = 4000) {
   };
 }
 
+/**
+ * The right-hand side on a grid, as the `field` view draws it: one
+ * `{x, y, dx, dy}` per sample. The arrows are supposed to BE the equation, so
+ * the field demos check them against the equation by hand.
+ */
+function field(source, [x0, x1, y0, y1], nx, ny, t = 0) {
+  const model = new wasm.Model();
+  model.set_source(source);
+  const flat = model.vector_field(x0, x1, y0, y1, nx, ny, t);
+  const out = [];
+  for (let i = 0; i * 4 < flat.length; i++) {
+    const [x, y, dx, dy] = flat.subarray(4 * i, 4 * i + 4);
+    out.push({ x, y, dx, dy });
+  }
+  return out;
+}
+
 const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 /** Format a number the v1 lexer can read back: it has no exponent notation. */
@@ -120,12 +139,20 @@ function setParam(source, name, value) {
   return source.replace(paramRow(name), `$1${name} = ${literal(value)}`);
 }
 
+/** Move a starting point without touching anything else. */
+function setStart(source, name, value) {
+  const row = new RegExp(`^([ \\t]*)${escapeRe(name)}\\(0\\)[ \\t]*=[ \\t]*[^#\\n]*`, 'gm');
+  ok(row.test(source), `no starting row for ${name}`);
+  return source.replace(row, `$1${name}(0) = ${literal(value)}`);
+}
+
 // --- trajectory measurements ------------------------------------------------
 
 const slice = (v, from, to) => v.slice(Math.floor(v.length * from), Math.floor(v.length * to));
 const maxAbs = (v) => v.reduce((m, x) => Math.max(m, Math.abs(x)), 0);
 const spread = (v) => Math.max(...v) - Math.min(...v);
 const drift = (v) => spread(v) / Math.max(1e-12, Math.abs(v[0]));
+const rms = (v) => Math.sqrt(v.reduce((s, x) => s + x * x, 0) / v.length);
 
 /** Sign changes — a cheap, robust stand-in for "how many oscillations". */
 function zeroCrossings(v) {
@@ -137,195 +164,79 @@ function zeroCrossings(v) {
 /**
  * Instantaneous amplitude of an oscillator of frequency `w`: the radius in the
  * phase plane, sqrt(x^2 + (v/w)^2). For beating this is far sharper than a
- * windowed peak — it reaches zero exactly at the moment the oscillator hands
- * all of its motion to its neighbour, instead of smearing that moment across
- * a window.
+ * windowed peak — it reaches zero exactly at the moment the two tones cancel,
+ * instead of smearing that moment across a window.
  */
 const amplitude = (q, v, w) => q.map((x, i) => Math.hypot(x, v[i] / w));
 
 /** Index of the largest value — for comparing which peak comes first. */
 const argmax = (v) => v.reduce((best, x, i) => (x > v[best] ? i : best), 0);
 
+/** Radius column of a two-state run. */
+const radius = (r, a, b) => r.col(a).map((x, i) => Math.hypot(x, r.col(b)[i]));
+
 // =============================================================================
-// Layer 4: the physics. One entry per demo id; every demo must have one.
+// Layer 5: the physics. One entry per demo id; every demo must have one.
 // =============================================================================
 
 const PHYSICS = {
-  'plucked-string': (demo) => {
-    const span = demo.tSpan;
-
-    // Released from rest: a pluck is a shape held still, then let go. Every
-    // velocity state must start at exactly zero.
-    const rest = run(demo.source, span);
-    for (const s of rest.diagnostics.states) {
-      if (s.endsWith("'")) close(rest.col(s)[0], 0, 0, `${s} must start at rest`);
+  integral: (demo) => {
+    // THE CLAIM: `df/dx = a x^(a-1)` with `f(0) = 0` is the integral, and the
+    // integral of a x^(a-1) is x^a. Checked against the closed form at every
+    // sample, at five powers, including a fractional one.
+    for (const a of [1, 2, 3, 4, 2.5]) {
+      const r = run(setParam(demo.source, 'a', a), demo.tSpan);
+      const f = r.col('f');
+      close(f[0], 0, 0, 'the area under a point is zero');
+      let worst = 0;
+      for (let i = 0; i < r.t.length; i++) {
+        worst = Math.max(worst, Math.abs(f[i] - Math.pow(r.t[i], a)));
+      }
+      ok(worst < 1e-6, `a = ${a}: the integral is off x^a by ${worst}`);
+      // And the end point is the exact power, which is what the eye reads.
+      close(f[f.length - 1], Math.pow(demo.tSpan[1], a), 1e-6, `f(3) at a = ${a}`);
     }
 
-    // The pluck is a triangle peaking at mass 2, and mass 2 is the highest
-    // point of the string at t = 0.
-    const start = [1, 2, 3, 4, 5, 6].map((i) => rest.col(`x_${i}`)[0]);
-    close(start[1], 1, 1e-12, 'the pluck depth at a = 1');
-    ok(start[0] < start[1] && start[1] > start[2], 'mass 2 must be the corner of the pluck');
-    ok(
-      start[2] > start[3] && start[3] > start[4] && start[4] > start[5],
-      'the far side of the pluck must fall off linearly'
-    );
+    // The denominator names the axis. A document written `df/dx` is drawing f
+    // against x, and calling that axis `t` would describe a different picture.
+    const base = run(demo.source, demo.tSpan);
+    ok(base.diagnostics.independent === 'x',
+       `independent should be x, got ${base.diagnostics.independent}`);
+    ok(base.diagnostics.states.join(',') === 'f', 'the only state is the integral itself');
 
-    // Undamped, it rings forever: the string still has essentially all of its
-    // swing at the end of the window.
-    const free = run(setParam(demo.source, 'c', 0), span);
-    const early = maxAbs(slice(free.col('x_3'), 0, 0.1));
-    const late = maxAbs(slice(free.col('x_3'), 0.9, 1));
-    ok(late > 0.8 * early, `undamped string decayed: ${early} -> ${late}`);
-
-    // Damped, it dies away — that is what damping is for.
-    const damped = run(demo.source, span);
-    const dEarly = maxAbs(slice(damped.col('x_3'), 0, 0.1));
-    const dLate = maxAbs(slice(damped.col('x_3'), 0.9, 1));
-    ok(dLate < 0.5 * dEarly, `damped string did not decay: ${dEarly} -> ${dLate}`);
-
-    // KNOB: tension is pitch. At the top of the slider the string must go
-    // through many more oscillations in the same window than at the bottom.
-    const k = demo.knobs.find((x) => x.name === 'k');
-    const slack = run(setParam(demo.source, 'k', k.min), span);
-    const tight = run(setParam(demo.source, 'k', k.max), span);
-    const slackN = zeroCrossings(slack.col('x_3'));
-    const tightN = zeroCrossings(tight.col('x_3'));
-    ok(slackN >= 4, `at minimum tension the string barely moves: ${slackN} crossings`);
-    ok(
-      tightN > 2 * slackN,
-      `tension knob does not change the pitch: k=${k.min} gave ${slackN} crossings, k=${k.max} gave ${tightN}`
-    );
-
-    // KNOB: with the nonlinearity off the string is linear, so doubling the
-    // pluck must exactly double the motion...
-    const one = run(setParam(demo.source, 'c', 0), span);
-    const two = run(setParam(setParam(demo.source, 'c', 0), 'a', 2), span);
-    close(maxAbs(two.col('x_4')), 2 * maxAbs(one.col('x_4')), 1e-6, 'a linear string must scale');
-
-    // ...and with it on, it must not: that is the whole point of the knob.
-    const stiff = setParam(setParam(demo.source, 'c', 0), 'g', 300);
-    const soft = run(setParam(stiff, 'a', 0.5), span);
-    const hard = run(setParam(stiff, 'a', 3), span);
-    const ratio = zeroCrossings(hard.col('x_3')) / zeroCrossings(soft.col('x_3'));
-    ok(ratio > 1.15, `the stretch nonlinearity has no effect on the tone: ratio ${ratio}`);
+    // The knob really is the power: at a = 4 the curve ends nine times higher
+    // than at a = 2.
+    const two = run(setParam(demo.source, 'a', 2), demo.tSpan).col('f');
+    const four = run(setParam(demo.source, 'a', 4), demo.tSpan).col('f');
+    close(four[3999] / two[3999], 9, 1e-6, '3^4 / 3^2');
   },
 
-  'colliding-strings': (demo) => {
-    const span = demo.tSpan;
-    // Non-penetration is a property of the WHOLE trajectory, so it is sampled
-    // far more finely than the plot would: 24000 points over 12 s is 0.5 ms,
-    // and a contact lasts about 15 ms at this stiffness.
-    const N = 24000;
-    const R = Number(readParam(demo.source, 'r'));
-    const K = Number(readParam(demo.source, 'k'));
-    const P = Number(readParam(demo.source, 'p'));
-    const D0 = Number(readParam(demo.source, 'd'));
-    const dk = demo.knobs.find((x) => x.name === 'd');
-    const kk = demo.knobs.find((x) => x.name === 'k');
-    const ck = demo.knobs.find((x) => x.name === 'c');
+  rose: (demo) => {
+    // dr/dq = -k sin(kq) from r(0) = 1 is r = cos(kq), exactly. That closed
+    // form is the whole demo, so it is checked at every sample.
+    for (const k of [1, 2, 3, 5, 9]) {
+      const r = run(setParam(demo.source, 'k', k), demo.tSpan);
+      const rad = r.col('r');
+      let worst = 0;
+      for (let i = 0; i < r.t.length; i++) {
+        worst = Math.max(worst, Math.abs(rad[i] - Math.cos(k * r.t[i])));
+      }
+      ok(worst < 1e-5, `k = ${k}: r is off cos(kq) by ${worst}`);
+      close(Math.max(...rad), 1, 1e-4, `k = ${k}: the petals reach radius 1`);
+      close(Math.min(...rad), -1, 1e-4, `k = ${k}: and reach through the origin`);
 
-    /**
-     * Facing beads i sit `d + a_i - b_i` apart. Contact begins at 2r, the bead
-     * diameter; a gap of ZERO is the two centres crossing, and that is the
-     * thing the penalty force exists to prevent.
-     */
-    const gaps = (r, d) =>
-      [1, 2, 3].map((i) => {
-        const a = r.col(`a_${i}`);
-        const b = r.col(`b_${i}`);
-        return a.map((q, j) => d + q - b[j]);
-      });
-    const closest = (r, d) => Math.min(...gaps(r, d).map((g) => Math.min(...g)));
-
-    /** Kinetic energy of one string plus the tension it has stored. */
-    const stringEnergy = (r, name, k) => {
-      const x = [1, 2, 3].map((i) => r.col(`${name}_${i}`));
-      const v = [1, 2, 3].map((i) => r.col(`${name}_${i}'`));
-      return x[0].map((_, j) => {
-        const [p1, p2, p3] = [x[0][j], x[1][j], x[2][j]];
-        const kinetic = 0.5 * (v[0][j] ** 2 + v[1][j] ** 2 + v[2][j] ** 2);
-        const stretch = p1 * p1 + (p2 - p1) ** 2 + (p3 - p2) ** 2 + p3 * p3;
-        return kinetic + 0.5 * k * stretch;
-      });
-    };
-
-    /** Energy stored in the squashed contact springs. */
-    const contactEnergy = (r, d, p) => {
-      const g = gaps(r, d);
-      return g[0].map((_, j) =>
-        g.reduce((sum, col) => {
-          const overlap = Math.max(0, 2 * R - col[j]);
-          return sum + 0.5 * p * overlap * overlap;
-        }, 0)
-      );
-    };
-
-    // Both strings are plucked and let go, so every velocity starts at zero.
-    const base = run(demo.source, span, N);
-    for (const s of base.diagnostics.states) {
-      if (s.endsWith("'")) close(base.col(s)[0], 0, 0, `${s} must start at rest`);
+      // The petal count is not written anywhere: it is 2k crossings of the
+      // origin over one turn, which is what makes the picture a rose.
+      close(zeroCrossings(rad), 2 * k, 0, `k = ${k}: a rose has 2k crossings per turn`);
     }
 
-    // THE ASSERTION THIS DEMO EXISTS FOR: the strings never cross. Checked on
-    // every facing pair at every sample, at the default and at both ends of
-    // the distance knob, and at the corners that hit hardest (max tension,
-    // no damping, smallest gap).
-    const settings = [
-      { d: dk.min, k: K, c: 0.2 },
-      { d: D0, k: K, c: 0.2 },
-      { d: 0.8, k: K, c: 0.2 },
-      { d: dk.max, k: K, c: 0.2 },
-      { d: dk.min, k: kk.max, c: ck.min },
-      { d: dk.min, k: kk.max, c: ck.max },
-      { d: dk.min, k: kk.min, c: ck.min },
-      { d: D0, k: kk.max, c: ck.min },
-    ];
-    for (const s of settings) {
-      let src = setParam(demo.source, 'd', s.d);
-      src = setParam(src, 'k', s.k);
-      src = setParam(src, 'c', s.c);
-      const r = run(src, span, N);
-      const min = closest(r, s.d);
-      const where = `d=${s.d} k=${s.k} c=${s.c}`;
-      ok(min > 0, `the strings crossed at ${where}: the gap fell to ${min}`);
-      // And they do not merely avoid crossing: the beads squash by less than
-      // their own radius, so the contact is stiff enough to be a contact.
-      ok(2 * R - min < R, `the beads sank ${2 * R - min} into each other at ${where}`);
-    }
-
-    // The penalty force is what does that. Switch it off and the same pluck
-    // sends the two strings clean through one another — so the check above is
-    // measuring the contact and not the geometry.
-    const ghost = run(setParam(demo.source, 'p', 0), span, N);
-    const through = closest(ghost, D0);
-    ok(through < -0.2, `with p = 0 they should pass through, but the gap only reached ${through}`);
-
-    // At the default distance they really do touch, and gently: less than
-    // half a bead radius of squash.
-    const nearest = closest(base, D0);
-    ok(nearest < 2 * R, `the strings never touch at d = ${D0}: closest gap ${nearest}`);
-    ok(2 * R - nearest < 0.5 * R, `the default contact is too soft: ${2 * R - nearest} of squash`);
-
-    // KNOB, far end: wound out to the top of the slider they never touch at
-    // all, and with the damping off each string's own energy is then exactly
-    // constant — two independent strings, ringing on.
-    const apartSrc = setParam(setParam(demo.source, 'd', dk.max), 'c', 0);
-    const apart = run(apartSrc, span, N);
-    ok(closest(apart, dk.max) > 2 * R, 'at the far end of the knob they must never touch');
-    ok(drift(stringEnergy(apart, 'a', K)) < 1e-4, 'an untouched string must conserve its energy');
-    ok(drift(stringEnergy(apart, 'b', K)) < 1e-4, 'an untouched string must conserve its energy');
-
-    // KNOB, near end: the collision moves energy from one string to the other
-    // — neither is conserved on its own any more — while the pair plus the
-    // squashed contact springs still conserve the total.
-    const near = run(setParam(demo.source, 'c', 0), span, N);
-    const ea = stringEnergy(near, 'a', K);
-    const eb = stringEnergy(near, 'b', K);
-    const ec = contactEnergy(near, D0, P);
-    ok(spread(ea) / ea[0] > 0.5, `the collision barely moved energy: ${spread(ea) / ea[0]}`);
-    const total = ea.map((v, j) => v + eb[j] + ec[j]);
-    ok(drift(total) < 2e-3, `the colliding pair lost energy: drift ${drift(total)}`);
+    // The angle is the independent variable, and `r` is a real state — which
+    // together are exactly what the polar view needs to draw this.
+    const base = run(demo.source, demo.tSpan);
+    ok(base.diagnostics.independent === 'q',
+       `independent should be q, got ${base.diagnostics.independent}`);
+    ok(base.diagnostics.states.indexOf('r') >= 0, 'polar needs a state named r');
+    close(demo.tSpan[1], 2 * Math.PI, 1e-12, 'the window is exactly one turn');
   },
 
   'energy-drift': (demo) => {
@@ -336,6 +247,8 @@ const PHYSICS = {
     const d = JSON.parse(m.set_source(demo.source));
     ok(Array.isArray(d.derived) && d.derived.includes('E'),
        `E should be a derived row, got ${JSON.stringify(d.derived)}`);
+    ok(d.states.join(',') === "x,x'",
+       `d2x/dt2 must lower to a position and a velocity, got ${d.states}`);
 
     const ratio = (method) => {
       const r = JSON.parse(m.solve_with(demo.tSpan[0], demo.tSpan[1], method));
@@ -353,288 +266,139 @@ const PHYSICS = {
     ok(yoshida < 1.5, `Yoshida4 should hold energy in a band, ratio ${yoshida}`);
     ok(tsit5 > 2, `the adaptive method should visibly drift, ratio ${tsit5}`);
     ok(tsit5 > 2 * verlet, `the contrast is the demo: ${tsit5} vs ${verlet}`);
+
+    // And the quantity really is the energy of THIS spring: it starts at
+    // 0.5 w^2, and the trajectory is the cosine the closed form promises.
+    const r = run(demo.source, demo.tSpan);
+    const x = r.col('x');
+    for (let i = 0; i < r.t.length; i += 401) {
+      close(x[i], Math.cos(r.t[i]), 2e-3, `x(${r.t[i]}) should be cos t`);
+    }
   },
 
-  'stiff-string': (demo) => {
-    // The claim is about the SPECTRUM, so measure the spectrum. For a linear
-    // chain the modes are independent, so starting it in a single mode shape
-    // makes the motion a single frequency, which zero-crossings measure
-    // directly. Mode m of a simply-supported chain of six is sin(pi*m*i/7).
-    const shape = (m) => [1, 2, 3, 4, 5, 6].map((i) => Math.sin((Math.PI * m * i) / 7));
-
-    // Rewrite every position IC in one pass. Matching row by row was fragile;
-    // one multiline pass over `x_i(0) = ...` cannot half-apply.
-    const inMode = (src, m) => {
-      const v = shape(m);
-      return setParam(src, 'c', 0).replace(
-        /^(\s*)x_(\d)\(0\) = .*$/gm,
-        (_line, pad, i) => `${pad}x_${i}(0) = ${v[Number(i) - 1].toFixed(6)}`
-      );
-    };
-
-    // Frequency from zero crossings of the middle bead over a fixed window.
-    const freq = (src) => {
-      const { t, col } = run(src, [0, 12], 12000);
-      const y = col('x_3');
-      let crossings = 0;
-      for (let i = 1; i < y.length; i++) if ((y[i - 1] < 0) !== (y[i] < 0)) crossings++;
-      return crossings / (2 * (t[t.length - 1] - t[0]));
-    };
-
-    const ratioAt = (stiffness) => {
-      const src = setParam(demo.source, 's', stiffness);
-      const f1 = freq(inMode(src, 1));
-      const f2 = freq(inMode(src, 2));
-      ok(f1 > 0 && f2 > 0, `no oscillation at s=${stiffness}: ${f1}, ${f2}`);
-      return f2 / f1;
-    };
-
-    // With no bending stiffness the chain is an ordinary string: its overtones
-    // are (near enough) whole multiples of the fundamental.
-    const harmonic = ratioAt(0);
-    ok(Math.abs(harmonic - 2) < 0.12,
-       `without stiffness the second partial should be about twice the first, got ${harmonic}`);
-
-    // Add stiffness and the partials spread. This is the whole demo, and it
-    // comes out of the equation rather than being dialled in.
-    const stiff = ratioAt(40);
-    ok(stiff > harmonic + 0.15,
-       `stiffness should stretch the partials: ${harmonic} -> ${stiff}`);
-
-    // And it is a real string, not a blow-up: bounded, and it rings.
-    const { col } = run(demo.source, demo.tSpan);
-    const mid = col('x_3');
-    ok(mid.every((v) => Number.isFinite(v) && Math.abs(v) < 10), 'the string must stay bounded');
-    ok(maxAbs(slice(mid, 0.6, 1)) > 0.05, 'it should still be ringing late in the window');
-  },
-
-  'harmonic-oscillator': (demo) => {
-    // Undamped by default, so energy is exactly conserved. Anything that
-    // drifts here is the integrator leaking, not the model.
-    const { col } = run(demo.source, demo.tSpan);
-    const x = col('x');
-    const v = col("x'");
-    const energy = x.map((q, i) => 0.5 * (v[i] * v[i] + q * q));
-    ok(drift(energy) < 1e-4, `energy drifted by ${drift(energy)} over the span`);
-
-    // It is a cosine of unit amplitude, checked against the closed form.
-    const { t, col: c2 } = run(demo.source, demo.tSpan);
-    const got = c2('x');
-    for (let i = 0; i < t.length; i += 97) {
-      close(got[i], Math.cos(t[i]), 1e-5, `x(${t[i]}) should be cos t`);
+  hopf: (demo) => {
+    // A SUPERCRITICAL HOPF: below the threshold everything falls into the
+    // origin, above it a circle of radius sqrt(a) appears and attracts
+    // everything. Both halves are checked against the closed-form radius.
+    for (const a of [-0.6, -0.2]) {
+      const r = run(setParam(demo.source, 'a', a), demo.tSpan);
+      const late = slice(radius(r, 'x', 'y'), 0.8, 1);
+      ok(Math.max(...late) < 1e-3, `at a = ${a} everything should die: radius ${Math.max(...late)}`);
+    }
+    for (const a of [0.5, 1.2]) {
+      const r = run(setParam(demo.source, 'a', a), demo.tSpan);
+      const late = slice(radius(r, 'x', 'y'), 0.8, 1);
+      close(Math.min(...late), Math.sqrt(a), 1e-3, `the cycle radius at a = ${a}`);
+      close(Math.max(...late), Math.sqrt(a), 1e-3, `the cycle radius at a = ${a}`);
     }
 
-    // Turn the damping knob up and the same oscillator is nearly still by the
-    // end of the window.
-    const damped = run(setParam(demo.source, 'c', 0.3), demo.tSpan);
-    const early = maxAbs(slice(damped.col('x'), 0, 0.1));
-    const late = maxAbs(slice(damped.col('x'), 0.9, 1));
-    ok(late < 0.15 * early, `damping knob did little: ${early} -> ${late}`);
+    // It ARRIVES on the cycle rather than starting there — the document starts
+    // at radius 0.05 and the attracting ring is at 0.707.
+    const base = run(demo.source, demo.tSpan);
+    const rad = radius(base, 'x', 'y');
+    close(rad[0], 0.05, 1e-12, 'it starts near the origin');
+    ok(Math.max(...slice(rad, 0, 0.05)) < 0.3, 'the wind-on must be visible in the window');
+
+    // THE FIELD IS THE EQUATION. This is the assertion a field demo exists
+    // for: every arrow the view draws is the right-hand side at that point,
+    // exactly, not a second and subtly different evaluation of it.
+    const arrows = field(demo.source, [-2, 2, -2, 2], 9, 7);
+    ok(arrows.length === 63, `the grid should be 9 x 7, got ${arrows.length}`);
+    for (const { x, y, dx, dy } of arrows) {
+      const rr = x * x + y * y;
+      close(dx, 0.5 * x - y - x * rr, 1e-12, `arrow dx at (${x}, ${y})`);
+      close(dy, x + 0.5 * y - y * rr, 1e-12, `arrow dy at (${x}, ${y})`);
+    }
+    // The arrows turn: on the ring the flow is purely rotational, so the field
+    // there is perpendicular to the radius.
+    const onRing = field(demo.source, [Math.SQRT1_2, Math.SQRT1_2, 0, 0], 1, 1)[0];
+    close(onRing.x * onRing.dx + onRing.y * onRing.dy, 0, 1e-12,
+          'on the limit cycle the flow has no radial part');
   },
 
-  pendulum: (demo) => {
-    // Undamped, so it must come back to the angle it was released from and
-    // never go past it.
-    const { col } = run(demo.source, demo.tSpan);
-    const q = col('q');
-    close(q[0], 3, 1e-12, 'released from 3 radians');
-    ok(maxAbs(q) <= 3 + 1e-6, 'an undamped pendulum cannot swing higher than it started');
-    ok(Math.min(...q) < -2.9, 'it must reach the same angle on the far side');
-
-    // THE POINT: the period grows with amplitude, which the small-angle
-    // (sin q = q) pendulum in every textbook cannot do. Small-angle period
-    // here is 2*pi*sqrt(l/g) = 2.006 s.
-    const period = (src) => {
-      const r = run(src, demo.tSpan);
-      const n = zeroCrossings(r.col('q'));
-      ok(n >= 4, 'not enough swings to measure a period');
-      return (2 * (demo.tSpan[1] - demo.tSpan[0])) / n;
-    };
-    const small = period(setParam(demo.source, 'a', 0.05));
-    const large = period(demo.source);
-    close(small, 2.006, 0.05, 'small-angle period should match 2 pi sqrt(l/g)');
-    ok(large > 1.8 * small, `large-angle period is not stretched: ${small} -> ${large}`);
-  },
-
-  'driven-resonance': (demo) => {
-    // On resonance the steady-state amplitude is about f/(c*w) = 3.33.
-    const steady = (src) => maxAbs(slice(run(src, demo.tSpan).col('x'), 0.75, 1));
-    const on = steady(demo.source);
-    close(on, 0.5 / (0.15 * 1), 0.15, 'resonant amplitude should be about f/(c w)');
-
-    // Off resonance it collapses. That contrast is the demo.
-    const off = steady(setParam(demo.source, 'u', 2));
-    ok(on > 5 * off, `resonance is not sharp: on ${on}, off ${off}`);
-
-    // Lower damping, taller peak.
-    const sharp = steady(setParam(demo.source, 'c', 0.05));
-    ok(sharp > 2 * on, `less damping should ring louder: ${on} -> ${sharp}`);
-
-    // It starts from rest at the origin, so everything on screen was driven.
+  'pendulum-field': (demo) => {
+    // Released at 3.1 radians, a whisker inside the separatrix: it must
+    // librate — swing back — rather than go over the top.
     const r = run(demo.source, demo.tSpan);
-    close(r.col('x')[0], 0, 0, 'starts at the origin');
-    close(r.col("x'")[0], 0, 0, 'starts at rest');
-
-    // And it ends up oscillating at the DRIVE frequency, not its own: over 60
-    // seconds at u = 2 that is 2*60/(2*pi) ~ 19 cycles, so ~38 crossings.
-    const fast = run(setParam(demo.source, 'u', 2), demo.tSpan);
-    const n = zeroCrossings(slice(fast.col('x'), 0.5, 1));
-    close(n, (2 * 30) / Math.PI, 4, 'the steady state must follow the drive frequency');
-  },
-
-  'coupled-beats': (demo) => {
-    const r = run(demo.source, demo.tSpan, 6000);
     const x = r.col('x');
     const y = r.col('y');
+    close(x[0], 3.1, 1e-12, 'released from 3.1 radians');
+    ok(maxAbs(x) <= 3.1 + 1e-6, 'inside the separatrix it can never pass the top');
+    ok(Math.min(...x) < -3.09, 'and it must reach the same angle on the far side');
 
-    // All the motion starts in x.
-    close(x[0], 1, 1e-12, 'x starts pulled aside');
-    close(y[0], 0, 1e-12, 'y starts still');
+    // Undamped, so the pendulum energy is exactly conserved. It also says
+    // WHICH side of the separatrix this is: E < 1 librates, E > 1 circulates.
+    const E = x.map((q, i) => 0.5 * y[i] * y[i] - Math.cos(q));
+    ok(drift(E) < 1e-3, `energy drifted by ${drift(E)}`);
+    ok(E[0] < 1, `E = ${E[0]} — this start is supposed to be inside the separatrix`);
 
-    // COMPLETE HANDOVER: at some moment x is essentially motionless while y
-    // is swinging with the full original amplitude. Nothing was lost — it is
-    // all in the neighbour.
-    const ex = amplitude(x, r.col("x'"), 1);
-    const ey = amplitude(y, r.col("y'"), 1);
-    ok(Math.min(...ex) < 0.2, `x never goes quiet: min amplitude ${Math.min(...ex)}`);
-    ok(Math.max(...ey) > 0.85, `y never picks it all up: max amplitude ${Math.max(...ey)}`);
-
-    // The handover goes back and forth: x is loud, then quiet, then loud
-    // again. Measured from the FIRST quiet moment, so the check is about the
-    // round trip and not about where the window happens to end.
-    const quiet = ex.findIndex((v) => v < 0.2);
-    ok(quiet > 0 && quiet < ex.length * 0.6, `the first quiet moment is at index ${quiet}`);
-    ok(maxAbs(ex.slice(quiet + 1)) > 0.85, 'x must get the motion back again');
-
-    // Total energy of the pair is conserved (nothing is damped here).
-    const vx = r.col("x'");
-    const vy = r.col("y'");
-    const total = x.map(
-      (q, i) =>
-        0.5 * (vx[i] * vx[i] + vy[i] * vy[i] + q * q + y[i] * y[i]) +
-        0.5 * 0.2 * (q - y[i]) * (q - y[i])
-    );
-    ok(drift(total) < 1e-4, `pair energy drifted by ${drift(total)}`);
-
-    // Stronger coupling hands the motion over faster.
-    const beats = (c) => {
-      const rr = run(setParam(demo.source, 'c', c), demo.tSpan, 6000);
-      const amp = amplitude(rr.col('x'), rr.col("x'"), 1);
-      return zeroCrossings(amp.map((v) => v - 0.5));
+    // THE POINT OF THE PICTURE: near the separatrix the period blows up. The
+    // small-angle period is 2 pi; here it is more than three times that.
+    const period = (src) => {
+      const rr = run(src, demo.tSpan);
+      const n = zeroCrossings(rr.col('x'));
+      ok(n >= 2, 'not enough swings to measure a period');
+      return (2 * (demo.tSpan[1] - demo.tSpan[0])) / n;
     };
-    ok(beats(0.6) > 2 * beats(0.05), 'stronger coupling should beat faster');
+    const small = period(setStart(demo.source, 'x', 0.05));
+    close(small, 2 * Math.PI, 0.2, 'small swings should have period 2 pi');
+    ok(period(demo.source) > 3 * small, 'near the separatrix the period must blow up');
+
+    // KNOB: with drag the eyes become drains, so the whole thing stops.
+    const damped = run(setParam(demo.source, 'c', 0.8), demo.tSpan);
+    ok(maxAbs(slice(damped.col('x'), 0.9, 1)) < 1e-3, 'with drag it must settle at the bottom');
+    ok(maxAbs(slice(damped.col('y'), 0.9, 1)) < 1e-3, 'and stop moving');
+
+    // THE FIELD IS THE EQUATION, at every sample of the grid the view draws.
+    const arrows = field(demo.source, [-2 * Math.PI, 2 * Math.PI, -3, 3], 13, 9);
+    ok(arrows.length === 117, `the grid should be 13 x 9, got ${arrows.length}`);
+    for (const { x: qx, y: qy, dx, dy } of arrows) {
+      close(dx, qy, 1e-12, `arrow dx at (${qx}, ${qy})`);
+      close(dy, -Math.sin(qx), 1e-12, `arrow dy at (${qx}, ${qy})`);
+    }
+    // The eyes and the saddles are where the arrows vanish: at every multiple
+    // of pi on the axis, and nowhere else on it.
+    const axis = field(demo.source, [0, 3 * Math.PI, 0, 0], 7, 1);
+    axis.forEach((a, i) => {
+      const still = Math.hypot(a.dx, a.dy) < 1e-9;
+      ok(still === (i % 2 === 0), `the field should rest exactly at multiples of pi (i = ${i})`);
+    });
   },
 
   'van-der-pol': (demo) => {
     // A LIMIT CYCLE is defined by not depending on where you started. Three
     // wildly different starts, one destination.
-    const late = (x0, v0) => {
-      const s = demo.source.replace(/^x\(0\) = .*$/m, `x(0) = ${x0}`)
-        .replace(/^x'\(0\) = .*$/m, `x'(0) = ${v0}`);
-      const r = run(s, demo.tSpan);
-      return maxAbs(slice(r.col('x'), 0.75, 1));
+    const late = (x0, y0) => {
+      const s = setStart(setStart(demo.source, 'x', x0), 'y', y0);
+      return maxAbs(slice(run(s, demo.tSpan).col('x'), 0.75, 1));
     };
     const a = late(0.1, 0);
-    const b = late(3, 2);
-    const c = late(-2.5, -1);
-    close(b, a, 0.01, 'a limit cycle must not remember its initial condition');
-    close(c, a, 0.01, 'a limit cycle must not remember its initial condition');
+    close(late(3, 2), a, 0.01, 'a limit cycle must not remember its initial condition');
+    close(late(-2.5, -1), a, 0.01, 'a limit cycle must not remember its initial condition');
     close(a, 2.02, 0.05, 'the van der Pol cycle sits at amplitude ~2');
 
-    // And it really is a cycle: the second half of the window repeats the
-    // amplitude of the first half rather than growing or dying.
+    // And it really is a cycle: the last quarter of the window repeats the
+    // quarter before it rather than growing or dying.
     const r = run(demo.source, demo.tSpan);
-    const mid = maxAbs(slice(r.col('x'), 0.5, 0.75));
-    close(maxAbs(slice(r.col('x'), 0.75, 1)), mid, 1e-3, 'the orbit must repeat');
+    close(maxAbs(slice(r.col('x'), 0.75, 1)), maxAbs(slice(r.col('x'), 0.5, 0.75)), 1e-3,
+          'the orbit must repeat');
 
-    // Large m turns the wave into a relaxation twitch: the velocity spikes
-    // get far bigger while the displacement stays pinned at ~2.
+    // KNOB: large m is a relaxation oscillator — the same width, a far more
+    // violent snap. That is the difference between a hum and a buzz, and it is
+    // the reason this one is worth listening to.
     const stiff = run(setParam(demo.source, 'm', 8), demo.tSpan);
-    ok(
-      maxAbs(stiff.col("x'")) > 3 * maxAbs(r.col("x'")),
-      'raising m should sharpen the relaxation spikes'
-    );
+    const gentle = run(setParam(demo.source, 'm', 0.1), demo.tSpan);
+    ok(maxAbs(stiff.col('y')) > 4 * maxAbs(gentle.col('y')),
+       `raising m should sharpen the spikes: ${maxAbs(gentle.col('y'))} -> ${maxAbs(stiff.col('y'))}`);
     close(maxAbs(slice(stiff.col('x'), 0.75, 1)), 2.02, 0.1, 'amplitude stays ~2 regardless of m');
-  },
 
-  'lotka-volterra': (demo) => {
-    const r = run(demo.source, demo.tSpan);
-    const x = r.col('x');
-    const y = r.col('y');
-
-    ok(Math.min(...x) > 0 && Math.min(...y) > 0, 'populations must never go negative');
-
-    // Lotka-Volterra has an exact conserved quantity. It is the reason the
-    // orbits close instead of spiralling, so it is the honest check here.
-    const [a, b, c, d] = [1, 0.5, 0.75, 0.25];
-    const v = x.map((q, i) => d * q - c * Math.log(q) + b * y[i] - a * Math.log(y[i]));
-    ok(drift(v) < 1e-4, `the conserved quantity drifted by ${drift(v)}`);
-
-    // The predator peak LAGS the prey peak — predators can only grow after
-    // there is something to eat.
-    const preyPeak = argmax(slice(x, 0, 0.5));
-    const predPeak = argmax(slice(y, 0, 0.5));
-    ok(predPeak > preyPeak, 'the predator peak must come after the prey peak');
-
-    // It swings hard: the prey population changes by a factor of four.
-    ok(Math.max(...x) / Math.min(...x) > 4, 'the cycle should be dramatic, not a wobble');
-  },
-
-  'sir-epidemic': (demo) => {
-    const r = run(demo.source, demo.tSpan);
-    const s = r.col('s');
-    const i = r.col('i');
-    const rr = r.col('r');
-
-    // Nobody is created or destroyed. This is the model's one hard invariant.
-    const total = s.map((v, j) => v + i[j] + rr[j]);
-    for (const v of total) close(v, 1, 1e-8, 's + i + r must stay exactly 1');
-
-    // Susceptibles only ever fall, recovered only ever rise.
-    for (let j = 1; j < s.length; j++) {
-      ok(s[j] <= s[j - 1] + 1e-12, 'susceptibles cannot increase');
-      ok(rr[j] >= rr[j - 1] - 1e-12, 'the recovered count cannot fall');
+    // THE FIELD IS THE EQUATION — including the m the slider is holding.
+    const arrows = field(demo.source, [-3, 3, -4, 4], 11, 9);
+    ok(arrows.length === 99, `the grid should be 11 x 9, got ${arrows.length}`);
+    for (const { x, y, dx, dy } of arrows) {
+      close(dx, y, 1e-12, `arrow dx at (${x}, ${y})`);
+      close(dy, 2 * (1 - x * x) * y - x, 1e-12, `arrow dy at (${x}, ${y})`);
     }
-
-    // There is a real outbreak, and it is over by the end of the window.
-    ok(Math.max(...i) > 0.2, `the epidemic never took off: peak ${Math.max(...i)}`);
-    ok(i[i.length - 1] < 0.01, 'the outbreak should have burnt out inside the span');
-    ok(rr[rr.length - 1] > 0.9, 'nearly everyone should have been infected at b = 0.6');
-
-    // BELOW THRESHOLD: with b < g the seed infection just fizzles, and the
-    // curve is flat. That contrast is what the knob is for.
-    const damp = run(setParam(demo.source, 'b', 0.05), demo.tSpan);
-    ok(Math.max(...damp.col('i')) <= 0.001 + 1e-9, 'below threshold nothing should grow');
-    ok(damp.col('r')[damp.col('r').length - 1] < 0.01, 'below threshold almost nobody is infected');
-  },
-
-  lorenz: (demo) => {
-    const r = run(demo.source, demo.tSpan);
-    const x = r.col('x');
-
-    // Bounded but never repeating: it stays on the attractor.
-    ok(maxAbs(x) < 60 && maxAbs(r.col('z')) < 120, 'the attractor must stay bounded');
-    ok(zeroCrossings(x) > 10, 'it should flip between the wings many times');
-
-    // SENSITIVE DEPENDENCE. One part in a million in the initial x. The two
-    // runs track each other closely for ten seconds and are unrelated by
-    // forty — that is the whole idea of chaos, made checkable.
-    const nudged = run(setParam(demo.source, 'a', 1.000001), demo.tSpan);
-    const other = nudged.col('x');
-    const at = (frac) => Math.abs(x[Math.floor((x.length - 1) * frac)] - other[Math.floor((x.length - 1) * frac)]);
-    ok(at(0.25) < 0.1, `the two runs should still agree at t = 10: apart by ${at(0.25)}`);
-    let separated = 0;
-    for (let j = 0; j < x.length; j++) if (Math.abs(x[j] - other[j]) > 5) separated += 1;
-    ok(separated > 200, 'a millionth of a nudge must end up changing everything');
-    ok(
-      maxAbs(x.map((v, j) => v - other[j])) > 10,
-      'the nudged run must diverge completely by the end'
-    );
-
-    // BELOW THE THRESHOLD the chaos genuinely switches off: at r = 10 the
-    // flow settles onto a steady roll and simply stops moving.
-    const calm = run(setParam(demo.source, 'r', 10), demo.tSpan);
-    ok(spread(slice(calm.col('x'), 0.9, 1)) < 1e-3, 'at r = 10 it must settle to a fixed point');
   },
 
   orbit: (demo) => {
@@ -653,9 +417,13 @@ const PHYSICS = {
     ok(drift(L) < 1e-4, `angular momentum drifted by ${drift(L)}`);
     ok(drift(E) < 1e-4, `energy drifted by ${drift(E)}`);
 
+    // The helper row is load-bearing: one function, called twice.
+    ok(r.diagnostics.params.join(',') === 'm,v',
+       `the function must not become a parameter, got ${r.diagnostics.params}`);
+
     // It is an ellipse with perihelion where it launched and aphelion where
     // the vis-viva equation says: a = 1/(2 - v^2), r_max = 2a - 1.
-    const rad = x.map((q, i) => Math.hypot(q, y[i]));
+    const rad = radius(r, 'x', 'y');
     const a = 1 / (2 - 1.1 * 1.1);
     close(Math.min(...rad), 1, 1e-3, 'perihelion is the launch radius');
     close(Math.max(...rad), 2 * a - 1, 5e-3, 'aphelion should match the vis-viva equation');
@@ -668,24 +436,263 @@ const PHYSICS = {
 
     // Circular when launched at exactly the circular speed.
     const circle = run(setParam(demo.source, 'v', 1), demo.tSpan);
-    const cr = circle.col('x').map((q, i) => Math.hypot(q, circle.col('y')[i]));
-    ok(spread(cr) < 1e-5, `v = 1 should be a circle, radius varied by ${spread(cr)}`);
+    ok(spread(radius(circle, 'x', 'y')) < 1e-5, 'v = 1 should be a circle');
 
     // And it closes: after one period it is back where it started.
     const period = 2 * Math.PI * Math.pow(a, 1.5);
-    const idx = Math.round(((period - demo.tSpan[0]) / (demo.tSpan[1] - demo.tSpan[0])) * (x.length - 1));
+    const idx = Math.round(
+      ((period - demo.tSpan[0]) / (demo.tSpan[1] - demo.tSpan[0])) * (x.length - 1)
+    );
     close(x[idx], x[0], 5e-3, 'the ellipse must close after one period');
     close(y[idx], y[0], 5e-3, 'the ellipse must close after one period');
+  },
+
+  lorenz: (demo) => {
+    const r = run(demo.source, demo.tSpan);
+    const x = r.col('x');
+
+    // Bounded but never repeating: it stays on the attractor.
+    ok(maxAbs(x) < 60 && maxAbs(r.col('z')) < 120, 'the attractor must stay bounded');
+    ok(zeroCrossings(x) > 10, 'it should flip between the wings many times');
+
+    // SENSITIVE DEPENDENCE. One part in a million in the starting x. The two
+    // runs track each other closely for ten seconds and are unrelated by
+    // forty — that is the whole idea of chaos, made checkable.
+    const other = run(setParam(demo.source, 'a', 1.000001), demo.tSpan).col('x');
+    const at = (f) => {
+      const i = Math.floor((x.length - 1) * f);
+      return Math.abs(x[i] - other[i]);
+    };
+    ok(at(0.25) < 0.1, `the two runs should still agree at t = 10: apart by ${at(0.25)}`);
+    let separated = 0;
+    for (let j = 0; j < x.length; j++) if (Math.abs(x[j] - other[j]) > 5) separated += 1;
+    ok(separated > 200, 'a millionth of a nudge must end up changing everything');
+    ok(maxAbs(x.map((v, j) => v - other[j])) > 10, 'the nudged run must diverge completely');
+
+    // BELOW THE THRESHOLD the chaos genuinely switches off: at r = 10 the flow
+    // settles onto a steady roll at sqrt(b(r-1)) and simply stops moving.
+    const calm = run(setParam(demo.source, 'r', 10), demo.tSpan);
+    const end = calm.col('x');
+    ok(spread(slice(end, 0.9, 1)) < 1e-3, 'at r = 10 it must settle to a fixed point');
+    close(Math.abs(end[end.length - 1]), Math.sqrt((8 / 3) * 9), 1e-3,
+          'and the fixed point is the one the equations name');
+  },
+
+  'lotka-volterra': (demo) => {
+    const r = run(demo.source, demo.tSpan);
+    const x = r.col('x');
+    const y = r.col('y');
+    ok(Math.min(...x) > 0 && Math.min(...y) > 0, 'populations must never go negative');
+
+    // Lotka-Volterra has an exact conserved quantity. It is the reason the
+    // orbits close instead of spiralling, so it is the honest check here — and
+    // it is rebuilt from the knobs as written, not from remembered numbers.
+    const A = Number(readParam(demo.source, 'a'));
+    const B = Number(readParam(demo.source, 'b'));
+    const invariant = (rr, a, b) => {
+      const p = rr.col('x');
+      const q = rr.col('y');
+      return p.map((v, i) => 0.25 * v - 0.75 * Math.log(v) + b * q[i] - a * Math.log(q[i]));
+    };
+    ok(drift(invariant(r, A, B)) < 1e-4, `the conserved quantity drifted by ${drift(invariant(r, A, B))}`);
+
+    // The predator peak LAGS the prey peak — predators can only grow after
+    // there is something to eat.
+    ok(argmax(slice(y, 0, 0.5)) > argmax(slice(x, 0, 0.5)) + 100,
+       'the predator peak must come well after the prey peak');
+
+    // It swings hard, and it keeps swinging: the last cycle is as big as the
+    // first, which is what "closed orbit" means on a t-y plot.
+    ok(Math.max(...x) / Math.min(...x) > 4, 'the cycle should be dramatic, not a wobble');
+    close(Math.max(...slice(x, 0.6, 1)), Math.max(...slice(x, 0, 0.4)), 0.02,
+          'the cycle must not decay');
+
+    // KNOB: the loop the same start sits on is set by the knobs. Slacken the
+    // predation and this start lands on a far wider orbit — and it is still a
+    // closed one, because the invariant is exact at every setting.
+    for (const b of [0.2, 1.5]) {
+      const other = run(setParam(demo.source, 'b', b), demo.tSpan);
+      ok(drift(invariant(other, A, b)) < 1e-4, `at b = ${b} the orbit stopped being closed`);
+    }
+    const slack = run(setParam(demo.source, 'b', 0.2), demo.tSpan);
+    const slackSwing = Math.max(...slack.col('x')) / Math.min(...slack.col('x'));
+    ok(slackSwing > 2 * (Math.max(...x) / Math.min(...x)),
+       `the predation knob should change the size of the cycle, got ${slackSwing}`);
+  },
+
+  duffing: (demo) => {
+    // The drive period. Everything below is about whether the answer shares it.
+    const T = (2 * Math.PI) / 1.2;
+
+    /** How well the late motion repeats itself one drive period earlier. */
+    const repeatError = (g) => {
+      const r = run(setParam(demo.source, 'g', g), demo.tSpan, 8000);
+      const x = r.col('x');
+      const k = Math.round(T / (r.t[1] - r.t[0]));
+      let worst = 0;
+      for (let i = Math.floor(x.length * 0.75); i < x.length; i++) {
+        worst = Math.max(worst, Math.abs(x[i] - x[i - k]));
+      }
+      return { worst, x };
+    };
+
+    // LOCKED: at g = 0.2 the answer has the drive's own period, to a hair,
+    // and it never leaves the well it settled in.
+    const locked = repeatError(0.2);
+    ok(locked.worst < 0.05, `at g = 0.2 it should repeat the drive: error ${locked.worst}`);
+    ok(zeroCrossings(slice(locked.x, 0.5, 1)) === 0, 'and stay in one well');
+
+    // CHAOTIC: at the default it never repeats, and it hops between the wells
+    // in an order with no period at all.
+    const wild = repeatError(0.35);
+    ok(wild.worst > 1, `at g = 0.35 it must not repeat: error ${wild.worst}`);
+    ok(zeroCrossings(slice(wild.x, 0.5, 1)) >= 4,
+       'the whole point is that it changes wells, repeatedly and late');
+    ok(Math.max(...wild.x) > 0.8 && Math.min(...wild.x) < -0.8, 'it must visit both wells');
+
+    // It is bounded chaos, not a blow-up: the two wells sit at x = +/-1 and it
+    // never gets far from them.
+    const r = run(demo.source, demo.tSpan);
+    ok(r.report.stopped === undefined, 'the run must cover the whole window');
+    ok(maxAbs(r.col('x')) < 2, `it must stay in the double well: reached ${maxAbs(r.col('x'))}`);
+
+    // And the drive is what does it: with the shove almost off it falls into a
+    // well and stays put, period-locked and tiny.
+    const quiet = repeatError(demo.knobs[0].min);
+    ok(quiet.worst < 0.05, 'a weak drive is period-locked too');
+    ok(maxAbs(quiet.x) < maxAbs(wild.x), 'and much smaller than the chaotic one');
+  },
+
+  beats: (demo) => {
+    // The two tones are 1 and 1 + b, so their sum is
+    //   s = 2 cos(b t / 2) cos((1 + b/2) t),
+    // an envelope of 2|cos(b t / 2)| on a carrier. Every number below is that
+    // formula, and none of them is written in the document.
+    const envelope = (b) => {
+      const src = setParam(demo.source, 'b', b);
+      const r = run(src, demo.tSpan, 8000);
+      const s = r.col('x').map((v, i) => v + r.col('y')[i]);
+      const sv = r.col("x'").map((v, i) => v + r.col("y'")[i]);
+      return { r, s, e: amplitude(s, sv, 1) };
+    };
+
+    // UNISON: at b = 0 there is no beat at all. One tone, amplitude exactly 2,
+    // for the whole window.
+    const unison = envelope(0);
+    close(Math.max(...unison.e), 2, 1e-3, 'two identical tones add to amplitude 2');
+    ok(spread(unison.e) < 1e-3, `at b = 0 nothing should throb: spread ${spread(unison.e)}`);
+
+    // BEATING: at the default the sum really does cancel — the envelope comes
+    // within a twentieth of silence — and returns to full amplitude.
+    const base = envelope(0.08);
+    ok(Math.min(...base.e) < 0.1, `the beat never nulls: min ${Math.min(...base.e)}`);
+    ok(Math.max(...base.e) > 1.9, 'and it must come back to full amplitude');
+
+    // THE RATE, EXACTLY. The envelope crosses half amplitude wherever
+    // |cos(b t / 2)| = 1/2, i.e. at t = (n pi/3) * 2/b for n not a multiple of
+    // 3. Counting those in the window is a closed-form prediction of the
+    // picture, and it must be right on the nose at every detuning.
+    for (const b of [0.02, 0.08, 0.2, 0.5]) {
+      let want = 0;
+      for (let n = 1; (n * Math.PI) / 3 <= (b * demo.tSpan[1]) / 2; n++) if (n % 3 !== 0) want += 1;
+      const got = zeroCrossings(envelope(b).e.map((v) => v - 1));
+      close(got, want, 0, `b = ${b}: the beat rate should give ${want} half-amplitude crossings`);
+    }
+
+    // The sum is a derived row, not a state: it is drawn from the solution
+    // rather than integrated, and it is the series this demo shows.
+    ok(base.r.diagnostics.derived.join(',') === 's', 'the sum must be a derived row');
+    ok(base.r.diagnostics.states.join(',') === "x,x',y,y'", 'and the states are the two springs');
+    const m = new wasm.Model();
+    m.set_source(demo.source);
+    JSON.parse(m.solve(demo.tSpan[0], demo.tSpan[1]));
+    const c = JSON.parse(m.conservation('s', 0));
+    ok(c.ok === true, `the monitor must be able to read s: ${c.error}`);
+    close(c.initial, 2, 1e-9, 'the two tones start in phase, so s starts at 2');
+  },
+
+  'noise-resonator': (demo) => {
+    // 1. DETERMINISM, which is the property that makes noise integrable at
+    // all. Two runs of the same document are the same numbers, bit for bit.
+    const a = run(demo.source, demo.tSpan);
+    const b = run(demo.source, demo.tSpan);
+    for (let i = 0; i < a.col('x').length; i += 37) {
+      ok(a.col('x')[i] === b.col('x')[i], `noise is not reproducible at sample ${i}`);
+    }
+    ok(a.report.stopped === undefined,
+       'a band-limited noise source must not collapse the step size');
+
+    // 2. IT IS THE NOISE DOING IT. Turn the level to zero and the resonator
+    // sits at exactly zero forever — a control run, not an eyeball.
+    const silent = run(setParam(demo.source, 'f', 0), demo.tSpan);
+    close(maxAbs(silent.col('x')), 0, 0, 'with f = 0 nothing should move at all');
+    ok(spread(a.col('x')) > 1, `with f = 1 it should really move: span ${spread(a.col('x'))}`);
+
+    // 3. HISS IN, A PITCH OUT. The resonator answers at ITS OWN frequency
+    // (w = 1, so 2 T / 2 pi crossings in the window) whatever the noise rate
+    // is set to — that is what "resonance" means, and it is measurable.
+    const expected = (2 * (demo.tSpan[1] - demo.tSpan[0])) / (2 * Math.PI);
+    for (const rate of [1, 6, 40]) {
+      const r = run(setParam(demo.source, 'r', rate), demo.tSpan);
+      close(zeroCrossings(r.col('x')), expected, 3,
+            `at noise rate ${rate} it should still ring at its own frequency`);
+    }
+
+    // 4. THE DAMPING KNOB IS THE WIDTH OF THAT RESONANCE: less damping, far
+    // more of the hiss gets through at the peak.
+    const sharp = rms(run(setParam(demo.source, 'c', 0.02), demo.tSpan).col('x'));
+    const dull = rms(run(setParam(demo.source, 'c', 2), demo.tSpan).col('x'));
+    ok(sharp > 4 * dull, `a sharper resonance should ring much louder: ${dull} -> ${sharp}`);
+  },
+
+  epidemic: (demo) => {
+    const r = run(demo.source, demo.tSpan);
+    const s = r.col('s');
+    const i = r.col('i');
+    const rr = r.col('r');
+
+    // Nobody is created or destroyed. Nothing in the document says so — it is
+    // a consequence of the three right-hand sides summing to zero.
+    for (const v of s.map((v0, j) => v0 + i[j] + rr[j])) {
+      close(v, 1, 1e-9, 's + i + r must stay exactly 1');
+    }
+
+    // Susceptibles only ever fall, recovered only ever rise.
+    for (let j = 1; j < s.length; j++) {
+      ok(s[j] <= s[j - 1] + 1e-12, 'susceptibles cannot increase');
+      ok(rr[j] >= rr[j - 1] - 1e-12, 'the recovered count cannot fall');
+    }
+
+    // There is a real outbreak, and it is over by the end of the window.
+    ok(Math.max(...i) > 0.2, `the epidemic never took off: peak ${Math.max(...i)}`);
+    ok(i[i.length - 1] < 0.01, 'the outbreak should have burnt out inside the span');
+
+    // The final size is not a guess either: it is the root of
+    // 1 - s_inf = 1 - exp(-(b/g)(1 - s_inf)), which the curve must land on.
+    const R0 = Number(readParam(demo.source, 'b')) / Number(readParam(demo.source, 'g'));
+    let sInf = 0.5;
+    for (let k = 0; k < 500; k++) sInf = Math.exp(-R0 * (1 - sInf));
+    close(s[s.length - 1], sInf, 2e-3, 'the final susceptible fraction has a closed form');
+
+    // BELOW THRESHOLD: b/g < 1 and the seed infection just fizzles. Checked
+    // from both knobs, because the threshold is the ratio and not either one.
+    for (const src of [setParam(demo.source, 'b', 0.05), setParam(demo.source, 'g', 0.6)]) {
+      const damp = run(src, demo.tSpan);
+      ok(Math.max(...damp.col('i')) <= 0.001 + 1e-9, 'below threshold nothing should grow');
+      ok(damp.col('r')[damp.col('r').length - 1] < 0.05, 'and almost nobody is infected');
+    }
   },
 };
 
 // =============================================================================
-// Layers 1-3, applied to every demo.
+// Layers 1-4, applied to every demo.
 // =============================================================================
+
+const VIEWS = ['time', 'phase', 'polar', 'field'];
 
 test('the gallery is not empty and has stable, unique ids', () => {
   ok(Array.isArray(DEMOS), 'DEMOS must be an array');
-  ok(DEMOS.length >= 8, `expected a real gallery, got ${DEMOS.length} demos`);
+  ok(DEMOS.length >= 10, `expected a real gallery, got ${DEMOS.length} demos`);
   const ids = DEMOS.map((d) => d.id);
   ok(new Set(ids).size === ids.length, `duplicate ids: ${ids}`);
   for (const id of ids) ok(/^[a-z0-9-]+$/.test(id), `id ${id} should be a slug`);
@@ -694,6 +701,25 @@ test('the gallery is not empty and has stable, unique ids', () => {
 test('demoById finds every demo and nothing else', () => {
   for (const d of DEMOS) ok(demoById(d.id) === d, `demoById lost ${d.id}`);
   ok(demoById('no-such-demo') === undefined, 'demoById must return undefined when it misses');
+});
+
+test('the gallery covers the views, the notation and the ear', () => {
+  // A gallery that is all t-y is a gallery that never shows the equation
+  // itself. Fields are the half people never see, so there are several.
+  const fields = DEMOS.filter((d) => d.view === 'field');
+  ok(fields.length >= 2, `expected at least two field demos, got ${fields.length}`);
+  ok(DEMOS.some((d) => d.view === 'time'), 'something must be about t-y');
+
+  const all = DEMOS.map((d) => d.source).join('\n');
+  ok(/^d[a-z](_\d)?\/d[a-z]\d? = /m.test(all), 'nothing shows Leibniz notation');
+  ok(/^df\/dx = /m.test(all), 'no integral written as a differential equation');
+  ok(/^d2[a-z]\/d[a-z]2 = /m.test(all), 'nothing shows second-order Leibniz notation');
+  ok(/^[a-z]' = /m.test(all), "nothing uses the x' spelling");
+  ok(/^[a-z]'' = /m.test(all), "nothing uses the x'' spelling");
+  ok(/^[a-z]\([a-z], [a-z]\) = /m.test(all), 'no function definition anywhere');
+  ok(/(white|pink|brown|blue|smooth|telegraph)\(/.test(all), 'nothing uses the noise family');
+
+  ok(DEMOS.filter((d) => d.audio).length >= 3, 'several demos should be worth hearing');
 });
 
 for (const demo of DEMOS) {
@@ -712,6 +738,9 @@ for (const demo of DEMOS) {
     // An example is read by looking at it. The title and blurb carry the
     // words; the source carries only the mathematics.
     ok(!demo.source.includes('#'), 'a demo source must carry no comments');
+    // Rows are the cost of a demo, so there is a ceiling on them.
+    const rows = demo.source.split('\n').filter((l) => l.trim().length > 0).length;
+    ok(rows <= 9, `${rows} rows is too many to read at a glance`);
   });
 
   test(at('knob ranges are sane and start where the document does'), () => {
@@ -730,7 +759,14 @@ for (const demo of DEMOS) {
     }
   });
 
-  // --- 2. compiles ----------------------------------------------------------
+  // --- 2. view --------------------------------------------------------------
+
+  test(at('declares the one view it is about'), () => {
+    ok(typeof demo.view === 'string', 'a demo must say which view it is about');
+    ok(VIEWS.indexOf(demo.view) >= 0, `view ${demo.view} is not one of ${VIEWS}`);
+  });
+
+  // --- 3. compiles ----------------------------------------------------------
 
   const compiled = run(demo.source, demo.tSpan);
 
@@ -750,7 +786,25 @@ for (const demo of DEMOS) {
     }
   });
 
-  // --- 3. interesting -------------------------------------------------------
+  test(at('the view it declares is one the document can actually draw'), () => {
+    const states = compiled.diagnostics.states;
+    // The shell's rule, and this is the whole reason the layer exists: a demo
+    // that declares a view its own document cannot draw arrives as a fallback
+    // to t-y, which is a demo arriving as the wrong picture.
+    if (demo.view === 'phase' || demo.view === 'field') {
+      ok(states.length === 2,
+         `${demo.view} needs exactly two states — this has ${states.length}: ${states}`);
+    }
+    if (demo.view === 'field') {
+      // And `vector_field` has to actually answer for it.
+      ok(field(demo.source, [-1, 1, -1, 1], 4, 4).length === 16, 'the field came back empty');
+    }
+    if (demo.view === 'polar') {
+      ok(states.indexOf('r') >= 0, `polar needs a state named r, got ${states}`);
+    }
+  });
+
+  // --- 4. interesting -------------------------------------------------------
 
   test(at('solves over its own tSpan'), () => {
     ok(compiled.report.ok, `solve failed: ${compiled.report.error}`);
@@ -771,7 +825,7 @@ for (const demo of DEMOS) {
     ok(biggest > 0.1, `nothing moves: the widest state spans only ${biggest}`);
   });
 
-  // --- 4. physics -----------------------------------------------------------
+  // --- 5. physics -----------------------------------------------------------
 
   test(at('obeys its physics'), () => {
     const check = PHYSICS[demo.id];

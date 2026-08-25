@@ -82,6 +82,57 @@ ok('the plot has a legend/readout after solving',
    ($('readout').childNodes.length > 0 || $('readout').textContent.length > 0));
 
 // ---------------------------------------------------------------------------
+// THE START SCREEN
+//
+// Two ways in, offered AFTER the eased loading screen and inside the app shell
+// rather than in front of it: same ground, same easing, one motion. The choice
+// is remembered so it asks once, and the logo is the way back to it.
+// ---------------------------------------------------------------------------
+
+const inspectEarly = globalThis.__numplaInspect;
+{
+  ok('the app opens on the start screen', inspectEarly.route() === 'chooser',
+     inspectEarly.route());
+  ok('the route is a class on <body>', doc.body.classList.contains('route-chooser'));
+  ok('the chooser lives INSIDE the app shell, not in front of the loader',
+     $('app').contains($('chooser')) && !$('loader').contains($('chooser')));
+  ok('the top bar has already arrived under it',
+     doc.querySelectorAll('.topbar').length === 1 && $('app').contains($('home-btn')));
+  ok('both ways in are offered', !!$('choice-solve') && !!$('choice-compute'));
+  ok('the workspace is built underneath, so choosing costs no re-measure',
+     rowEls().length > 0 && $('canvas') !== null);
+
+  // A build with no CAS must SAY so on the card rather than open a dead pane.
+  if (!inspectEarly.probe().cas) {
+    ok('with no CAS the Compute card is offered as unavailable',
+       $('choice-compute').getAttribute('aria-disabled') === 'true');
+    ok('and it names the calls it is missing',
+       /cas_simplify/.test($('choice-compute-why').textContent),
+       $('choice-compute-why').textContent.slice(0, 90));
+    click($('choice-compute'));
+    await settle(5);
+    ok('pressing it opens nothing', inspectEarly.route() === 'chooser',
+       inspectEarly.route());
+  }
+
+  click($('choice-solve'));
+  await settle(10);
+  ok('choosing solve & simulate opens the workspace',
+     inspectEarly.route() === 'solve' && doc.body.classList.contains('route-solve'));
+  ok('and the chooser is no longer the route',
+     !doc.body.classList.contains('route-chooser'));
+  ok('the choice is remembered so it does not nag on reload',
+     localStorage.getItem('numpla.route') === 'solve');
+
+  click($('home-btn'));
+  await settle(5);
+  ok('the logo is the way back to the chooser', inspectEarly.route() === 'chooser');
+  click($('choice-solve'));
+  await settle(10);
+  ok('and back in again', inspectEarly.route() === 'solve');
+}
+
+// ---------------------------------------------------------------------------
 // `t` is gone. Not a slider, not a row, not a playhead, not a play button.
 // ---------------------------------------------------------------------------
 
@@ -228,6 +279,26 @@ ok('the reset button puts the frame back', JSON.stringify(spanOf()) === '[-5,5]'
 // ---------------------------------------------------------------------------
 
 const { DEMOS } = await import(new URL('./demos.js', APP).href);
+
+// Two documents the suite writes for itself. Borrowing a demo for a property
+// test - "this one is first-order", "this one shares a parameter across rows" -
+// couples the test to a gallery that gets rewritten, and the coupling fails
+// SILENTLY: the demo changes shape, the assertion still runs, and it no longer
+// tests what its name says.
+const SECOND_ORDER = ["x'' = -x", 'x(0) = 1', "x'(0) = 0"].join('\n');
+const FIRST_ORDER = ["x' = -y", "y' = x", 'x(0) = 1', 'y(0) = 0'].join('\n');
+const WAITING_DOC = [
+  'k = 3',
+  "x_1'' = -k x_1",
+  "x_2'' = -k x_2",
+  "x_3'' = -k x_3",
+  'x_1(0) = 1',
+  'x_2(0) = 0.8',
+  'x_3(0) = 0.6',
+  "x_1'(0) = 0",
+  "x_2'(0) = 0",
+  "x_3'(0) = 0",
+].join('\n');
 click($('demos-btn'));
 await settle(10);
 const items = $('demomenu').querySelectorAll('.demoitem');
@@ -236,10 +307,22 @@ ok('the demo menu lists every demo', items.length === DEMOS.length,
 
 async function loadDemoById(id) {
   const i = DEMOS.findIndex((d) => d.id === id);
+  if (i < 0) return null;
   if ($('demomenu').hidden) { click($('demos-btn')); await settle(5); }
   click($('demomenu').querySelectorAll('.demoitem')[i]);
   await settleSolve();
   return DEMOS[i];
+}
+
+/**
+ * A demo picked by what it IS, never by its id. The gallery gets rewritten; a
+ * test that names one entry rots with it, and rots silently - the name still
+ * resolves to something, and the assertion stops meaning what it says.
+ */
+async function loadDemoWhere(what, pred) {
+  const demo = DEMOS.find(pred) || null;
+  ok('the gallery still has ' + what, !!demo, DEMOS.length + ' demos');
+  return demo ? loadDemoById(demo.id) : null;
 }
 
 for (let i = 0; i < DEMOS.length; i++) {
@@ -259,9 +342,17 @@ for (let i = 0; i < DEMOS.length; i++) {
   ok(`${demo.id}: no row is in error`, errored.length === 0,
      errored.map((r) => r.textContent).join(' | ').slice(0, 160));
   ok(`${demo.id}: solved`, !/error|failed/i.test(status), `status: ${status}`);
-  ok(`${demo.id}: its tSpan became the frame`,
-     JSON.stringify(spanOf()) === JSON.stringify(demo.tSpan),
-     `${JSON.stringify(spanOf())} vs tSpan ${JSON.stringify(demo.tSpan)}`);
+  // Against the real numbers, not the badge's rounded text: a demo may declare
+  // an irrational span (2pi, for a full turn) and the badge is a readout.
+  const sp = globalThis.__numplaInspect.span();
+  const near = (a, b) => Math.abs(a - b) <= 1e-9 * Math.max(1, Math.abs(b));
+  ok(`${demo.id}: its tSpan became the span that was integrated`,
+     near(sp.t0, demo.tSpan[0]) && near(sp.t1, demo.tSpan[1]),
+     `${sp.t0}..${sp.t1} vs tSpan ${JSON.stringify(demo.tSpan)}`);
+  const fw = globalThis.__numplaInspect.window();
+  ok(`${demo.id}: and its frame`,
+     near(fw.x0, demo.tSpan[0]) && near(fw.x1, demo.tSpan[1]),
+     `${fw.x0}..${fw.x1} vs tSpan ${JSON.stringify(demo.tSpan)}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -272,27 +363,49 @@ const chipNames = () =>
   $('readout').querySelectorAll('.chip__name').map((n) => n.textContent);
 
 {
-  const demo = await loadDemoById('colliding-strings');
-  const names = chipNames();
-  ok('show filters the legend to what the document asked for',
-     JSON.stringify(names) === JSON.stringify(demo.show),
-     `${JSON.stringify(names)} vs show ${JSON.stringify(demo.show)}`);
-  ok('the states left out are still solved',
-     !/error|failed/i.test($('stat-solve').textContent) &&
-     names.length < demo.source.split('\n').filter((l) => /''\s*=/.test(l)).length * 2,
-     `${names.length} drawn`);
+  const demo = await loadDemoWhere('a demo that says what to look at',
+                                   (d) => Array.isArray(d.show) && d.show.length);
+  if (demo) {
+    const names = chipNames();
+    const states = globalThis.__numplaInspect.names().states;
+    ok('show filters the legend to what the document asked for',
+       JSON.stringify(names) === JSON.stringify(demo.show),
+       JSON.stringify(names) + ' vs show ' + JSON.stringify(demo.show));
+    ok('the states left out are still solved',
+       !/error|failed/i.test($('stat-solve').textContent) &&
+       names.length < states.length,
+       names.length + ' drawn of ' + states.length);
+  }
 }
 
 {
-  await loadDemoById('harmonic-oscillator');
-  const names = chipNames();
-  ok('no show list means every series is drawn', names.length === 2,
-     `${JSON.stringify(names)}`);
+  // The first demo with no `show` that this build can actually compile. A demo
+  // that will not parse is already reported, once, by the loop above; making
+  // every later test fail again for the same reason only hides the new ones.
+  let demo = null;
+  for (const d of DEMOS.filter((x) => !x.show)) {
+    await loadDemoById(d.id);
+    if (!rowEls().some((r) => r.classList.contains('is-error'))) { demo = d; break; }
+  }
+  ok('the gallery still has a demo with no show list', !!demo, DEMOS.length + ' demos');
+  if (demo) {
+    const names = chipNames();
+    const states = globalThis.__numplaInspect.names().states;
+    ok('no show list means every state is in the legend',
+       states.length > 0 && states.every((n) => names.indexOf(n) >= 0),
+       JSON.stringify(names) + ' vs states ' + JSON.stringify(states));
+  }
 }
 
 // ---------------------------------------------------------------------------
 // The integrator switch — on the strip, and it actually switches
 // ---------------------------------------------------------------------------
+
+// Second-order, because the next few checks are about the symplectic methods
+// and a first-order document is refused by them - which is the check AFTER
+// these ones. Written here rather than inherited from whichever demo ran last.
+inspectEarly.setDocument(SECOND_ORDER);
+await settleSolve();
 
 const modeChips = () => $('methods').querySelectorAll('.modechip');
 ok('the integrator switch is on the strip', modeChips().length >= 3,
@@ -318,7 +431,10 @@ ok('the switch shows which one is live',
 
 // A symplectic method on a first-order document is REFUSED, never downgraded.
 {
-  await loadDemoById('lotka-volterra');
+  // Written here rather than borrowed from the gallery: the property under test
+  // is "this document is first-order", and a demo can stop being that between
+  // one commit and the next, quietly disarming the test that names it.
+  inspectEarly.setDocument(FIRST_ORDER);
   await settleSolve();
   const bad = $('stat-solve');
   ok('a symplectic method is refused on a first-order document',
@@ -350,11 +466,12 @@ const fieldText = (row) => {
 const rowMatching = (re) => rowEls().find((r) => re.test(fieldText(r)));
 
 {
-  await loadDemoById('plucked-string');
+  inspectEarly.setDocument(WAITING_DOC);
+  await settleSolve();
   const chipsBefore = chipNames().length;
-  ok('the demo drew something to begin with', chipsBefore > 0);
+  ok('the document drew something to begin with', chipsBefore > 0);
 
-  const kRow = rowMatching(/k\s*=\s*60/);
+  const kRow = rowMatching(/^k=3$/);
   ok('found the row defining k', !!kRow, fieldText(rowEls()[0]));
   click(kRow.querySelector('.row__del'));
   await settleSolve();
@@ -1515,6 +1632,289 @@ if (hearBtn) {
     await settle(6);
     ok('FOCUSING A ROW ON A DESKTOP STILL RAISES NOTHING', kb.hidden);
   }
+}
+
+
+// ---------------------------------------------------------------------------
+// WHAT A DEMO ARRIVES AS
+//
+// The complaint: "the same graph is in every view". Every view the model
+// supported used to turn itself on, so the t–y curve was drawn whichever view
+// you had come for. A demo now declares the one view it is ABOUT, and loading
+// it turns that view on and the others off — while leaving the menu free to
+// turn anything back on a moment later.
+// ---------------------------------------------------------------------------
+
+const { VIEWS } = await import(new URL('./plot.js', APP).href);
+
+/** Did the demo currently loaded actually compile in this build? */
+const docCompiles = () => !rowEls().some((r) => r.classList.contains('is-error'));
+
+{
+  const undeclared = DEMOS.filter((d) => VIEWS.indexOf(d.view) < 0);
+  ok('every demo declares the one view it is about', undeclared.length === 0,
+     undeclared.map((d) => d.id + ':' + d.view).join(', '));
+
+  for (const demo of DEMOS) {
+    await loadDemoById(demo.id);
+    const want = VIEWS.indexOf(demo.view) >= 0 ? demo.view : 'time';
+    ok(demo.id + ': loading it adopts its declared view',
+       inspect.demoView().want === want,
+       inspect.demoView().want + ' vs ' + want);
+
+    // A demo this build cannot compile is already reported by the loop above;
+    // its capabilities say nothing, so there is nothing here to read.
+    if (!docCompiles()) continue;
+
+    const v = inspect.views();
+    const expect = v.caps[want] ? want : 'time';
+    ok(demo.id + ': exactly one view is drawing', v.on.length === 1,
+       JSON.stringify(v.on));
+    ok(demo.id + ': and it is ' + expect, v.on[0] === expect,
+       JSON.stringify(v.on) + ' — caps ' + JSON.stringify(v.caps));
+  }
+}
+
+// A document nobody chose the subject of keeps the old policy: everything the
+// model supports is on. Nothing here may pretend to know what it is about.
+{
+  inspect.setDocument(FIRST_ORDER);
+  await settleSolve();
+  const v = inspect.views();
+  ok('a plain document still lights up everything it supports',
+     v.on.length > 1 && v.on.indexOf('time') >= 0 && v.on.indexOf('phase') >= 0,
+     JSON.stringify(v.on));
+}
+
+// The menu is untouched by the policy: it is still how any supported view goes
+// on, and a demo's choice is arrival, not a lock.
+{
+  let loaded = null;
+  for (const d of DEMOS) {
+    await loadDemoById(d.id);
+    if (docCompiles()) { loaded = d; break; }
+  }
+  ok('at least one demo loads in this build', !!loaded,
+     loaded ? loaded.id : 'none of ' + DEMOS.length);
+
+  if (loaded) {
+    const one = inspect.views().on;
+    ok('it arrived with exactly one view', one.length === 1, JSON.stringify(one));
+
+    const caps = inspect.views().caps;
+    const other = VIEWS.find((v) => v !== one[0] && caps[v]);
+    if (other) {
+      if ($('viewmenu').hidden) { click(viewsBtn); await settle(5); }
+      click(viewItem(other));
+      await settleSolve();
+      const now = inspect.views().on;
+      ok('the menu still turns any supported view on after a demo',
+         now.indexOf(other) >= 0, JSON.stringify(now));
+      ok('and the demo view is still there beside it',
+         now.indexOf(one[0]) >= 0 && now.length === 2, JSON.stringify(now));
+      if (!$('viewmenu').hidden) { click(viewsBtn); await settle(5); }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// NEW: an empty document and the default frame, in one press
+// ---------------------------------------------------------------------------
+
+{
+  ok('the new button is in the top bar', !!$('new-btn') &&
+     $('new-btn').closest('.topbar') !== null);
+
+  // Arrive from something with rows, a moved frame, a slider and a seed.
+  inspect.setDocument(WAITING_DOC);
+  await settleSolve();
+  ok('there is something to clear', rowEls().length > 3, rowEls().length + ' rows');
+
+  click($('new-btn'));
+  await settleSolve();
+
+  const rs = rowEls();
+  ok('NEW CLEARS TO AN EMPTY DOCUMENT',
+     rs.length === 1 && rs[0].classList.contains('is-tail'),
+     rs.length + ' rows: ' + rs.map((r) => r.textContent).join(' | ').slice(0, 80));
+  ok('and the document really is empty', inspect.source().trim() === '',
+     JSON.stringify(inspect.source()));
+
+  const w = inspect.window();
+  ok('and to the default frame',
+     w.x0 === -5 && w.x1 === 5 && w.y0 === -5 && w.y1 === 5, JSON.stringify(w));
+  ok('the sliders go with it', rowsHost.querySelectorAll('.knob').length === 0);
+  ok('so do the seeds', inspect.seeds().length === 0, JSON.stringify(inspect.seeds()));
+  ok('and the demo it came from is forgotten',
+     !$('demos-btn').getAttribute('data-demo'),
+     String($('demos-btn').getAttribute('data-demo')));
+  ok('an empty document is not an error',
+     !$('stat-solve').classList.contains('is-bad'),
+     'status: ' + $('stat-solve').textContent);
+  ok('nothing is drawn, and nothing is claimed',
+     !rowEls().some((r) => r.classList.contains('is-error')));
+
+  // Typing into the blank row is all it takes to be going again.
+  inspect.setDocument(FIRST_ORDER);
+  await settleSolve();
+  ok('and it is ready to be typed into again',
+     /solved/.test($('stat-solve').textContent), 'status: ' + $('stat-solve').textContent);
+}
+
+// ---------------------------------------------------------------------------
+// THE COMPUTE PANE
+//
+// The second route: a Maple-like pane over the CAS calls. Built here against a
+// stub when the build has none, because the pane is the shell's job and the
+// calls are the crate's — the same way the field and seed calls are tested.
+// ---------------------------------------------------------------------------
+
+{
+  const reply = (input, output) => JSON.stringify({ ok: true, input, output });
+  const stubCas = {
+    simplify: (e) => reply(e, e === '2x' ? '2x' : e),
+    diff: (e, v) => reply(e, '2' + v),
+    expand: (e) => reply(e, e + '+1'),
+    eval: (e) => JSON.stringify({ ok: false, input: e, output: '',
+                                  error: 'no number in ' + e }),
+  };
+
+  const real = inspect.probe().cas;
+  inspect.setCasApi(real ? null : stubCas);
+  ok('the CAS calls are available' + (real ? ' (real WASM)' : ' (stubbed)'),
+     inspect.cas().available, JSON.stringify(inspect.cas().ops));
+  ok('all four operations are offered',
+     inspect.cas().ops.length === 4, JSON.stringify(inspect.cas().ops));
+
+  ok('the Compute card is live once the calls are there',
+     $('choice-compute').getAttribute('aria-disabled') === 'false');
+  click($('choice-compute'));
+  await settle(10);
+  ok('choosing Compute opens the compute pane',
+     inspect.route() === 'compute' && doc.body.classList.contains('route-compute'),
+     inspect.route());
+  ok('and the workspace is no longer the route',
+     !doc.body.classList.contains('route-solve'));
+  ok('the input surface is a MathField, like every other input here',
+     $('compute-field').querySelectorAll('.mf').length === 1);
+
+  const ops = () => $('compute-ops').querySelectorAll('.casop');
+  ok('one button per operation', ops().length === 4,
+     ops().map((b) => b.dataset.op).join(', '));
+  ok('the differentiation button names its variable',
+     /^d\/dx$/.test(ops().find((b) => b.dataset.op === 'diff').textContent),
+     ops().find((b) => b.dataset.op === 'diff').textContent);
+
+  $('compute-var').value = 'u';
+  dispatch($('compute-var'), 'input', { type: 'input', target: $('compute-var') });
+  await settle(5);
+  ok('and follows it when it changes',
+     /^d\/du$/.test(ops().find((b) => b.dataset.op === 'diff').textContent),
+     ops().find((b) => b.dataset.op === 'diff').textContent);
+  $('compute-var').value = 'x';
+  dispatch($('compute-var'), 'input', { type: 'input', target: $('compute-var') });
+  await settle(5);
+
+  const items = () => $('compute-log').querySelectorAll('.casitem');
+  ok('the history starts empty and says what this is',
+     items().length === 0 && /integration/.test($('compute-log').textContent),
+     $('compute-log').textContent.slice(0, 60));
+
+  // Type through the field's own typing path, not by writing its source.
+  inspect.clearCas();
+  // Whatever the field's own round-trip spells this as IS the input: the point
+  // is that the CAS is handed the field's source, not a string the test made up.
+  const typed = inspect.typeCas('x^2');
+  ok('typing reaches the field', typed.length > 0 && inspect.cas().input === typed,
+     JSON.stringify(typed));
+
+  click(ops().find((b) => b.dataset.op === 'diff'));
+  await settle(10);
+  ok('an operation adds one entry to the history', items().length === 1,
+     items().length + ' entries');
+
+  const log = inspect.cas().log;
+  ok('the entry keeps the input it was given', log[0].input === typed,
+     JSON.stringify(log[0]));
+  ok('and carries the answer', log[0].output === '2x', JSON.stringify(log[0]));
+  // The shim has no descendant selectors, so reach the field through its host -
+  // which is the point anyway: the answer is a real MathField, not text.
+  const partOf = (item, cls) => {
+    const host = item.querySelector(cls);
+    return host ? host.querySelector('.mf') : null;
+  };
+  ok('the answer is rendered as mathematics, not as a line of text',
+     partOf(items()[0], '.casitem__out') !== null,
+     items()[0].textContent.slice(0, 60));
+  ok('the input is rendered the same way',
+     partOf(items()[0], '.casitem__in') !== null);
+
+  // THE ROUND TRIP: a result is Numpla source, so it goes back into the input.
+  const use = items()[0].querySelector('.casitem__use');
+  ok('a result offers to go back into the input', !!use && !use.hidden);
+  click(use);
+  await settle(5);
+  ok('A RESULT ROUND-TRIPS BACK INTO THE INPUT', inspect.cas().input === '2x',
+     JSON.stringify(inspect.cas().input));
+
+  click(ops().find((b) => b.dataset.op === 'simplify'));
+  await settle(10);
+  const log2 = inspect.cas().log;
+  ok('and the next operation runs on it', log2.length === 2 && log2[1].input === '2x',
+     JSON.stringify(log2[1]));
+  ok('the history keeps both, oldest first',
+     items().length === 2 && items()[0].dataset.op === 'diff' &&
+     items()[1].dataset.op === 'simplify',
+     items().map((i) => i.dataset.op).join(', '));
+
+  // A refusal from the CAS is reported on its entry, never thrown away. Driven
+  // by a stub that refuses, whichever build is underneath: what is under test
+  // is what the PANE does with `ok: false`, not what any one call answers.
+  inspect.setCasApi(stubCas);
+  await settle(5);
+  click(ops().find((b) => b.dataset.op === 'eval'));
+  await settle(10);
+  const last = inspect.cas().log[inspect.cas().log.length - 1];
+  ok('a CAS refusal is kept and shown', !!last.error && !last.output,
+     JSON.stringify(last));
+  ok('the entry says so on its face',
+     items()[items().length - 1].classList.contains('is-error') &&
+     items()[items().length - 1].querySelector('.casitem__err') !== null);
+  ok('and a refused result offers nothing to insert',
+     items()[items().length - 1].querySelector('.casitem__use').hidden);
+
+  click($('compute-clear'));
+  await settle(5);
+  ok('the history can be emptied', items().length === 0 && inspect.cas().log.length === 0);
+
+  ok('the compute route is remembered too',
+     localStorage.getItem('numpla.route') === 'compute',
+     String(localStorage.getItem('numpla.route')));
+
+  // -- and what happens when the build has none of the calls ---------------
+  inspect.setCasApi(false);
+  await settle(5);
+  ok('losing the calls does not strand you in a dead pane',
+     inspect.route() === 'solve', inspect.route());
+  ok('the Compute card goes back to unavailable',
+     $('choice-compute').getAttribute('aria-disabled') === 'true');
+  ok('and it names the calls it wants',
+     /cas_simplify/.test($('choice-compute-why').textContent),
+     $('choice-compute-why').textContent.slice(0, 80));
+
+  click($('home-btn'));
+  await settle(5);
+  click($('choice-compute'));
+  await settle(5);
+  ok('and the card cannot be pressed into a dead pane',
+     inspect.route() === 'chooser', inspect.route());
+
+  // Back to a working state for whatever comes next.
+  inspect.setCasApi(real ? null : stubCas);
+  click($('choice-solve'));
+  await settle(10);
+  ok('and back to solve & simulate', inspect.route() === 'solve');
+  inspect.setCasApi(null);
 }
 
 // ---------------------------------------------------------------------------

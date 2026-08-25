@@ -7,3 +7,4 @@ repository.workspace = true
 description = "Numpla: cas"
 
 [dependencies]
+numpla-expr.workspace = true

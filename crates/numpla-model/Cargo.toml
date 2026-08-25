@@ -7,6 +7,7 @@ repository.workspace = true
 description = "Numpla: model - text rows to an integrated solution"
 
 [dependencies]
+numpla-cas.workspace = true
 numpla-expr.workspace = true
 numpla-noise.workspace = true
 numpla-ode.workspace = true

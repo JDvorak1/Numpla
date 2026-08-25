@@ -2265,6 +2265,180 @@ function tap(f, x = 0, y = 0, move = 0) {
 }
 
 // ---------------------------------------------------------------------------
+// 23. Leibniz notation
+//
+// `dx/dt = -y` is `x' = -y`, `d2x/dt2` is `x''`, and `df/dx` differentiates
+// along `x`. It is a fraction - it parses to one, renders stacked as one - and
+// only its source spelling differs, because `(dx)/(dt) = -y` is a quotient the
+// engine rejects. See docs/wasm-api.md.
+// ---------------------------------------------------------------------------
+
+roundTrip('dx/dt = -y');
+roundTrip('dy/dt = x');
+roundTrip('d2x/dt2 = -x');
+roundTrip('d^2x/dt^2 = -x');
+roundTrip('d2x/dt^2 = -x');
+roundTrip('df/dx = 2x');
+roundTrip('dr/dq = -ksin(kq)');
+roundTrip('ds/dt = -bsi');
+roundTrip('dx_1/dt = -y_1');
+roundTrip('dx/dt = -y # released from rest');
+roundTrip('dx/dt = ax - y - x(x^(2) + y^(2))');
+
+{
+  const m = new MathModel('dx/dt = -y');
+  eq('a Leibniz row is a fraction, like the notation it is',
+    m.root.map((a) => a.type).join(','), 'frac,op,op,var');
+  eq('with the differential in the numerator', toSource(m.root[0].num), 'dx');
+  eq('and the independent variable in the denominator', toSource(m.root[0].den), 'dt');
+  eq('so it typesets as one', m.latex, '\\frac{dx}{dt}=-y');
+  eq('and it is emitted the way the engine reads it', m.source, 'dx/dt = -y');
+
+  const o = new MathModel('d^2x/dt^2 = -x');
+  eq('the caret spelling carries a real superscript',
+    o.root[0].num.map((a) => a.type).join(','), 'var,sup,var');
+  eq('on both halves', o.root[0].den.map((a) => a.type).join(','), 'var,var,sup');
+  eq('and comes back with bare orders, not ^(2), which the engine rejects',
+    o.source, 'd^2x/dt^2 = -x');
+
+  const d = new MathModel('d2x/dt2 = -w^2 x');
+  eq('the digit spelling is left digits', d.source, 'd2x/dt2 = -w^(2)x');
+}
+
+{
+  // `d` is still an ordinary name. The notation is recognised only when it
+  // spans the whole left-hand side of an `=`.
+  eq('a parameter called d is a parameter', new MathModel('d = 0.25').source, 'd = 0.25');
+  eq('and d as a coefficient stays one',
+    new MathModel("y' = -c y + d x y").source, "y' = -cy + dxy");
+  eq('a derivative inside an expression is the arithmetic it always was',
+    new MathModel('x = dx/dt').source, 'x = (dx)/(d)t');
+  eq('and one with no = at all is too',
+    new MathModel('dx/dt').source, '(dx)/(d)t');
+  eq('a two-letter numerator is not a derivative - the engine says so too',
+    new MathModel('dxy/dt = 1').source, '(dxy)/(d)t = 1');
+  eq('nor is a fraction that merely starts with d',
+    new MathModel('d/dt = 1').source, '(d)/(d)t = 1');
+  eq('an ordinary quotient on the left is untouched',
+    new MathModel('x/2 = 3').source, '(x)/(2) = 3');
+  eq('and so is a row that has no = of its own',
+    new MathModel('dx/dt + 1').source, '(dx)/(d)t + 1');
+}
+
+{
+  // Spelling is normalised the way every other spelling is, and each result is
+  // a fixed point.
+  const same = (from, to) => {
+    eq('normalises ' + JSON.stringify(from), new MathModel(from).source, to);
+    eq('and that is stable', new MathModel(to).source, to);
+  };
+  same('d x / d t = 1', 'dx/dt = 1');
+  same('dx / dt = 1', 'dx/dt = 1');
+  same('dx/dt=-y', 'dx/dt = -y');
+  same('dx_{1}/dt = 1', 'dx_1/dt = 1');
+  same('d 2 x / d t 2 = 1', 'd2x/dt2 = 1');
+  // The spelling the field used to produce, read back: it becomes the one the
+  // engine accepts rather than staying broken.
+  same('(dx)/(dt) = -y', 'dx/dt = -y');
+  // Mismatched orders are a derivative the engine reports, not arithmetic, so
+  // the row is kept as written and the diagnostic is the engine's to give.
+  same('d2x/dt = -x', 'd2x/dt = -x');
+  same('dx/dt2 = -x', 'dx/dt2 = -x');
+}
+
+{
+  // Typing it. `/` opens a fraction, which is right here as well as everywhere
+  // else; `=` steps out of the structure it is in, because a row has one level.
+  const typedRow = (text) => { const m = new MathModel(); m.type(text); return m.source; };
+  eq('typed straight through', typedRow('dx/dt=-y'), 'dx/dt = -y');
+  eq('second order, typed', typedRow('d2x/dt2=-x'), 'd2x/dt2 = -x');
+  eq('an integral, typed', typedRow('df/dx=2x'), 'df/dx = 2x');
+  eq('and the same rule fixes an ordinary fraction row', typedRow('x/2=3'), '(x)/(2) = 3');
+  eq('and an exponent row', typedRow('x^2=3'), 'x^(2) = 3');
+  eq('and a subscript row', typedRow('k_1=2'), 'k_1 = 2');
+  eq('a row with no structure is unaffected', typedRow('a+b=c'), 'a + b = c');
+
+  const m = new MathModel();
+  m.type('dx/dt');
+  eq('before the = it is an ordinary fraction, and says so', m.source, '(dx)/(dt)');
+  eq('with the caret still in the denominator', m.st.path.length, 1);
+  m.type('=');
+  eq('the = leaves the denominator behind', m.source, 'dx/dt = ');
+  eq('and lands at row level', m.st.path.length, 0);
+  eq('just after the fraction', m.st.index, 2);
+  m.type('-y');
+  eq('and the row finishes normally', m.source, 'dx/dt = -y');
+}
+
+{
+  // The two input paths agree, as they must - they are one path.
+  const keys = new MathField(new ShimEl('div'), { value: '' });
+  keys.focus();
+  for (const ch of 'dx/dt=-y') press(keys, ch);
+  const api = new MathField(new ShimEl('div'), { value: '' });
+  api.focus();
+  api.insert('dx/dt=-y');
+  const cmd = new MathField(new ShimEl('div'), { value: '' });
+  cmd.focus();
+  cmd.insert('dx');
+  cmd.command('frac');
+  cmd.insert('dt');
+  cmd.insert('=-y');
+  eq('the key handler types a Leibniz row', keys.source, 'dx/dt = -y');
+  eq('insert() types the same row', api.source, keys.source);
+  eq('the keyboard frac key types the same row', cmd.source, keys.source);
+  eq('and leaves the caret in the same place', caretOf(cmd), caretOf(keys));
+  const cls = keys.el.classes().join(' ');
+  ok('it renders as a stacked fraction, which is what the notation is',
+    cls.includes('mf-frac'));
+  ok('with a numerator and a denominator',
+    cls.includes('mf-num') && cls.includes('mf-den'));
+  keys.destroy();
+  api.destroy();
+  cmd.destroy();
+}
+
+{
+  // And the engine agrees: every spelling the field emits compiles.
+  let wasm = null;
+  try {
+    const fs = await import('node:fs');
+    wasm = await import('./pkg/numpla_wasm.js');
+    wasm.initSync({
+      module: fs.readFileSync(new URL('./pkg/numpla_wasm_bg.wasm', import.meta.url)),
+    });
+  } catch (e) {
+    wasm = null;
+  }
+  if (!wasm) {
+    console.warn('  note: no WASM build found, the Leibniz semantic check was skipped');
+  } else {
+    const compile = (src) => JSON.parse(new wasm.Model().set_source(src));
+    const cases = [
+      ['dx/dt = -y\ndy/dt = x', 'x,y', 't'],
+      ['d2x/dt2 = -x', "x,x'", 't'],
+      ['d^2x/dt^2 = -x', "x,x'", 't'],
+      ['df/dx = 2x\nf(0) = 0', 'f', 'x'],
+      ['dr/dq = -k sin(kq)\nr(0) = 1\nk = 3', 'r', 'q'],
+      ['dx_1/dt = -y_1\ndy_1/dt = x_1', 'x_1,y_1', 't'],
+    ];
+    for (const [src, states, independent] of cases) {
+      const rebuilt = src.split('\n').map((l) => new MathModel(l).source).join('\n');
+      const out = compile(rebuilt);
+      const errs = out.issues.filter((i) => i.severity === 'error');
+      ok('the engine accepts what the field emits for ' + JSON.stringify(src),
+        errs.length === 0, rebuilt + ' -> ' + JSON.stringify(errs));
+      eq('and reads the same states from it', out.states.join(','), states);
+      eq('and the same independent variable', out.independent, independent);
+    }
+    // The old, broken output, for the record: this is what was being sent.
+    const broken = compile('(dx)/(d)t = -y');
+    ok('the spelling the field used to emit really was rejected',
+      broken.issues.some((i) => i.severity === 'error'));
+  }
+}
+
+// ---------------------------------------------------------------------------
 
 console.log((failed ? 'FAILED  ' : 'ok  ') + passed + ' passed, ' + failed + ' failed');
 process.exit(failed ? 1 : 0);

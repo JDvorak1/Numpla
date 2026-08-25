@@ -9,7 +9,8 @@
 use std::collections::{BTreeSet, HashMap};
 
 use numpla_expr::{
-    deriv_key, eval, parse, parse_with, Env, EvalError, Expr, FuncNames, ParseError, Stmt, Value,
+    deriv_key, eval, parse_row, parse_row_with, Env, EvalError, Expr, FuncNames, ParsedRow, Stmt,
+    Value,
 };
 
 use crate::report::{Diagnostics, Fix, Issue, Severity};
@@ -42,7 +43,7 @@ pub struct Derived {
 
 /// A compiled document: the state vector, its initial values, and the
 /// environment every right-hand side is evaluated against.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Document {
     pub states: Vec<String>,
     pub params: Vec<String>,
@@ -54,6 +55,38 @@ pub struct Document {
     /// Constants and user functions. States are *not* bound here; the solver
     /// writes them in on every call.
     pub env: Env,
+    /// What the rows differentiate *with respect to* — the `t` of `dx/dt`, the
+    /// `x` of `df/dx`.
+    ///
+    /// This is a name, not a convention: it is the environment key the solver
+    /// binds its parameter to on every right-hand-side call, the name a row may
+    /// legitimately read, and the label the horizontal axis deserves. A
+    /// document of `x' = ...` rows never says, so it gets `t`; a document that
+    /// writes `df/dx = 2x` is integrating along `x` and everything downstream
+    /// has to agree, or the row would be reading a name nothing binds.
+    ///
+    /// One per document. See [`resolve_independent`] for why two is an error
+    /// rather than something to pick a winner from.
+    pub independent: String,
+}
+
+/// `t` unless a row says otherwise — the same default an empty document gets
+/// from [`compile`], written once so the two cannot drift apart.
+pub const DEFAULT_INDEPENDENT: &str = "t";
+
+impl Default for Document {
+    fn default() -> Document {
+        Document {
+            states: Vec::new(),
+            params: Vec::new(),
+            derived: Vec::new(),
+            issues: Vec::new(),
+            y0: Vec::new(),
+            rhs: Vec::new(),
+            env: Env::default(),
+            independent: DEFAULT_INDEPENDENT.to_string(),
+        }
+    }
 }
 
 impl Document {
@@ -97,6 +130,7 @@ impl Document {
             states: self.states.clone(),
             params: self.params.clone(),
             derived: self.derived.iter().map(|d| d.name.clone()).collect(),
+            independent: self.independent.clone(),
             issues: self.issues.clone(),
         }
     }
@@ -284,6 +318,9 @@ struct Row {
     /// A stable handle for the row, used to name the random call sites inside
     /// it. See [`resolve_random_sites`].
     key: String,
+    /// The independent variable this row named, if it was written in Leibniz
+    /// notation. `None` for `x' = ...` and for every non-ODE row.
+    indep: Option<String>,
 }
 
 pub fn compile(src: &str) -> Document {
@@ -291,7 +328,9 @@ pub fn compile(src: &str) -> Document {
     let mut rows = read_rows(src, &mut doc.issues);
     resolve_random_sites(&mut rows, doc.env.noise_seed);
 
+    doc.independent = resolve_independent(&rows, &mut doc.issues);
     let states = declare_states(&rows, &mut doc);
+    reject_independent_that_is_also_a_state(&rows, &mut doc);
     let derived_rows = bind_assignments(&rows, &mut doc);
     let stated = apply_initial_conditions(&rows, &mut doc);
     report_missing_initial_conditions(&rows, &states, &stated, &mut doc);
@@ -337,11 +376,11 @@ fn read_rows(src: &str, issues: &mut Vec<Issue>) -> Vec<Row> {
         .filter(|(_, c)| !c.trim().is_empty())
         .collect();
 
-    let mut parsed: Vec<(Stmt, Vec<ParseError>)> = code.iter().map(|(_, c)| parse(c)).collect();
+    let mut parsed: Vec<ParsedRow> = code.iter().map(|(_, c)| parse_row(c)).collect();
 
     let funcs: FuncNames = parsed
         .iter()
-        .filter_map(|(stmt, _)| match stmt {
+        .filter_map(|r| match &r.stmt {
             // A row with parameters. `x(0) = 1` reaches us as an equation
             // rather than an assignment, so an initial condition cannot be
             // mistaken for a function definition here.
@@ -351,11 +390,12 @@ fn read_rows(src: &str, issues: &mut Vec<Issue>) -> Vec<Row> {
         .collect();
 
     if !funcs.is_empty() {
-        parsed = code.iter().map(|(_, c)| parse_with(c, &funcs)).collect();
+        parsed = code.iter().map(|(_, c)| parse_row_with(c, &funcs)).collect();
     }
 
     let mut rows = Vec::with_capacity(parsed.len());
-    for ((line, code), (stmt, errors)) in code.into_iter().zip(parsed) {
+    for ((line, code), row) in code.into_iter().zip(parsed) {
+        let ParsedRow { stmt, errors, indep } = row;
         let hole = stmt_has_hole(&stmt);
         for e in errors {
             issues.push(Issue::new(
@@ -378,6 +418,7 @@ fn read_rows(src: &str, issues: &mut Vec<Issue>) -> Vec<Row> {
             key: row_key(&stmt, code),
             stmt,
             hole,
+            indep,
         });
     }
     rows
@@ -395,6 +436,92 @@ fn row_key(stmt: &Stmt, code: &str) -> String {
         Stmt::Ode { name, order, .. } => deriv_key(name, *order),
         Stmt::Equation { .. } | Stmt::Expr(_) => code.trim().to_string(),
     }
+}
+
+/// Pass 0: what the document differentiates with respect to.
+///
+/// A row written `dx/dt = ...` asserts that the independent variable is `t`;
+/// `df/dx = ...` asserts it is `x`; `x' = ...` asserts nothing and goes along
+/// with whatever the rest of the document said. With no assertion at all the
+/// answer is [`DEFAULT_INDEPENDENT`], which is what every document written
+/// before this notation existed gets, so nothing about them changes.
+///
+/// # Why disagreement is an error rather than a choice
+///
+/// `dx/dt = -y` beside `dy/ds = x` is not a system. There is one solver
+/// parameter and one horizontal axis, so picking the first row's answer would
+/// integrate the second row along a variable it never mentions and label the
+/// plot with a name half the document disagrees with — a plausible curve of
+/// something nobody wrote, which is the failure mode this codebase reports
+/// rather than smooths over. Both rows are named, in both directions, because
+/// neither is the wrong one: the document has to choose.
+fn resolve_independent(rows: &[Row], issues: &mut Vec<Issue>) -> String {
+    let named: Vec<&Row> = rows.iter().filter(|r| r.indep.is_some()).collect();
+    let Some(first) = named.first() else {
+        return DEFAULT_INDEPENDENT.to_string();
+    };
+    let agreed = first.indep.clone().unwrap_or_default();
+
+    let mut disagreed = false;
+    for row in named.iter().skip(1) {
+        let other = row.indep.clone().unwrap_or_default();
+        if other == agreed {
+            continue;
+        }
+        disagreed = true;
+        issues.push(row.issue(Severity::Error, mixed(first, &agreed, row, &other)));
+    }
+    if disagreed {
+        // The first row is as much part of the disagreement as the others, and
+        // it is the one a person is most likely to want to change, so it is
+        // underlined too rather than being treated as the winner.
+        let (row, other) = named
+            .iter()
+            .skip(1)
+            .map(|r| (*r, r.indep.clone().unwrap_or_default()))
+            .find(|(_, o)| *o != agreed)
+            .expect("disagreed means one exists");
+        issues.push(first.issue(Severity::Error, mixed(first, &agreed, row, &other)));
+    }
+    agreed
+}
+
+/// The sentence both halves of a mixed document get, naming both rows so the
+/// person can see the pair without hunting for the other one.
+fn mixed(a: &Row, a_name: &str, b: &Row, b_name: &str) -> String {
+    format!(
+        "line {} differentiates by {} and line {} by {} — a document has one independent variable",
+        a.line + 1,
+        a_name,
+        b.line + 1,
+        b_name
+    )
+}
+
+/// A name cannot be both the thing being integrated and the thing it is
+/// integrated against.
+///
+/// `dx/dx = 1` is the shape. Left alone it would bind `x` twice per
+/// right-hand-side call — once as the solver's parameter, once as the state —
+/// and the second write would win silently, which is a different equation
+/// wearing the same text. Reported on the row that introduced the clash.
+fn reject_independent_that_is_also_a_state(rows: &[Row], doc: &mut Document) {
+    if !doc.states.contains(&doc.independent) {
+        return;
+    }
+    let Some(row) = rows.iter().find(|r| match &r.stmt {
+        Stmt::Ode { name, .. } => *name == doc.independent,
+        _ => false,
+    }) else {
+        return;
+    };
+    doc.issues.push(row.issue(
+        Severity::Error,
+        format!(
+            "{} is the independent variable, so it cannot also be a state",
+            doc.independent
+        ),
+    ));
 }
 
 /// Which rows the states came from.
@@ -505,10 +632,11 @@ fn bind_assignments(rows: &[Row], doc: &mut Document) -> Vec<usize> {
     // defined further down the document, and the classification has to see
     // every definition before it can follow one.
     //
-    // `t` counts as a solution name: `drive = sin(t)` has no value until there
-    // is a time to evaluate it at, exactly like a row reading a state.
+    // The independent variable counts as a solution name: `drive = sin(t)` has
+    // no value until there is a time to evaluate it at, exactly like a row
+    // reading a state.
     let mut solution_names: BTreeSet<String> = doc.states.iter().cloned().collect();
-    solution_names.insert("t".to_string());
+    solution_names.insert(doc.independent.clone());
 
     // Relaxed to a fixed point, because reading a derived row makes a row
     // derived in turn: `K = 0.5x'^2`, `U = 0.5x^2`, `E = K + U` is how anyone
@@ -628,7 +756,10 @@ fn apply_initial_conditions(rows: &[Row], doc: &mut Document) -> Vec<bool> {
         if *at != 0.0 {
             doc.issues.push(row.issue(
                 Severity::Error,
-                "initial conditions are only supported at t = 0".to_string(),
+                format!(
+                    "initial conditions are only supported at {} = 0",
+                    doc.independent
+                ),
             ));
             continue;
         }
@@ -749,7 +880,7 @@ fn probe_right_hand_sides(
         return;
     }
     let mut env = doc.env.clone();
-    env.set("t", 0.0);
+    env.set(&doc.independent, 0.0);
     for (name, v) in doc.states.iter().zip(&doc.y0) {
         env.set(name, *v);
     }

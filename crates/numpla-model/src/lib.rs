@@ -26,11 +26,13 @@
 //!    up is the most useful thing a long run can teach, so swapping integrators
 //!    is one argument and the answer never claims to be something it is not.
 
+pub mod cas;
 pub mod conserve;
 pub mod document;
 pub mod report;
 pub mod system;
 
+pub use cas::{CasReply, CasStep};
 pub use document::{Derived, Document, StateRhs};
 pub use report::{
     ConservationReport, Diagnostics, Drift, Fix, Issue, MethodJson, MethodsJson, Severity,
@@ -673,6 +675,38 @@ impl Model {
     /// the wire form.
     pub fn document(&self) -> &Document {
         &self.doc
+    }
+
+    // ---- the compute pane ------------------------------------------------
+    //
+    // Four calls, all `&self`: algebra reads the document and never disturbs
+    // it. That is stated in the signature rather than in a comment so the
+    // compiler keeps the promise — asking to differentiate something must never
+    // be able to throw away the curve on screen.
+    //
+    // Each returns `CasReply` as JSON. `output` is Numpla source that parses;
+    // see `cas` for the three decisions about what "the document's scope" means
+    // here, and `docs/wasm-api.md` for the wire shape.
+
+    /// Fold arithmetic, apply the identity and zero laws, collect like terms.
+    pub fn cas_simplify(&self, expr: &str) -> String {
+        to_json(&cas::simplify_expr(&self.doc, expr))
+    }
+
+    /// Differentiate with respect to `var`.
+    pub fn cas_diff(&self, expr: &str, var: &str) -> String {
+        to_json(&cas::diff_expr(&self.doc, expr, var))
+    }
+
+    /// Multiply out products over sums.
+    pub fn cas_expand(&self, expr: &str) -> String {
+        to_json(&cas::expand_expr(&self.doc, expr))
+    }
+
+    /// Evaluate to a number where the document gives enough to do so, and to
+    /// the simplified expression where it does not.
+    pub fn cas_eval(&self, expr: &str) -> String {
+        to_json(&cas::eval_expr(&self.doc, expr))
     }
 
     /// Everything downstream of a solution, dropped together.
@@ -2265,6 +2299,166 @@ mod tests {
         let m = solved("x' = 1", 0.0, 2.0);
         assert_eq!(m.eval(-5.0)[0], 0.0);
         assert!((m.eval(99.0)[0] - 2.0).abs() < 1e-9);
+    }
+
+    // --- Leibniz notation -------------------------------------------------
+
+    /// Every sample of one curve against every sample of the other. The claim
+    /// is not "equivalent notations" but *the same system*, and the only way
+    /// to say that about a differential equation is numerically.
+    fn same_trajectory(a: &str, b: &str, t1: f64) {
+        let (ma, mb) = (solved(a, 0.0, t1), solved(b, 0.0, t1));
+        let (sa, sb) = (ma.sample(200), mb.sample(200));
+        assert_eq!(sa.len(), sb.len(), "different shapes:
+{}
+{}", a, b);
+        assert!(!sa.is_empty());
+        for (i, (x, y)) in sa.iter().zip(&sb).enumerate() {
+            assert_eq!(x.to_bits(), y.to_bits(), "sample {} of
+{}
+{}", i, a, b);
+        }
+    }
+
+    #[test]
+    fn a_leibniz_row_integrates_exactly_as_its_primed_twin_does() {
+        same_trajectory(
+            "dx/dt = -y
+dy/dt = x
+x(0) = 1
+y(0) = 0",
+            "x' = -y
+y' = x
+x(0) = 1
+y(0) = 0",
+            std::f64::consts::TAU,
+        );
+    }
+
+    #[test]
+    fn a_second_order_leibniz_row_integrates_exactly_as_its_primed_twin_does() {
+        for leibniz in ["d2x/dt2 = -x - 0.4x'", "d^2x/dt^2 = -x - 0.4x'"] {
+            same_trajectory(
+                &format!("{}
+x(0) = 1
+x'(0) = 0", leibniz),
+                "x'' = -x - 0.4x'
+x(0) = 1
+x'(0) = 0",
+                12.0,
+            );
+        }
+    }
+
+    /// The reason this is more than sugar. `df/dx = 2x` with `f(0) = 0` is how
+    /// you write an integral in a tool that solves differential equations, and
+    /// the answer had better be `x^2`.
+    #[test]
+    fn an_integral_written_as_a_differential_equation_gives_the_closed_form() {
+        let mut m = solved("df/dx = 2x
+f(0) = 0
+E = f - x^2", 0.0, 3.0);
+        assert_eq!(m.document().independent, "x");
+        assert_eq!(m.document().states, vec!["f".to_string()]);
+        for x in [0.5, 1.0, 2.0, 2.75, 3.0] {
+            let f = m.eval(x)[0];
+            assert!((f - x * x).abs() < 1e-8, "f({}) = {}", x, f);
+        }
+        // The residual is a derived row reading the independent variable under
+        // its own name, so the monitor has to bind `x` too — and it is flat at
+        // zero exactly when the whole chain agrees on what `x` means.
+        let c = m.conservation("E", 0);
+        assert!(c.ok, "{:?}", c.error);
+        assert!(c.drift.max_abs_deviation < 1e-8, "{:?}", c.drift);
+    }
+
+    /// The independent variable is a name the solver binds, so a row is
+    /// entitled to read it — under whatever name the document chose.
+    #[test]
+    fn the_independent_variable_is_readable_inside_a_right_hand_side() {
+        // `t` when `t` is what the document differentiates by.
+        let m = solved("x' = t", 0.0, 2.0);
+        assert!((m.eval(2.0)[0] - 2.0).abs() < 1e-9);
+        // and `s` when it is not, integrating s -> s^2/2.
+        let m = solved("dx/ds = s", 0.0, 2.0);
+        assert_eq!(m.document().independent, "s");
+        assert!((m.eval(2.0)[0] - 2.0).abs() < 1e-9);
+    }
+
+    /// One document, one horizontal axis. Neither row is the wrong one, so
+    /// both are underlined and both sentences name the pair.
+    #[test]
+    fn mixing_independent_variables_is_an_error_naming_both_rows() {
+        let errs = errors_on("dx/dt = -y
+dy/ds = x");
+        assert_eq!(errs.len(), 2, "{:?}", errs);
+        let lines: Vec<usize> = errs.iter().map(|i| i.line).collect();
+        assert_eq!(lines, vec![0, 1], "{:?}", errs);
+        for e in &errs {
+            assert!(e.message.contains("line 1"), "{:?}", e);
+            assert!(e.message.contains("line 2"), "{:?}", e);
+            assert!(e.message.contains(" t "), "{:?}", e);
+            assert!(e.message.contains(" s "), "{:?}", e);
+        }
+        // Agreement is not a disagreement, however many rows agree.
+        assert!(errors_on("dx/dt = -y
+dy/dt = x").is_empty());
+        // A prime asserts nothing, so it never conflicts with anything.
+        assert!(errors_on("df/dx = 2y
+y' = 1").is_empty());
+    }
+
+    /// The predator-prey demo's `d` is a predation rate, and it stays one. If
+    /// the notation reached past the left of an `=`, `d x y` would change
+    /// meaning and the model would quietly become a different one.
+    #[test]
+    fn d_is_still_an_ordinary_parameter() {
+        let src = "a = 1
+b = 0.5
+c = 0.75
+d = 0.25
+                   x' = a x - b x y
+y' = -c y + d x y
+x(0) = 6
+y(0) = 2";
+        let diag = Model::new().set_source(src);
+        assert!(diag.params.contains(&"d".to_string()), "{:?}", diag.params);
+        assert_eq!(diag.independent, "t");
+        assert!(diag.issues.is_empty(), "{:?}", diag.issues);
+        // The same system with the parameter spelled `p` must integrate to the
+        // same numbers, which is only true if `d` was read as a coefficient.
+        same_trajectory(src, &src.replace('d', "p"), 12.0);
+    }
+
+    /// Both spellings of the superscript, and the notation left alone in the
+    /// one place it would have to guess.
+    #[test]
+    fn superscripts_and_non_rows() {
+        // A mismatched pair is a slip of the pen and is told so.
+        let errs = errors_on("d2x/dt = -x");
+        assert_eq!(errs.len(), 1, "{:?}", errs);
+        assert!(errs[0].message.contains("d2x/dt"), "{:?}", errs);
+        // Third order is not supported, and says so under either spelling.
+        assert!(!errors_on("d3x/dt3 = -x").is_empty());
+        // A name cannot be integrated against itself.
+        let errs = errors_on("dx/dx = 1");
+        assert_eq!(errs.len(), 1, "{:?}", errs);
+        assert!(errs[0].message.contains("independent variable"), "{:?}", errs);
+    }
+
+    #[test]
+    fn the_independent_variable_reaches_the_wire() {
+        let json = Model::new().set_source_json("df/dx = 2x
+f(0) = 0");
+        assert!(json.contains(r#""independent":"x""#), "{}", json);
+        // A document that never says gets the default, spelled out rather than
+        // left for the shell to assume.
+        let json = Model::new().set_source_json("x' = -y
+y' = x");
+        assert!(json.contains(r#""independent":"t""#), "{}", json);
+        // Including an empty one, so the axis has a label before the first row.
+        let json = Model::new().set_source_json("");
+        assert!(json.contains(r#""independent":"t""#), "{}", json);
     }
 
     #[test]

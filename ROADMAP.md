@@ -100,11 +100,30 @@ idea-generation engine.
 - Save-file format for telemetry/results
 - Hear panel (hover -> Other -> Hear -> bounds -> Listen -> exit)
 
-## M9 — CAS pane  (`numpla-cas`)
+## M9 — CAS pane  (`numpla-cas`)  (built, in its honest scope)
 
-- e-graph rewriting (`egg`) for simplify/expand/factor
-- Symbolic diff/integrate, limits
-- Dual-engine solve: algebraic first, numeric search fallback, results labeled
+Brought forward by v6: the start screen offers "compute" beside "solve &
+simulate", so the pane had to be real before the rest of the milestone.
+
+- [x] `simplify` — arithmetic folding, identity and zero laws, like terms,
+      canonical ordering of commutative operands
+- [x] `diff` — sum, product, quotient, chain and power rules (including
+      `x^x`), and every builtin `numpla-expr` can evaluate
+- [x] `expand` — products over sums, small integer powers of sums
+- [x] `subs` and numeric evaluation, with the document's functions and
+      parameter values in scope
+- [x] The property test that makes it trustworthy: every rewrite is evaluated
+      before and after at many pseudo-random points, every result round-trips
+      through the parser, and every symbolic derivative is checked against a
+      Richardson-extrapolated central difference
+- [x] `cas_simplify` / `cas_diff` / `cas_expand` / `cas_eval` across the WASM
+      boundary — see `docs/wasm-api.md`
+
+Deliberately **not** built, and there is no function to call for any of them:
+symbolic integration, equation solving, limits, series, symbolic matrices. The
+reasons are in the `numpla-cas` crate docs. Hand-written rewriting rather than
+e-graphs (`egg`), because the crate depends only on `numpla-expr` — an external
+rewriting engine would be a second, unverified notion of what an expression is.
 
 ## M10 — Data & export
 
@@ -190,6 +209,6 @@ Fixed:
 | `numpla-autodiff` | forward + reverse mode over the AST |
 | `numpla-linalg` | matrices whose entries are functions of coordinates |
 | `numpla-ode` | integrators, telemetry, events |
-| `numpla-cas` | e-graph rewriting, symbolic calculus, dual-engine solve |
+| `numpla-cas` | simplify, differentiate, expand, substitute — value-preserving by test |
 | `numpla-plot` | GPU rendering primitives |
 | `numpla-wasm` | wasm-bindgen boundary (thin; no logic) |

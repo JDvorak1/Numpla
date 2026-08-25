@@ -101,7 +101,7 @@ impl Issue {
 }
 
 /// What `set_source` answers with.
-#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Diagnostics {
     /// State vector order. `states.len()` is the dimension of everything the
     /// solver returns, so the shell can label columns without asking again.
@@ -113,7 +113,29 @@ pub struct Diagnostics {
     /// the shell can offer this list directly as the monitor's menu instead of
     /// asking the user to spell a name twice.
     pub derived: Vec<String>,
+    /// What the document differentiates with respect to — the `t` of `dx/dt`,
+    /// the `x` of `df/dx`, and `"t"` for a document of `x' = ...` rows that
+    /// never said.
+    ///
+    /// On the wire because the shell cannot work it out: it is the name the
+    /// solver binds on every step, the name a right-hand side may read, and
+    /// therefore the only honest label for the horizontal axis. A document
+    /// integrating `df/dx = 2x` is drawing `f` against `x`, and a plot captioned
+    /// `t` would be describing a different picture.
+    pub independent: String,
     pub issues: Vec<Issue>,
+}
+
+impl Default for Diagnostics {
+    fn default() -> Diagnostics {
+        Diagnostics {
+            states: Vec::new(),
+            params: Vec::new(),
+            derived: Vec::new(),
+            independent: crate::document::DEFAULT_INDEPENDENT.to_string(),
+            issues: Vec::new(),
+        }
+    }
 }
 
 /// Why an integration ended before it reached `t1`.

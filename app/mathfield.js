@@ -286,6 +286,18 @@ function exitLeft(st) {
   return true;
 }
 
+/**
+ * Step all the way out of whatever structures the caret is in, to the position
+ * just after the outermost one. Only `=` uses this - see typeChar().
+ */
+function exitToRow(st) {
+  while (st.path.length) {
+    const [at] = st.path[st.path.length - 1];
+    st.path.pop();
+    st.index = at + 1;
+  }
+}
+
 export function moveRight(st) {
   const L = curList(st);
   if (st.index < L.length) {
@@ -573,7 +585,18 @@ export function typeChar(st, ch) {
       insert(st, [A.op(ch)]);
       return true;
     }
-    case '+': case '-': case '*': case '=':
+    case '=':
+      // A row is `left = right`, and it has exactly one level: `=` is never
+      // meaningful inside a numerator, an exponent or a radicand. So typing one
+      // steps out of whatever structure the caret is in and lands it at row
+      // level, which is the only place the language accepts it. Without this,
+      // `dx/dt = -y` typed straight through puts the `=` in the denominator -
+      // and so do `x/2 = 3` and `x^2 = 3`. It is the same rule the parser
+      // already applies when it reads a row back.
+      exitToRow(st);
+      insert(st, [A.op(ch)]);
+      return true;
+    case '+': case '-': case '*':
       insert(st, [A.op(ch)]); return true;
     default:
       return false;
@@ -721,16 +744,91 @@ function needsWordGap(out, name) {
   return WORDS.some((w) => w.length > name.length && run.endsWith(w));
 }
 
+// ---------------------------------------------------------------------------
+// Leibniz notation
+//
+// `dx/dt = -y` is the same row as `x' = -y`, and `d2x/dt2` (or `d^2x/dt^2`) the
+// same as `x''`; the denominator additionally names the document's independent
+// variable, which is what makes `df/dx = 2x` an integral along `x`. See
+// docs/wasm-api.md, "Leibniz notation, and the independent variable".
+//
+// The engine recognises it only when it spans the *whole* left-hand side of an
+// `=`, so that `d = 0.25` stays a parameter and `y' = -c y + d x y` keeps `d`
+// as a coefficient. The field mirrors that rule exactly, in one regex used by
+// both halves of the round trip: the parser recognises a Leibniz left-hand side
+// only where the serialiser will emit one, which is what keeps the two stable
+// against each other.
+//
+// It is still a fraction. It parses to a `frac` atom, renders stacked with a
+// rule between the two halves - which is how the notation is written, and the
+// reason not to invent a new atom type for it - and only its *source* differs:
+// `dx/dt`, not `(dx)/(dt)`, because that is the spelling the engine accepts.
+// ---------------------------------------------------------------------------
+
+/** A state's name: one letter, optionally subscripted. `dxy/dt` is not one. */
+const LEIB_NAME = String.raw`[A-Za-z](?:_[A-Za-z0-9]+|_\{[A-Za-z0-9]*\})?`;
+/** The order of the derivative, in either spelling: `d2x/dt2`, `d^2x/dt^2`. */
+const LEIB_ORDER = String.raw`(?:\^\s*\d+|\d+)`;
+
+/**
+ * A whole Leibniz left-hand side. Whitespace is irrelevant (`d x / d t` is the
+ * same row), and the two orders are matched independently: `d2x/dt` is a
+ * derivative the engine reports as mismatched, not arithmetic, so the field
+ * keeps it as written rather than rewriting it into something else.
+ */
+const LEIBNIZ_LHS = new RegExp(String.raw
+  `^\s*d\s*${LEIB_ORDER}?\s*${LEIB_NAME}\s*/\s*d\s*${LEIB_NAME}\s*${LEIB_ORDER}?\s*$`);
+
 function subSource(sub, next) {
   if (!sub) return '';
-  const inner = toSource(sub, true);
+  const inner = toSource(sub, true, false);
   // Numpla's lexer reads a braceless subscript as a run of alphanumerics, so a
   // bare `_1` is only safe when the next atom cannot extend it.
   if (/^[A-Za-z0-9]+$/.test(inner) && !alnumStart(next)) return '_' + inner;
   return '_{' + inner + '}';
 }
 
-export function toSource(list, inSub = false) {
+/**
+ * One half of a Leibniz derivative as source text, or null when this list holds
+ * something a derivative cannot. Only names, digits and a bare `^n` appear in
+ * `d2x` or `dt^2`, and the order has to be written `^2` rather than `^(2)`:
+ * the engine reads the first and rejects the second.
+ */
+function leibnizHalf(list) {
+  let out = '';
+  for (let i = 0; i < list.length; i++) {
+    const a = list[i];
+    if (a.type === 'var') { out += a.name + subSource(a.sub, list[i + 1]); continue; }
+    if (a.type === 'digit' && a.ch !== '.') { out += a.ch; continue; }
+    if (a.type === 'sup' && a.body.length
+      && a.body.every((b) => b.type === 'digit' && b.ch !== '.')) {
+      out += '^' + a.body.map((b) => b.ch).join('');
+      continue;
+    }
+    return null;
+  }
+  return out;
+}
+
+/**
+ * `dx/dt` when this fraction is a Leibniz derivative, null when it is an
+ * ordinary quotient. Whatever comes back is text the parser reads straight back
+ * into the same fraction - LEIBNIZ_LHS decides both.
+ */
+function leibnizSource(frac) {
+  const num = leibnizHalf(frac.num);
+  if (num == null) return null;
+  const den = leibnizHalf(frac.den);
+  if (den == null) return null;
+  const text = num + '/' + den;
+  return LEIBNIZ_LHS.test(text) ? text : null;
+}
+
+/**
+ * @param top true while serialising a whole row, which is the only place a
+ *   Leibniz derivative is one - see LEIBNIZ_LHS.
+ */
+export function toSource(list, inSub = false, top = true) {
   let out = '';
   for (let i = 0; i < list.length; i++) {
     const a = list[i];
@@ -757,10 +855,19 @@ export function toSource(list, inSub = false) {
         else if (a.ch === '*') out += '*';
         else out += ' ' + a.ch + ' ';
         break;
-      case 'frac': out += '(' + toSource(a.num) + ')/(' + toSource(a.den) + ')'; break;
-      case 'sup': out += '^(' + toSource(a.body) + ')'; break;
-      case 'sqrt': out += 'sqrt(' + toSource(a.body) + ')'; break;
-      case 'group': out += a.open + toSource(a.body) + a.close; break;
+      case 'frac': {
+        // A fraction that is the whole left-hand side of an `=` and reads as a
+        // derivative is written the way the engine reads it: `dx/dt = -y`,
+        // never `(dx)/(dt) = -y`, which it rejects.
+        const leib = top && i === 0 && next && next.type === 'op' && next.ch === '='
+          ? leibnizSource(a) : null;
+        out += leib != null ? leib
+          : '(' + toSource(a.num, false, false) + ')/(' + toSource(a.den, false, false) + ')';
+        break;
+      }
+      case 'sup': out += '^(' + toSource(a.body, false, false) + ')'; break;
+      case 'sqrt': out += 'sqrt(' + toSource(a.body, false, false) + ')'; break;
+      case 'group': out += a.open + toSource(a.body, false, false) + a.close; break;
       case 'text':
         // Byte for byte. The only shaping anywhere near a comment is the single
         // space that separates it from mathematics on the same row.
@@ -842,6 +949,27 @@ function longestWord(rest, table) {
  * (with `(x)` unwrapped back to `x`), which is what makes the round trip stable
  * and what lets a document loaded from disk render as proper notation.
  */
+/**
+ * A Leibniz derivative filling the whole left-hand side of an `=`, or null.
+ * The two halves are read by the ordinary parser, so `d2x` is the atoms `d`,
+ * `2`, `x` and `d^2x` carries a real superscript - a fraction of plain
+ * notation, which is exactly what it is.
+ *
+ * @returns { frac, at } where `at` is the index of the `=` to carry on from.
+ */
+function leibnizLead(s, funcs) {
+  const eq = s.indexOf('=');
+  if (eq === -1) return null;
+  const lhs = s.slice(0, eq);
+  if (!LEIBNIZ_LHS.test(lhs)) return null;
+  const slash = lhs.indexOf('/');
+  return {
+    frac: A.frac(parseSource(lhs.slice(0, slash), funcs),
+      parseSource(lhs.slice(slash + 1), funcs)),
+    at: eq,
+  };
+}
+
 export function parseSource(text, funcs = null) {
   const userFuncs = funcs instanceof Set ? funcs : normaliseFunctions(funcs);
   const raw = String(text == null ? '' : text);
@@ -991,7 +1119,13 @@ export function parseSource(text, funcs = null) {
     return out;
   }
 
-  return parseList('').concat(tail);
+  // A Leibniz left-hand side is taken whole, before the general parse gets to
+  // the `/` and builds an arithmetic quotient out of it. Everything from the
+  // `=` onwards is ordinary mathematics and is read as such.
+  const lead = leibnizLead(s, userFuncs);
+  if (lead) i = lead.at;
+  const body = parseList('');
+  return (lead ? [lead.frac].concat(body) : body).concat(tail);
 }
 
 // ---------------------------------------------------------------------------

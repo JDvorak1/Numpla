@@ -221,6 +221,7 @@ body.ready .loader {
    and the bottom bar is gone, so the workspace has that height. */
 .app {
   height: 100%;
+  position: relative;   /* the start screen sits over the second row */
   display: grid;
   grid-template-rows: var(--topbar-h) minmax(0, 1fr);
   overflow: hidden;
@@ -269,7 +270,26 @@ body.ready .workspace { animation: settle 700ms var(--ease) 340ms both; }
   overflow: hidden;
 }
 
-.brand { display: flex; align-items: baseline; gap: 10px; }
+/* The brand is a button - the way back to the start screen - so it has to
+   shed every default a <button> brings with it and keep looking like a mark. */
+.brand {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 4px 8px 4px 4px;
+  margin-left: -4px;
+  appearance: none;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+  flex: 0 0 auto;
+  transition: background-color 120ms var(--ease), border-color 120ms var(--ease);
+}
+.brand:hover { background: var(--paper-2); border-color: var(--line); }
+.brand:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .brand__mark { width: 20px; height: 20px; color: var(--accent); align-self: center; }
 
 .brand__name {
@@ -1808,3 +1828,391 @@ body.is-narrow .infobtn { min-width: 38px; min-height: 38px; }
     border-radius: var(--r);
   }
 }
+
+/* ============================================================
+   THE START SCREEN, AND THE TWO ROUTES
+
+   Numpla opens by asking which of two things you want. The
+   answer is a class on <body> - `route-chooser`, `route-solve`,
+   `route-compute` - and exactly one of the workspace and the
+   compute pane occupies the grid's second row at a time.
+
+   The chooser is NOT a second loading gate. It lives inside
+   the app shell, over the second row only, on the same ground
+   the loading screen paints, and it rises on the same easing
+   the workspace does - so the loader fades straight into it
+   and the top bar is already there when it arrives.
+   ============================================================ */
+
+/* The two document-level actions, kept together and pushed right. */
+.topacts {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+  flex: 0 0 auto;
+}
+.topacts .demosbtn { margin-left: 0; }
+
+.demosbtn--new .icon { width: 12px; height: 12px; }
+
+/* -- which pane owns the second row ------------------------- */
+
+.compute { display: none; }
+body.route-compute .workspace { display: none; }
+body.route-compute .compute {
+  grid-row: 2;
+  display: grid;
+  animation: settle 560ms var(--ease) 40ms both;
+}
+
+/* Nothing in the top bar acts on a document you have not chosen to open. */
+body.route-chooser .topacts,
+body.route-compute .topacts { display: none; }
+body.route-chooser .telemetry .stat,
+body.route-compute .telemetry .stat { display: none; }
+body.route-chooser .panetabs,
+body.route-compute .panetabs { display: none; }
+
+/* On a phone the top bar is already tight: the two actions keep their own
+   spacing and the telemetry keeps the auto margin it had. */
+body.is-narrow .topacts { margin-left: 0; gap: 4px; }
+body.is-narrow .brand { min-height: var(--tap); padding: 0 8px; margin-left: -8px; }
+
+/* Under the chooser the workspace keeps its box - the canvas is measured from
+   it, and coming back must not cost a re-measure - but it is inert and unseen. */
+body.route-chooser .workspace,
+body.route-chooser .compute { visibility: hidden; pointer-events: none; }
+
+/* -- the chooser itself ------------------------------------- */
+
+.chooser {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: var(--topbar-h);
+  bottom: 0;
+  z-index: 40;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  /* the loading screen's own ground, so the hand-off keeps the floor */
+  background:
+    radial-gradient(120% 90% at 50% 34%, #ffffff 0%, var(--paper-3) 70%);
+  opacity: 0;
+  visibility: hidden;
+  transform: scale(.988) translateY(8px);
+  transition:
+    opacity 380ms var(--ease),
+    transform 460ms var(--ease),
+    visibility 0s linear 380ms;
+}
+body.route-chooser .chooser {
+  opacity: 1;
+  visibility: visible;
+  transform: none;
+  transition-delay: 0s;
+}
+
+/* The same delay the workspace settles on, so the first arrival reads as one
+   continuous gesture out of the loader rather than as two screens. */
+body.ready.route-chooser .chooser__inner {
+  animation: settle 700ms var(--ease) 340ms both;
+}
+
+.chooser__inner { width: min(760px, 100%); text-align: center; }
+
+.chooser__lead {
+  margin: 0 0 22px;
+  font-family: var(--mono);
+  font-size: 13px;
+  letter-spacing: .16em;
+  color: var(--muted);
+}
+
+.chooser__cards {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+}
+
+.choice {
+  display: grid;
+  grid-template-rows: auto auto 1fr;
+  gap: 10px;
+  padding: 26px 22px 24px;
+  text-align: left;
+  appearance: none;
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  background: var(--paper);
+  box-shadow: var(--shadow-1);
+  font: inherit;
+  color: var(--text);
+  cursor: pointer;
+  transition: border-color 140ms var(--ease), box-shadow 180ms var(--ease),
+              transform 180ms var(--ease);
+}
+.choice:hover {
+  border-color: var(--accent-line);
+  box-shadow: var(--shadow-2);
+  transform: translateY(-2px);
+}
+.choice:active { transform: translateY(0); }
+.choice:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+
+.choice__mark { color: var(--accent); line-height: 0; }
+.choice__mark svg { width: 34px; height: 34px; }
+
+.choice__name {
+  font-family: var(--mono);
+  font-size: 15px;
+  letter-spacing: .04em;
+  color: var(--text);
+}
+
+.choice__why { color: var(--muted); font-size: 12.5px; line-height: 1.55; }
+
+/* A route the build cannot serve is offered as unavailable and says why -
+   never as a live button that opens a dead pane. */
+.choice[aria-disabled="true"] {
+  cursor: not-allowed;
+  background: var(--paper-2);
+  box-shadow: none;
+}
+.choice[aria-disabled="true"]:hover {
+  transform: none;
+  border-color: var(--line);
+  box-shadow: none;
+}
+.choice[aria-disabled="true"] .choice__mark,
+.choice[aria-disabled="true"] .choice__name,
+.choice[aria-disabled="true"] .choice__why { color: var(--faint); }
+
+.chooser__foot {
+  margin: 20px 0 0;
+  font-size: 12px;
+  color: var(--faint);
+}
+
+/* ============================================================
+   THE COMPUTE PANE
+
+   Input on top, history below, and the history scrolls - the
+   same layout rule as the system pane: nothing outside a
+   scroller may change size because a result arrived.
+   ============================================================ */
+
+.compute {
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
+  min-height: 0;
+  background: var(--paper);
+  overflow: hidden;
+}
+
+.compute__head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  height: var(--plothead-h);
+  padding: 0 18px;
+  border-bottom: 1px solid var(--line);
+  background: var(--paper-2);
+}
+.compute__title {
+  margin: 0;
+  font-family: var(--mono);
+  font-size: 12px;
+  font-weight: 500;
+  letter-spacing: .16em;
+  color: var(--text-2);
+}
+.compute__note {
+  margin: 0;
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  color: var(--muted);
+}
+.compute__note.is-bad { color: var(--error); }
+
+.compute__io {
+  display: grid;
+  gap: 10px;
+  padding: 16px 18px 14px;
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.compute__field .mf {
+  min-height: 44px;
+  padding: 9px 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-sm);
+  background: var(--paper);
+  font-size: 17px;
+}
+.compute__field .mf.is-focused {
+  border-color: var(--accent-line);
+  box-shadow: 0 0 0 3px var(--accent-tint);
+}
+
+.compute__row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.compute__ops { display: inline-flex; gap: 6px; flex-wrap: wrap; }
+
+.casop {
+  appearance: none;
+  min-height: 32px;
+  padding: 0 13px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--paper);
+  color: var(--text-2);
+  font-family: var(--mono);
+  font-size: 12.5px;
+  cursor: pointer;
+  transition: color 120ms var(--ease), background-color 120ms var(--ease),
+              border-color 120ms var(--ease);
+}
+.casop:hover { color: var(--accent); border-color: var(--accent-line); background: var(--accent-tint); }
+.casop.is-last { color: var(--accent); border-color: var(--accent-line); }
+.casop[aria-disabled="true"] {
+  color: #c3c8d0;
+  cursor: not-allowed;
+  background: var(--paper-2);
+}
+.casop[aria-disabled="true"]:hover { color: #c3c8d0; border-color: var(--line); background: var(--paper-2); }
+.casop:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+.compute__var {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--muted);
+}
+.compute__var input {
+  width: 46px;
+  padding: 5px 7px;
+  font-family: var(--mono);
+  font-size: 12.5px;
+  color: var(--text);
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+}
+.compute__var input:focus {
+  outline: none;
+  border-color: var(--accent-line);
+  box-shadow: 0 0 0 3px var(--accent-tint);
+}
+
+.compute__log {
+  overflow-y: auto;
+  padding: 12px 18px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  scrollbar-width: thin;
+  scrollbar-color: #dde1e6 transparent;
+}
+.compute__log::-webkit-scrollbar { width: 10px; }
+.compute__log::-webkit-scrollbar-thumb {
+  background: #e3e7ec;
+  border-radius: 8px;
+  border: 3px solid var(--paper);
+}
+
+.casempty {
+  margin: 26px auto;
+  max-width: 44ch;
+  text-align: center;
+  color: var(--faint);
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+
+.casitem {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-areas:
+    "op   in   use"
+    "sign out  out";
+  align-items: center;
+  gap: 6px 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: var(--paper-2);
+}
+
+.casitem__op {
+  grid-area: op;
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: .08em;
+  color: var(--muted);
+  white-space: nowrap;
+}
+.casitem__in   { grid-area: in;  min-width: 0; overflow-x: auto; }
+.casitem__sign { grid-area: sign; color: var(--accent); font-size: 14px; text-align: center; }
+.casitem__out  { grid-area: out; min-width: 0; overflow-x: auto; }
+
+.casitem__use {
+  grid-area: use;
+  appearance: none;
+  min-height: 26px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--paper);
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 11.5px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.casitem__use:hover { color: var(--paper); background: var(--accent); border-color: var(--accent); }
+.casitem__use:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.casitem__use[hidden] { display: none; }
+
+.casitem__err {
+  grid-area: out;
+  font-size: 12.5px;
+  color: var(--error);
+}
+.casitem.is-error { border-color: var(--error-line); background: var(--error-tint); }
+
+/* A read-only rendering of the same math the input surface draws: a field with
+   its own editing switched off, not a second renderer. */
+.mf--static .mf { border: 0; background: transparent; padding: 0; cursor: default; }
+.casitem .mf { font-size: 15px; }
+.casitem__in .mf { color: var(--text-2); }
+
+.compute__foot {
+  margin: 0;
+  padding: 9px 18px;
+  border-top: 1px solid var(--line);
+  background: var(--paper-2);
+  font-size: 12px;
+  color: var(--muted);
+  min-height: 34px;
+}
+.compute__foot.is-bad { color: var(--error); }
+
+/* -- the phone --------------------------------------------- */
+
+body.is-narrow .chooser { padding: 16px; }
+body.is-narrow .chooser__cards { grid-template-columns: minmax(0, 1fr); gap: 12px; }
+body.is-narrow .choice { padding: 18px 16px; }
+body.is-narrow .compute__head { height: 56px; padding: 0 12px; }
+body.is-narrow .compute__io { padding: 12px; }
+body.is-narrow .compute__log { padding: 10px 12px 16px; }
+body.is-narrow .casop,
+body.is-touch .casop { min-height: var(--tap); padding: 0 14px; }
+body.is-narrow .casitem__use,
+body.is-touch .casitem__use { min-height: 34px; }

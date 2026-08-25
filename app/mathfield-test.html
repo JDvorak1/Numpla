@@ -111,6 +111,18 @@
   <h2>Structures</h2>
   <div class="grid" id="structures"></div>
 
+  <h2>Leibniz notation (a fraction that is a derivative)</h2>
+  <p class="hint">
+    <code>dx/dt = -y</code> is the same row as <code>x' = -y</code>, and the
+    denominator names the independent variable. It is stacked, because that is
+    how the notation is written &mdash; but its <code>source</code> is
+    <code>dx/dt</code>, not <code>(dx)/(dt)</code>, which is the only spelling
+    the engine accepts. Type one in the empty field: <kbd>d</kbd> <kbd>x</kbd>
+    <kbd>/</kbd> <kbd>d</kbd> <kbd>t</kbd> <kbd>=</kbd> &mdash; the
+    <kbd>=</kbd> steps out of the denominator by itself.
+  </p>
+  <div class="grid" id="leibniz"></div>
+
   <h2>Tall and nested</h2>
   <div class="grid" id="tall"></div>
 
@@ -229,6 +241,22 @@ mount('structures', 'delimiters that grow', 'z = ((a)/(b) + c)');
 mount('structures', 'functions, upright', 'y = sin(2pit) + exp(-t)*cos(t)');
 mount('structures', 'implicit multiplication (xy is x times y)', 'p = 2xy - 3ab');
 mount('structures', 'brackets', 'v = [1, 2, 3]');
+
+// --- Leibniz ----------------------------------------------------------------
+// A derivative is a fraction, so it is one here too: same atom, same stacked
+// rendering, same arrows and backspace. Only the source spelling differs.
+mount('leibniz', 'first order', 'dx/dt = -y');
+mount('leibniz', 'second order, digit spelling', 'd2x/dt2 = -x');
+mount('leibniz', 'second order, caret spelling', 'd^2x/dt^2 = -x');
+mount('leibniz', 'an integral: df/dx from f(0) = 0 is the area', 'df/dx = 2x');
+mount('leibniz', 'the denominator names the axis - here it is q, not t',
+  'dr/dq = -ksin(kq)');
+mount('leibniz', 'subscripted states', 'dx_1/dt = -y_1');
+mount('leibniz', 'd is still an ordinary name', 'd = 0.25');
+mount('leibniz', 'and still an ordinary coefficient', "y' = -cy + dxy");
+mount('leibniz', 'a derivative inside an expression is arithmetic, as documented',
+  'x = dx/dt');
+mount('leibniz', 'type one here: d x / d t = -y', '');
 
 // --- stress -----------------------------------------------------------------
 mount('tall', 'nested fractions', 'q = ((1)/(2))/((3)/(4))');

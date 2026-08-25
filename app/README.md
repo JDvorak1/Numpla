@@ -30,13 +30,79 @@ of hanging. Same for a missing `mathfield.js`.
 
 | file | role |
 |---|---|
-| `index.html` | markup: loading screen, expression rows, the plot and its control strip, the overlays |
+| `index.html` | markup: loading screen, the start screen, expression rows, the plot and its control strip, the compute pane, the overlays |
 | `styles.css` | the light theme, the fixed layout, the eased loader → app hand-off |
 | `main.js` | boot, WASM binding, the row list, diagnostics, sliders, the frame gestures, the reference |
 | `plot.js` | `Plot` — one HiDPI canvas, one frame, and `time` / `phase` / `polar` / `field` all drawn into it, overlapping; the field grid rule, the shade ramp, and seed hit-testing |
 | `demos.js` | the gallery: source, `tSpan`, `show`, and the knobs each demo declares |
 | `mathfield.js` / `mathfield.css` | the math field itself (see `docs/ui-v2.md` Part A) |
 | `serve.mjs` | the dependency-free dev server |
+
+## Two ways in
+
+Numpla opens by asking which of two things you want.
+
+- **Solve & simulate** — the workspace: rows, sliders, the plot and everything
+  on its strip.
+- **Compute** — a Maple-like pane over the CAS calls: type an expression and
+  simplify, differentiate, expand or evaluate it.
+
+**The start screen is not a second gate.** It lives inside the app shell, over
+the workspace's own grid row, painted on the loading screen's own background,
+and it rises on the same easing and the same delay the workspace rises on. So
+the sequence is one motion: the loader fades and drifts out, the top bar and the
+question arrive together underneath it, and choosing fades the question out over
+a workspace that is already laid out behind it — which is also why choosing
+costs no re-measure, no re-sample and no re-solve.
+
+The route is a class on `<body>` — `route-chooser`, `route-solve`,
+`route-compute` — and exactly one of the workspace and the compute pane owns the
+grid's second row at a time.
+
+**It asks once.** The choice is written to `localStorage` under `numpla.route`
+(in a `try/catch`, like the divider's width), so a reload goes straight back to
+where you were. **The logo is the way back to the chooser** — a mark that goes
+home is the one navigation convention everybody already has, and it costs no
+width and needs no label. The word beside it says which route you are in.
+
+**A route the build cannot serve is never offered as a live button.** If
+`app/pkg/` has none of the four CAS calls, the Compute card is rendered as
+unavailable and names the calls it wants, rather than opening a pane with four
+dead buttons; and a remembered `compute` route on such a build lands on `solve`.
+
+## Compute
+
+The pane is input on top, history below, and the history is the only thing that
+scrolls — the same layout rule the system pane obeys.
+
+**The input is a `MathField`**, the same class every row in the system pane uses.
+There is exactly one way to type mathematics in this product; a text box would
+have been a second one. **Every result is rendered by another `MathField`** with
+its editing taken away (keys and clicks are stopped on the host, in the capture
+phase, so nothing reaches the field), which is why an answer comes back as
+mathematics rather than as a line of source — and why the input and the answer
+cannot disagree about what an expression looks like: they are drawn by the same
+code.
+
+| | |
+|---|---|
+| operations | `simplify`, `d/dx`, `expand`, `evaluate` — one button each, **built from the calls the build actually has**, so a WASM missing `cas_expand` shows three live buttons and says what the fourth needs |
+| the variable | `d/dx` reads a small field beside the buttons; the button relabels itself as you change it |
+| `Enter` | runs the operation you last used |
+| the history | one entry per run, oldest first, scrolling; `use` puts that answer back into the input |
+| a refusal | `ok: false` is kept as its own entry with the CAS's own sentence — a refusal is an answer, and throwing it away is how a tool becomes untrustworthy |
+
+**Results are Numpla source, so they round-trip.** `output` goes back through
+the same parser the rows use, which is what makes `use` possible: differentiate,
+press `use`, simplify the derivative — without retyping anything.
+
+Not here, and said rather than half-done: symbolic integration, equation
+solving, limits, series, matrices.
+
+The math keyboard follows you into this pane. While `compute` is the route the
+keyboard's target is the pane's own input surface, wrapped in the one shape the
+keyboard knows, so a tap and a keystroke take the same path here as they do in a
+row — and `Enter` runs the operation instead of opening a row below.
 
 ## The six things this shell is built around
 
@@ -460,6 +526,44 @@ a `#` row round-trips verbatim through the math field, reaches `set_source`
 unchanged (the parser skips it), is never diagnosed, and is not numbered as an
 equation.
 
+### What a demo arrives as
+
+The complaint this answers: *the same graph is in every view*. It was true, and
+the plot was never at fault — the three views genuinely draw different geometry.
+The **policy** was wrong: everything the model supported turned itself on, so
+`t–y` was drawn whichever view you had come for.
+
+**A demo declares the one view it is about** — `view: 'time' | 'phase' |
+'polar' | 'field'` — and loading it turns that view on and the others off. The
+views menu is untouched by this: anything supported can be switched back on the
+moment after, and that decision then survives every recompile. This changes what
+a demo *arrives as*, not what the menu can do.
+
+- **A demo with no `view` arrives as `time`.** It is the one view every document
+  can draw whatever its shape, and it is the view such a demo used to arrive
+  with anyway — the change is that it now arrives with exactly *one*.
+- **A declared view the document or the build cannot draw degrades to `time`**,
+  checked once, after the compile that knows the answer. `field` on a build with
+  no `vector_field`, or `phase` on a six-state string, would otherwise arrive as
+  an empty plot — which is worse than the wrong picture, and the views menu is
+  already saying why it is off.
+- **A plain document keeps the old policy**: the one at boot, one typed from
+  nothing, one pushed in by the suite. Nobody chose its subject, so nothing here
+  may pretend to know it — everything it supports is on.
+
+### New
+
+**New** sits beside **Demos** in the top bar: an empty document and the default
+frame, in one press, so starting from nothing does not mean deleting six rows
+one at a time. The two live together because they answer the same question —
+what is in the document — and the top bar is the only place on screen that is
+about the document as a whole rather than about one row.
+
+Everything the document accumulated goes with it: its sliders and their ranges,
+its seeds, its `show` list, the demo it came from, the view policy, and the
+frame. What survives is what belongs to the *person* rather than to the
+document — the pane width, the integrator, the route, the keyboard.
+
 ### The shell owns the function names
 
 `d(x, y)` is a call only when the document has a `d(x, y) = ...` row; otherwise
@@ -474,6 +578,26 @@ genuinely means the wrong thing and re-reading it cannot always recover the
 intent. `setFunctions` on every row is the safety net for a definition that
 appears later; it does not fire `onChange`, so `recompute` re-reads the document
 itself when a row reports that it changed.
+
+## The mark
+
+A **trajectory**, in one curve: a dot at the initial condition, one big
+overshoot, a smaller return, and away off the top right. Asymmetric on purpose —
+a symmetric bump has no direction, and direction is the entire subject of a
+differential-equations tool. Three control points define it, so it survives
+being 16px wide.
+
+It is the same curve in all three places it appears, at two scales:
+
+| where | how |
+|---|---|
+| the favicon | `0 0 32 32`, teal on white, with the rounded plate |
+| the top bar | the same 32-unit path in `currentColor`, and it is a button — the way back to the start screen |
+| the loading screen | the same shape at `0 0 120 120` inside the ring, traced by the dash animation, with the seed dot at the trajectory's start |
+
+On the loading screen the dash sweeps along the curve, so the mark is not a
+picture of a trajectory but a point moving along one — which is what the ring
+and the seed dot were always for.
 
 ## Layout: nothing moves while you type
 
@@ -705,3 +829,16 @@ of keys a metre apart.
 | `activeRow()` | which row the keys are typing into |
 | `source()` | the document as the compiler sees it |
 | `setFieldApi(on)` | hide `insert`/`command` on every row, so the fallback path can be proved |
+| `names()` | `{ states, params, derived }` as the compiler reported them |
+| `demoView()` | `{ want, pending }` — the view the last-loaded demo asked for |
+| `route()` | `chooser` \| `solve` \| `compute` |
+| `setRoute(name)` | go somewhere, as the cards do |
+| `cas()` | `{ available, ops, mounted, input, lastOp, log }` |
+| `setCasApi(next)` | `false` = "this build has none", an object = a stub, `null` = whatever the probe found |
+| `typeCas(text)` | type into the compute field, through the field's own typing path |
+| `clearCas()` | empty it |
+| `runCas(op)` | run one operation, exactly as its button does |
+
+`probe()` reports `cas` beside `field` and `seed`, so a suite can tell a build
+that has the CAS calls from one that does not — and drive the whole pane against
+a stub either way.

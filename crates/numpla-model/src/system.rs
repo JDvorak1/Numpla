@@ -21,6 +21,14 @@ pub struct ModelSystem {
     /// `x'`, which is exactly the key the evaluator resolves `Expr::Deriv`
     /// against — so one binding serves both the state and `x'` written by hand.
     keys: Vec<String>,
+    /// The env key the solver's own parameter binds to on every call.
+    ///
+    /// Hard-coded as `t` until documents could say otherwise; a document
+    /// written `df/dx = 2x` integrates along `x`, and binding `t` there would
+    /// leave the right-hand side reading a name nothing had written — the row
+    /// would go pending and the model would refuse to run. Carried as a string
+    /// rather than looked up per call for the same reason `keys` is.
+    indep: String,
     rhs: Vec<StateRhs>,
     /// The derived rows some right-hand side actually reads — `x' = -E` with
     /// `E = 0.5x^2` is ordinary — bound before each evaluation so the solver
@@ -43,12 +51,13 @@ impl ModelSystem {
         let mut env = doc.env.clone();
         // Pre-seed every key that `rhs` writes, so the per-call binding is a
         // slot overwrite rather than a hash-map insert with a fresh `String`.
-        env.set("t", 0.0);
+        env.set(&doc.independent, 0.0);
         for (name, v) in doc.states.iter().zip(&doc.y0) {
             env.set(name, *v);
         }
         ModelSystem {
             keys: doc.states.clone(),
+            indep: doc.independent.clone(),
             rhs: doc.rhs.clone(),
             derived: doc.derived_for_rhs(),
             env: RefCell::new(env),
@@ -76,7 +85,7 @@ impl System for ModelSystem {
 
     fn rhs(&self, t: f64, y: &[f64], dy: &mut [f64]) {
         let mut env = self.env.borrow_mut();
-        bind(&mut env, "t", t);
+        bind(&mut env, &self.indep, t);
         for (key, value) in self.keys.iter().zip(y) {
             bind(&mut env, key, *value);
         }

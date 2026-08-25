@@ -329,13 +329,18 @@ await test('a sub-window renders only that part of the solution', () => {
 
 await test('a demo document renders to sound', async () => {
   const { DEMOS } = await import('./demos.js');
-  const demo = DEMOS.find((d) => d.id === 'colliding-strings');
+  // Pick by property, not by id. Naming one demo couples this suite to the
+  // gallery's contents, and the gallery is rewritten whenever the demos change;
+  // what this test actually needs is "a demo someone would listen to".
+  const demo = DEMOS.find((d) => d.audio);
+  ok(!!demo, 'the gallery should contain at least one audio demo');
   const model = new wasm.Model();
   const diagnostics = JSON.parse(model.set_source(demo.source));
   const report = JSON.parse(model.solve(demo.tSpan[0], demo.tSpan[1]));
   ok(report.ok, `the demo failed to solve: ${report.error}`);
   const r = renderModel(model, {
-    state: 'a_2',
+    // Whatever the demo says is worth looking at, else its first state.
+    state: (demo.show && demo.show[0]) || diagnostics.states[0],
     states: diagnostics.states,
     window: demo.tSpan,
     compression: 12,
