@@ -2,9 +2,10 @@
 // main.js - the Numpla browser shell.
 //
 // Flow:
-//   boot()  ->  load MathField + WASM  ->  reveal the app (eased)
-//   edit    ->  debounce  ->  set_source  ->  per-row diagnostics  ->  solve
-//   sliders ->  t drives eval(t); a parameter slider rewrites its own row
+//   boot()   ->  load MathField + WASM  ->  reveal the app (eased)
+//   edit     ->  debounce  ->  set_source  ->  per-row diagnostics  ->  solve
+//   pan/zoom ->  debounce  ->  solve over the NEW window  ->  re-sample
+//   sliders  ->  a parameter slider rewrites its own row and re-solves
 //
 // Rows are Desmos-shaped: a blank row always sits at the end of the list and is
 // not a real row until something is typed into it, Enter opens a row below, and
@@ -15,38 +16,44 @@
 // been asked for: every scalar row offers "add slider" in the line it already
 // reserves for its diagnostic.
 //
-// `t` IS ONE OF THOSE ROWS. It used to be a special widget in a bar of its own,
-// which is exactly why it felt like a dial attached to nothing. It is a
-// variable in the system now: the row `t = [0, 20]` says what the span is - a
-// list literal, which today's parser already reads, and which the solver's own
-// binding of `t` overrides while it integrates, so the row cannot change what
-// the equations mean - and the slider promoted on that row is the playhead
-// inside it. Same offer, same knob, same gear, same x as every other variable.
+// THERE IS NO `t` ANY MORE - not a slider, not a row, not a playhead. It was a
+// dial attached to nothing twice over, because it answered a question nobody
+// asks: nobody wants to SET a span, they want to LOOK somewhere and have the
+// software compute what they are looking at. So (docs/ui-v5.md):
+//
+//   THE VISIBLE WINDOW IS THE INTEGRATION SPAN.
+//
+// The frame's x0..x1 is what gets solved, at the resolution the canvas can
+// draw. Pan or zoom the horizontal axis and the model re-solves over the new
+// span, debounced exactly the way editing is, with the last good curve left on
+// screen in the meantime.
 //
 // Five structural rules this file exists to enforce:
 //
 //   1. GRAY-NOT-RED. `severity: "pending"` is muted. Only `"error"` is red,
 //      and only an `"error"` pauses the solve - the last good curve stays on
 //      screen while the document is mid-edit.
-//   2. ONE PLOT. A single canvas. Each view is an independent switch, and the
-//      canvas is tiled between the ones that are on. A chip the model cannot
-//      support stays visible but inert, because that is how the capability is
-//      discovered - and nothing is ever switched off on the user's behalf.
-//   3. THE FRAME IS THE USER'S. -5..5 on both axes to begin with, then theirs:
-//      drag an axis to scale it, drag the body to pan, wheel to zoom. A
-//      re-solve redraws inside the frame they left.
-//   4. `t` MOVES THE PICTURE. A marker rides the curve and the trajectory is
-//      drawn travelled-vs-ahead, so scrubbing reads as motion. Nothing else
-//      would have justified a control for it.
+//   2. ONE PLOT, EVERYTHING IN IT. A single canvas and a single frame; every
+//      enabled view draws into it, overlapping. Nothing is tiled. A view the
+//      model supports turns itself ON; the views menu is how you turn one off.
+//   3. THE FRAME IS THE USER'S - AND IT IS THE QUERY. -5..5 on both axes to
+//      begin with, then theirs: drag an axis to scale it, drag the body to pan,
+//      wheel to zoom. A re-solve never moves it; moving it causes a re-solve.
+//   4. THE METHOD IS ON THE SURFACE. Discrete versus continuous - Tsit5 against
+//      Verlet and Yoshida4 - is one click on the plot's strip, and a symplectic
+//      method asked of a document with no second-order structure is REFUSED in
+//      a sentence, never quietly downgraded to something that draws.
 //   5. NOTHING MOVES WHILE YOU TYPE. Panes have explicit sizes and scroll
 //      internally; diagnostics occupy reserved space; the slider settings, the
-//      demo gallery and the reference are overlays. The only thing that may
-//      change size is the field under the caret.
+//      demo gallery, the views menu and the reference are overlays. The only
+//      thing that may change size is the field under the caret.
 //
 // No bundler, no dependencies, no network. Plain ES modules.
 // ============================================================================
 
-import { Plot, VIEWS, panned, scaled, zoomed, seriesColor, fmtValue } from './plot.js';
+import {
+  Plot, VIEWS, VIEW_LABEL, panned, scaled, zoomed, seriesColor, fmtValue,
+} from './plot.js';
 import { DEMOS } from './demos.js';
 import { SoundPlayer, DEFAULTS as AUDIO_DEFAULTS } from './audio.js';
 
@@ -69,12 +76,13 @@ const el = {
 
   divider: $('divider'),
 
-  views:      $('views'),
+  methods:   $('methods'),
+  viewsBtn:  $('views-btn'),
+  viewmenu:  $('viewmenu'),
   canvas:     $('canvas'),
   frameFit:   $('frame-fit'),
   frameReset: $('frame-reset'),
 
-  play:    $('play'),
   readout: $('readout'),
 
   infoBtn:    $('info-btn'),
@@ -113,7 +121,6 @@ const el = {
 const plot = new Plot(el.canvas);
 
 const DEFAULT_DOC = [
-  't = [0, 20]',
   'k = 0.4',
   "x' = -y - k*x",
   "y' = x",
@@ -230,15 +237,15 @@ const state = {
   names: [],       // state variable names, in solver order
   params: [],      // named constants reported by the compiler
   derived: [],     // rows that are functions of the solution (energy, ...)
-  frame: null,     // last GOOD frame; an error never clears this
-  t0: 0,
-  t1: 20,
-  t: 0,            // playhead time
-  playing: false,
-  lastFrameMs: 0,
+  sol: null,       // last GOOD solution; an error never clears this
+  // The span that was last actually integrated. It exists so a pan that ends
+  // where it began does not re-solve, and so the shell can say what is drawn.
+  t0: -5,
+  t1: 5,
+  // What the loaded document says is worth drawing (`show`), or null for
+  // everything. A display choice: the states left out are still solved.
+  show: null,
 };
-
-const PLAY_SECONDS = 9;   // real seconds to traverse the whole span once
 
 const clamp = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v);
 
@@ -310,8 +317,8 @@ const niceStepFor = (span) => niceFloor(Math.abs(span) / 200) || 0.01;
 
 /** @type {{el:HTMLElement, host:HTMLElement, idxEl:HTMLElement,
  *          msgEl:HTMLElement, footEl:HTMLElement, knobEl:HTMLElement,
- *          offerEl:HTMLButtonElement, offerName:string, knobKey:string,
- *          field:any}[]} */
+ *          offerEl:HTMLButtonElement, fixEl:HTMLButtonElement, fixInsert:string,
+ *          offerName:string, knobKey:string, field:any}[]} */
 const rows = [];
 
 const DEL_MARK = '×';   // ×
@@ -553,13 +560,23 @@ function makeRow(source, at) {
   const msgEl = document.createElement('div');
   msgEl.className = 'row__msg';
 
+  // The suggestion, in the row's own reserved line - which is to say, WHERE THE
+  // PROBLEM IS. The bottom of the pane is not where your eye is when a row is
+  // half-written; this row is. It is deliberately not clever: the compiler
+  // proposes exactly one obvious row per issue, and this presses that row into
+  // the document. Nothing is invented, ranked or inferred here.
+  const fixEl = document.createElement('button');
+  fixEl.type = 'button';
+  fixEl.className = 'row__fix';
+  fixEl.hidden = true;
+
   const offerEl = document.createElement('button');
   offerEl.type = 'button';
   offerEl.className = 'row__offer';
   offerEl.textContent = 'add slider';
   offerEl.hidden = true;
 
-  footEl.append(msgEl, offerEl);
+  footEl.append(msgEl, fixEl, offerEl);
 
   // Where a promoted slider lives. Empty (and therefore invisible) otherwise.
   const knobEl = document.createElement('div');
@@ -568,8 +585,8 @@ function makeRow(source, at) {
   wrap.append(idxEl, host, del, footEl, knobEl);
 
   const row = {
-    el: wrap, host, idxEl, msgEl, footEl, knobEl, offerEl,
-    offerName: '', knobKey: '', field: null,
+    el: wrap, host, idxEl, msgEl, footEl, knobEl, offerEl, fixEl,
+    fixInsert: '', offerName: '', knobKey: '', field: null,
   };
 
   const index = at == null ? rows.length : clamp(at, 0, rows.length);
@@ -603,6 +620,11 @@ function makeRow(source, at) {
   offerEl.addEventListener('click', (e) => {
     e.preventDefault();
     promoteParam(row.offerName);
+  });
+
+  fixEl.addEventListener('click', (e) => {
+    e.preventDefault();
+    applyFix(row.fixInsert);
   });
 
   // Backspace in an already-empty row deletes the row and leaves the caret at
@@ -701,14 +723,13 @@ const pendingKnobs = new Map();
 function loadDemo(demo) {
   closeDemos();
   closeSettings();
-  setPlaying(false);
+  closeViews();
 
   // A demo's author has already answered the question the offer asks, so its
   // knobs arrive promoted, with the ranges over which they are interesting.
   pendingKnobs.clear();
   promoted.clear();
   knobRanges.clear();
-  promoted.add('t');           // the playhead is on by default, like a demo knob
   for (const k of demo.knobs || []) {
     pendingKnobs.set(k.name, k);
     promoted.add(k.name);
@@ -720,23 +741,29 @@ function loadDemo(demo) {
     sliders.delete(name);
   }
 
-  const [t0, t1] = demo.tSpan;
-  state.t0 = t0;
-  state.t1 = t1;
-  state.t = t0;
-
-  // A demo declares its span in `tSpan` rather than in its source, so the shell
-  // writes the row that says it. It is an ordinary row from that moment on:
-  // editable, sliderable, deletable.
-  const lines = demo.source.split('\n');
-  if (!lines.some((line) => SPAN_RE.test(line.split('#')[0]))) {
-    lines.unshift(spanRow(t0, t1));
+  // A demo still declares a `tSpan`, and it sets the FRAME - not the other way
+  // round. There is no row and no widget left to write it into: the window IS
+  // the span, so moving the window there is the whole of "load this demo over
+  // the interval its author had in mind".
+  const span = Array.isArray(demo.tSpan) && demo.tSpan.length === 2
+    ? demo.tSpan
+    : [0, 20];
+  const t0 = Number(span[0]);
+  const t1 = Number(span[1]);
+  if (isFinite(t0) && isFinite(t1) && t1 > t0) {
+    const win = plot.getWindow();
+    plot.setWindow({ x0: t0, x1: t1, y0: win.y0, y1: win.y1 });
   }
 
+  // `show` names the series that ARE the picture - one line per string rather
+  // than one per state. Everything is still solved; this only says what to draw.
+  state.show = Array.isArray(demo.show) && demo.show.length ? demo.show.slice() : null;
+
   clearRows();
-  buildRows(lines);
+  buildRows(demo.source.split('\n'));
 
   el.demosBtn.setAttribute('data-demo', demo.title);
+  syncFrameButtons();
   scheduleRecompute(0);
 }
 
@@ -753,6 +780,10 @@ function loadDemo(demo) {
 const player = new SoundPlayer();
 let hearing = false;
 
+/** The from/to the panel last filled in by itself, so a typed one is never
+ *  overwritten while a stale one always is. */
+const hearOffered = { from: '', to: '' };
+
 function hearStateNames() {
   return state.names && state.names.length ? state.names : [];
 }
@@ -768,8 +799,17 @@ function openHear() {
   });
   el.hearState.disabled = names.length === 0;
 
-  if (!el.hearFrom.value) el.hearFrom.value = String(state.t0);
-  if (!el.hearTo.value) el.hearTo.value = String(state.t1);
+  // The window is the span, so the span is what there is to listen to. A value
+  // typed by hand is kept; anything the panel put there itself is refreshed,
+  // because a window offered two zooms ago is not the run on screen.
+  if (!el.hearFrom.value || el.hearFrom.value === hearOffered.from) {
+    el.hearFrom.value = String(state.t0);
+    hearOffered.from = el.hearFrom.value;
+  }
+  if (!el.hearTo.value || el.hearTo.value === hearOffered.to) {
+    el.hearTo.value = String(state.t1);
+    hearOffered.to = el.hearTo.value;
+  }
   if (!el.hearComp.value) el.hearComp.value = String(AUDIO_DEFAULTS.compression);
 
   const r = el.hearBtn.getBoundingClientRect();
@@ -1020,12 +1060,28 @@ function toggleDemos() {
 // Diagnostics -> the rows themselves
 // ---------------------------------------------------------------------------
 
-function setRowDiagnostic(row, severity, message) {
+function setRowDiagnostic(row, severity, message, fix) {
   const sev = severity === 'error' ? 'error' : severity === 'pending' ? 'pending' : null;
   row.el.classList.toggle('is-error', sev === 'error');
   row.el.classList.toggle('is-pending', sev === 'pending');
   row.msgEl.textContent = sev ? (message || (sev === 'error' ? 'error' : 'incomplete')) : '';
   row.msgEl.title = row.msgEl.textContent;
+
+  // The proposal, rendered verbatim. An issue with no `fix` gets the message
+  // and no button, because there is nothing to press and inventing one would be
+  // exactly the cleverness this must not have.
+  const insert = fix && typeof fix.insert === 'string' ? fix.insert : '';
+  row.fixInsert = insert;
+  row.fixEl.hidden = !insert;
+  row.fixEl.textContent = insert ? (fix.label || 'add ' + insert) : '';
+  if (insert) {
+    row.fixEl.title = 'Write `' + insert + '` into the document';
+    row.fixEl.setAttribute('aria-label', 'Add the row ' + insert);
+  } else {
+    row.fixEl.removeAttribute('title');
+    row.fixEl.removeAttribute('aria-label');
+  }
+
   try {
     if (row.field && typeof row.field.setDiagnostic === 'function') {
       row.field.setDiagnostic(sev, message || '');
@@ -1047,15 +1103,28 @@ function applyDiagnostics(issues) {
     }
   }
 
+  // What is actually on offer, in the order the compiler reported it. Each
+  // distinct proposal is offered ONCE, on the earliest row that wants it - the
+  // contract already guarantees that, so three rows waiting on the same name
+  // produce one suggestion, in one place.
+  const fixes = collectFixes(issues);
+  const byLine = new Map();
+  for (const f of fixes) {
+    if (f.line >= 0 && !byLine.has(f.line)) byLine.set(f.line, f);
+  }
+
   const real = realRowCount();
   rows.forEach((row, i) => {
     // The trailing blank row is not part of the document and a comment row is
     // prose for the reader: neither is ever diagnosed.
-    const d = (i < real && !isCommentRow(row)) ? worst.get(i) : null;
-    setRowDiagnostic(row, d ? d.sev : null, d ? d.msg : '');
+    const diagnosable = i < real && !isCommentRow(row);
+    const d = diagnosable ? worst.get(i) : null;
+    const f = diagnosable ? byLine.get(i) : null;
+    if (f) f.attached = true;      // it has a row of its own to be pressed on
+    setRowDiagnostic(row, d ? d.sev : null, d ? d.msg : '', f);
   });
 
-  renderIssueBar(issues);
+  renderIssueBar(issues, fixes);
 }
 
 // ---------------------------------------------------------------------------
@@ -1070,6 +1139,18 @@ function applyDiagnostics(issues) {
 
 const squash = (s) => s.replace(/\s+/g, '');
 
+/**
+ * The thing a proposed row would define: `k = 1` -> `k`, `y(0) = 0` -> `y(0)`,
+ * `x'(0) = 0` -> `x'(0)`. This is the word the document is waiting for, and
+ * "what is it waiting for" is the only question being asked at that moment - so
+ * it has to be on screen by NAME, not counted.
+ */
+function fixTarget(insert) {
+  const m = /^\s*([A-Za-z_][A-Za-z_0-9]*'*)\s*(\(\s*0\s*\))?/.exec(insert);
+  if (!m) return insert;
+  return m[1] + (m[2] ? '(0)' : '');
+}
+
 function usableFix(it) {
   const f = it && it.fix;
   if (!f || typeof f !== 'object') return null;
@@ -1081,55 +1162,99 @@ function usableFix(it) {
   const message = typeof it.message === 'string' && it.message.trim()
     ? it.message.trim()
     : label;
-  return { insert, label, message };
+  return { insert, label, message, target: fixTarget(insert) };
 }
 
-/** The fixes the bar is currently offering, in the order they were reported. */
+/** The fixes currently on offer, in the order they were reported. */
 let offeredFixes = [];
 
-function renderIssueBar(issues) {
-  const errs = issues.filter((i) => i.severity === 'error').length;
-  const pend = issues.length - errs;
-
+/**
+ * Every proposal the compiler is making that is not already written down, once
+ * each, carrying the line it belongs to.
+ *
+ * A genuine error outranks a missing default: there is no point offering to
+ * complete a document that cannot be read yet.
+ */
+function collectFixes(issues) {
+  if (issues.some((i) => i.severity === 'error')) return [];
   // Something already written down is not missing, whatever the compiler said
   // a moment ago.
   const have = new Set(realRows().map((r) => squash(rowSource(r))));
   const seen = new Set();
-  const fixes = [];
+  const out = [];
   for (const it of issues) {
     const f = usableFix(it);
     if (!f) continue;
     const key = squash(f.insert);
     if (seen.has(key) || have.has(key)) continue;
     seen.add(key);
-    fixes.push(f);
+    out.push({ ...f, line: Number.isInteger(it.line) ? it.line : -1, attached: false });
   }
+  return out;
+}
 
-  // A genuine error outranks a missing default: there is no point offering to
-  // complete a document that cannot be read yet.
-  offeredFixes = errs ? [] : fixes;
+/** Write one proposed row into the document, at the end, and recompute. */
+function applyFix(insert) {
+  const text = typeof insert === 'string' ? insert.trim() : '';
+  if (!text) return null;
+  const have = new Set(realRows().map((r) => squash(rowSource(r))));
+  if (have.has(squash(text))) return null;
 
+  const row = makeRow(text, realRowCount());   // before the trailing blank row
+  ensureTail();
+  renumber();
+  scheduleRecompute(0);
+  // The button that had focus has just gone away; put the caret where the new
+  // text is instead of dropping focus on the floor.
+  placeCaret(row, true);
+  return row;
+}
+
+function renderIssueBar(issues, fixes) {
+  const errs = issues.filter((i) => i.severity === 'error').length;
+  const pend = issues.length - errs;
+
+  offeredFixes = fixes || [];
+
+  // The message: NAME what is missing. "1 issue · and 2 more" answers a
+  // question nobody asked; the one being asked is "what is it waiting for", and
+  // every fix already knows. The first keeps its full sentence, the rest are
+  // listed by name, and the hover text has all of them in full.
   if (offeredFixes.length) {
     const more = offeredFixes.length - 1;
     el.issueMsg.textContent = more
-      ? offeredFixes[0].message + ' · and ' + more + ' more'
+      ? offeredFixes[0].message + ' · also ' +
+        offeredFixes.slice(1).map((f) => f.target).join(', ')
       : offeredFixes[0].message;
-    // One fix gets its own imperative label. Several share one button: they are
-    // all the same kind of answer - "this is what it would have assumed" - and
-    // making someone click through them one re-solve at a time is exactly the
-    // asking-for-things this is meant to remove. Every row still carries its
-    // own message, so batching hides nothing.
-    el.issueFix.textContent = more
-      ? 'add all ' + offeredFixes.length + ' defaults'
-      : offeredFixes[0].label;
-    el.issueFix.title = offeredFixes.map((f) => f.insert).join('   ·   ');
-    el.issueFix.hidden = false;
-    el.issuebar.classList.add('has-fix');
+    el.issueMsg.title = offeredFixes.map((f) => f.message).join('   ·   ');
   } else {
     const bits = [];
     if (errs) bits.push(errs + (errs === 1 ? ' error' : ' errors'));
     if (pend) bits.push(pend + ' pending');
     el.issueMsg.textContent = bits.length ? bits.join(' · ') : 'clean';
+    el.issueMsg.title = el.issueMsg.textContent;
+  }
+
+  // The button: the bar is the SUMMARY now. The primary place to press is the
+  // row itself, where the problem is, so the bar adds a button only when it can
+  // do something the rows cannot - all of them at once, or one that has no row
+  // of its own to sit on (a proposal whose line is not a row you can see).
+  //
+  // Several share one button because they are all the same kind of answer -
+  // "this is what it would otherwise have assumed" - and clicking through them
+  // one re-solve at a time is exactly the asking-for-things this is meant to
+  // remove. Every row still carries its own message, so batching hides nothing.
+  const orphans = offeredFixes.filter((f) => !f.attached);
+  const barFixes = offeredFixes.length > 1 ? offeredFixes : orphans;
+
+  if (barFixes.length) {
+    el.issueFix.textContent = barFixes.length > 1
+      ? 'add all ' + barFixes.length + ' defaults'
+      : barFixes[0].label;
+    el.issueFix.title = barFixes.map((f) => f.insert).join('   ·   ');
+    el.issueFix.hidden = false;
+    el.issuebar.classList.add('has-fix');
+  } else {
     el.issueFix.hidden = true;
     el.issueFix.textContent = '';
     el.issueFix.removeAttribute('title');
@@ -1142,9 +1267,15 @@ function renderIssueBar(issues) {
 /** Append every proposed row to the document, then recompile. */
 function applyOfferedFixes() {
   if (!offeredFixes.length) return;
+  // The same set the button is offering: everything when there are several,
+  // and otherwise only the one with no row of its own to be pressed on.
+  const orphans = offeredFixes.filter((f) => !f.attached);
+  const wanted = offeredFixes.length > 1 ? offeredFixes : orphans;
+  if (!wanted.length) return;
+
   const have = new Set(realRows().map((r) => squash(rowSource(r))));
   let last = null;
-  for (const f of offeredFixes) {
+  for (const f of wanted) {
     const key = squash(f.insert);
     if (have.has(key)) continue;
     have.add(key);
@@ -1168,10 +1299,59 @@ function setSolveBadge(text, kind) {
   el.statSolve.title = text;
   el.statSolve.classList.toggle('is-ok', kind === 'ok');
   el.statSolve.classList.toggle('is-bad', kind === 'bad');
+  el.statSolve.classList.toggle('is-wait', kind === 'wait');
+}
+
+/**
+ * GRAY-NOT-RED, APPLIED TO THE SOLVE.
+ *
+ * `solve` refuses to run while a name is used but never defined, and says so:
+ * "the model is still incomplete — line 1: k is not defined yet". That is not a
+ * failure. It is the ordinary state of a document that is being written, and
+ * showing it in red teaches someone that half-typing is a mistake.
+ *
+ * Note what is NOT in here: order. Rows may be written in any sequence - an
+ * initial condition above its ODE row, a parameter used before it is defined, a
+ * function called before it is written - and the compiler resolves the document
+ * as a whole. So a document that is waiting is waiting for a name to EXIST
+ * somewhere, never for it to exist ABOVE.
+ *
+ * Three situations wear one shape (`ok: false` plus a sentence) and they are
+ * not the same event:
+ *
+ *   'waiting'  a name has not been typed yet   gray, and the curve stays
+ *   'refused'  a method this document has no structure for   red, no curve
+ *   'failed'   anything else                                 red, no curve
+ */
+function classifySolveFailure(msg, issues) {
+  // Every engine refusal of a method opens with that method's name.
+  if (methodNames.some((n) => msg.indexOf(n) === 0)) return 'refused';
+  if (/incomplete|not defined/i.test(msg)) return 'waiting';
+  if (issues.some((i) => i.severity === 'pending' && i.fix)) return 'waiting';
+  return 'failed';
+}
+
+/**
+ * What the document is waiting for, by name. Only an undefined name actually
+ * stops the solve - a missing initial condition is reported AND defaulted in
+ * the same pass, so it is never what the model is waiting on.
+ */
+function waitingOn() {
+  const names = offeredFixes.map((f) => f.target).filter((t) => !/\(0\)$/.test(t));
+  return names.length
+    ? 'waiting on ' + names.join(', ')
+    : 'waiting for the rest of the document';
 }
 
 // ---------------------------------------------------------------------------
-// View chips - what the model can actually show
+// Views - a small menu, not three chips spending permanent width
+//
+// Every view the model supports turns itself ON. That is the right default
+// because the views SHARE ONE FRAME now: an extra one is an extra curve over
+// the same axes, not a tile taken out of the picture, so there is nothing to
+// pay for having it on. The menu exists for the other direction - turning one
+// OFF when it is in the way - and a view the model cannot support is listed
+// with the reason, because that is how the capability is discovered.
 // ---------------------------------------------------------------------------
 
 const ANGLE_NAMES = ['theta', 'θ', 'phi', 'φ'];
@@ -1193,108 +1373,171 @@ function polarMapFor(names) {
   return { r, theta };
 }
 
-const CHIP_TITLE = {
+const VIEW_WHY = {
   time:  ['every state against time', 'every state against time'],
-  phase: ['state 2 against state 1', 'the phase plane needs exactly 2 states'],
-  polar: ['r against the angle', 'no polar content: define a state named r'],
+  phase: ['state 2 against state 1', 'needs exactly 2 states'],
+  polar: ['r against the angle', 'needs a state named r'],
 };
 
-const chips = new Map();          // view id -> button
 const caps = { time: true, phase: false, polar: false };
 
 /**
- * The views that are ON. A set, not a choice: `t–y`, `phase` and `polar` are
- * three independent switches and any number of them may be on at once. The
- * canvas is tiled between them (see plot.js, "HOW SEVERAL VIEWS SHARE THE
- * CANVAS"). Nothing but a click on its own chip ever takes a view out of here.
+ * The views the user has explicitly switched OFF. Everything the model supports
+ * and is not in here is on - so gaining a second state lights the phase
+ * portrait up by itself, and turning it off keeps it off across recompiles and
+ * demo loads, because that was a decision and decisions are remembered.
  */
-const viewsOn = new Set(['time']);
+const viewsOff = new Set();
 
-function collectChips() {
-  el.views.querySelectorAll('.viewchip').forEach((btn) => {
-    const view = btn.dataset.view;
-    if (!view) return;
-    chips.set(view, btn);
-    btn.addEventListener('click', () => toggleView(view));
-  });
-}
-
-function renderChips() {
-  chips.forEach((btn, view) => {
-    const ok = !!caps[view];
-    const on = viewsOn.has(view);
-    btn.classList.toggle('is-on', on);
-    btn.classList.toggle('is-off', !ok);
-    // Inert only while it is off AND unsupported: a view that is already on
-    // can always be turned off, whatever the document has become.
-    btn.setAttribute('aria-disabled', ok || on ? 'false' : 'true');
-    btn.setAttribute('aria-pressed', on ? 'true' : 'false');
-    const t = CHIP_TITLE[view];
-    if (t) btn.title = ok ? t[0] : t[1];
-  });
+/** The views actually drawn: supported, and not switched off. */
+function activeViews() {
+  return VIEWS.filter((v) => caps[v] && !viewsOff.has(v));
 }
 
 /** Push the on-set and the capability set at the plot, then repaint. */
 function applyViews() {
-  plot.setViews(VIEWS.filter((v) => viewsOn.has(v)));
+  plot.setViews(activeViews());
   plot.setSupport(caps);
-  renderChips();
+  renderViewMenu();
   syncFrameButtons();
   scheduleDraw();
 }
 
 function toggleView(view) {
-  if (!chips.has(view)) return;
-  if (viewsOn.has(view)) viewsOn.delete(view);
-  else if (caps[view]) viewsOn.add(view);
-  else return;                      // muted chips are inert, not hidden
+  if (VIEWS.indexOf(view) < 0) return;
+  if (viewsOff.has(view)) {
+    if (!caps[view]) return;        // an unsupported view has nothing to show
+    viewsOff.delete(view);
+  } else {
+    viewsOff.add(view);
+  }
   applyViews();
+  // Turning t–y back on hands the span back to the horizontal axis, and the
+  // axis may have moved while it was off.
+  scheduleResolve(0);
+}
+
+/** The menu itself: one line per view, checked when it is drawing. */
+function renderViewMenu() {
+  if (!el.viewmenu) return;
+  el.viewmenu.textContent = '';
+  const live = activeViews();
+  for (const view of VIEWS) {
+    const item = document.createElement('button');
+    item.type = 'button';
+    item.className = 'viewitem';
+    item.setAttribute('role', 'menuitemcheckbox');
+    item.dataset.view = view;
+
+    const on = live.indexOf(view) >= 0;
+    item.classList.toggle('is-on', on);
+    item.classList.toggle('is-off', !caps[view]);
+    item.setAttribute('aria-checked', on ? 'true' : 'false');
+    item.setAttribute('aria-disabled', caps[view] ? 'false' : 'true');
+
+    const mark = document.createElement('span');
+    mark.className = 'viewitem__mark';
+    mark.textContent = on ? '✓' : '';
+
+    const name = document.createElement('span');
+    name.className = 'viewitem__name';
+    name.textContent = VIEW_LABEL[view] || view;
+
+    const why = document.createElement('span');
+    why.className = 'viewitem__why';
+    const t = VIEW_WHY[view];
+    why.textContent = t ? (caps[view] ? t[0] : t[1]) : '';
+
+    item.append(mark, name, why);
+    item.addEventListener('click', () => toggleView(view));
+    el.viewmenu.append(item);
+  }
+  el.viewsBtn.classList.toggle('is-live', viewsOff.size > 0);
+  el.viewsBtn.title = live.length
+    ? 'drawing: ' + live.map((v) => VIEW_LABEL[v] || v).join(', ')
+    : 'nothing is drawn — turn a view on';
+}
+
+function openViews() {
+  renderViewMenu();
+  const r = el.viewsBtn.getBoundingClientRect();
+  el.viewmenu.hidden = false;
+  el.viewsBtn.setAttribute('aria-expanded', 'true');
+  const w = el.viewmenu.offsetWidth;
+  el.viewmenu.style.left = clamp(r.left, 8, Math.max(8, window.innerWidth - w - 8)) + 'px';
+  el.viewmenu.style.top = (r.bottom + 8) + 'px';
+}
+
+function closeViews() {
+  if (!el.viewmenu || el.viewmenu.hidden) return;
+  el.viewmenu.hidden = true;
+  el.viewsBtn.setAttribute('aria-expanded', 'false');
+}
+
+function toggleViewMenu() {
+  if (el.viewmenu.hidden) openViews(); else closeViews();
 }
 
 /**
- * What the document can currently show. This NEVER changes what is on: a view
- * that loses its support stays where the user put it and says why on its own
- * tile, because switching something off on someone's behalf is how a UI
- * teaches them not to trust it.
+ * What the document can currently show. A view that GAINS support turns on by
+ * itself unless it was switched off by hand; one that loses it stops drawing
+ * and says why in the menu, because a curve that cannot exist is not a curve
+ * anyone is owed.
  */
 function updateCapabilities(names) {
   caps.time = true;
   caps.phase = Array.isArray(names) && names.length === 2;
   caps.polar = polarMapFor(names) !== null;
-  plot.setSupport(caps);
-  renderChips();
+  applyViews();
+}
+
+// ---------------------------------------------------------------------------
+// `show` - a document saying what is worth looking at
+//
+// `colliding-strings` has twelve states and is about two strings. `show` names
+// the series that are the picture; the rest are still solved and still in the
+// hear panel, they are simply not drawn and not in the legend. Absent - or
+// naming nothing that exists in this document - means everything.
+// ---------------------------------------------------------------------------
+
+function shownSelection(names, extra) {
+  const want = state.show;
+  if (!Array.isArray(want) || !want.length) return { states: null, extra: null };
+
+  const states = [];
+  const derived = [];
+  (names || []).forEach((n, i) => { if (want.indexOf(n) >= 0) states.push(i); });
+  (extra || []).forEach((ex, i) => { if (want.indexOf(ex.name) >= 0) derived.push(i); });
+
+  // A `show` list that matches nothing would draw an empty plot, which is a
+  // worse answer than ignoring it.
+  if (!states.length && !derived.length) return { states: null, extra: null };
+  return { states, extra: derived };
 }
 
 // ---------------------------------------------------------------------------
 // The readout - which is also the legend
 //
-// Colour, name, and the value at the playhead: a separate legend would repeat
-// two thirds of that, so there is only one of them and it sits on the plot's
-// control strip.
+// Colour, name, and the value at the right-hand edge of the window - the end of
+// the span that was solved. A separate legend would repeat two thirds of that,
+// so there is only one of them and it sits on the plot's control strip.
 // ---------------------------------------------------------------------------
 
 function renderReadout(names, values) {
   el.readout.innerHTML = '';
   if (!Array.isArray(names) || !names.length) return;
 
-  // `t` first, because with no widget of its own this is where it is read.
-  const tc = document.createElement('span');
-  tc.className = 'chip chip--t';
-  const td = document.createElement('span');
-  td.className = 'chip__dot';
-  const tn = document.createElement('span');
-  tn.className = 'chip__name';
-  tn.textContent = 't';
-  const tv = document.createElement('span');
-  tv.className = 'chip__val';
-  tv.textContent = fmtValue(state.t);
-  tc.append(td, tn, tv);
-  el.readout.appendChild(tc);
+  const sol = state.sol;
+  const extra = (sol && sol.extra) || [];
+  const showStates = sol && Array.isArray(sol.showStates) ? sol.showStates : null;
+  const showExtra = sol && Array.isArray(sol.showExtra) ? sol.showExtra : null;
 
   const have = values && values.length;
   names.forEach((name, i) => {
+    if (showStates && showStates.indexOf(i) < 0) return;
     const chip = document.createElement('span');
     chip.className = 'chip';
+    chip.title = name + ' at t = ' + fmtValue(state.t1) + ', the right edge of the window';
     const dot = document.createElement('span');
     dot.className = 'chip__dot';
     dot.style.background = seriesColor(i);
@@ -1308,12 +1551,12 @@ function renderReadout(names, values) {
     el.readout.appendChild(chip);
   });
 
-  // Derived rows report their drift rather than a value at the playhead: the
-  // point of an energy row is not what it reads now but whether it is holding.
-  // secularRatio compares the band over the last tenth of the run against the
-  // first — around 1 is a band, well above 1 is a genuine drift.
-  const extra = (state.frame && state.frame.extra) || [];
+  // Derived rows report their drift rather than a value: the point of an energy
+  // row is not what it reads now but whether it is holding. secularRatio
+  // compares the band over the last tenth of the run against the first — around
+  // 1 is a band, well above 1 is a genuine drift.
   extra.forEach((ex, e) => {
+    if (showExtra && showExtra.indexOf(e) < 0) return;
     const chip = document.createElement('span');
     chip.className = 'chip chip--derived';
     const dot = document.createElement('span');
@@ -1349,12 +1592,12 @@ function scheduleDraw() {
   drawQueued = true;
   requestAnimationFrame(() => {
     drawQueued = false;
-    plot.draw(state.frame);
+    plot.draw(state.sol);
   });
 }
 
 // ---------------------------------------------------------------------------
-// The frame - -5..5 by default, and the user's from then on
+// The frame - -5..5 by default, the user's from then on, and THE QUERY
 //
 // Desmos' bargain: a fixed, predictable window is what makes two runs
 // comparable, so the plot does not fit itself around the data. What it does
@@ -1364,35 +1607,46 @@ function scheduleDraw() {
 //   drag along the x labels scale x about the value you grabbed
 //   drag along the y labels scale y about the value you grabbed
 //   wheel                   zoom about the cursor (over an axis: that axis)
-//   double click            that tile back to -5..5
-//   the -5..5 button        every tile back to -5..5
-//   the fit button          every tile around its own curve, when asked
+//   double click            back to -5..5
+//   the -5..5 button        back to -5..5
+//   the fit button          around the curve, when asked
 //
-// A re-solve never touches any of it.
+// A re-solve never touches any of it. The other direction is new: while `t–y`
+// is on, x0..x1 IS the span, so every one of those gestures ends in a re-solve
+// (scheduleResolve, below) over whatever the horizontal axis now shows.
 // ---------------------------------------------------------------------------
 
 function syncFrameButtons() {
   const dirty = !plot.isDefaultFrame();
   el.frameReset.classList.toggle('is-live', dirty);
   el.frameReset.setAttribute('aria-disabled', dirty ? 'false' : 'true');
-  el.frameFit.disabled = !state.frame;
+  el.frameFit.disabled = !state.sol;
+}
+
+/** Every gesture ends here: repaint now, re-solve shortly. */
+function frameChanged(delay) {
+  syncFrameButtons();
+  scheduleDraw();
+  scheduleResolve(delay);
 }
 
 function resetFrames() {
-  plot.resetAllWindows();
-  syncFrameButtons();
-  scheduleDraw();
+  plot.resetWindow();
+  frameChanged(0);
 }
 
 function fitFrames() {
-  if (!state.frame) return;
-  for (const view of VIEWS) {
-    if (!viewsOn.has(view)) continue;
-    const win = plot.fitWindow(view, state.frame);
-    if (win) plot.setWindow(view, win);
+  if (!state.sol) return;
+  const win = plot.fitWindow(state.sol);
+  if (win) {
+    // Fitting x while `t–y` is on would be circular - x already IS the solved
+    // span, so "fit" there can only mean "fit what the curves are doing
+    // vertically". The span is left exactly where the user put it.
+    const keepX = activeViews().indexOf('time') >= 0;
+    const now = plot.getWindow();
+    plot.setWindow(keepX ? { ...win, x0: now.x0, x1: now.x1 } : win);
   }
-  syncFrameButtons();
-  scheduleDraw();
+  frameChanged(0);
 }
 
 /** Where the pointer is, in the canvas' own CSS pixels. */
@@ -1424,15 +1678,14 @@ function wireCanvasGestures() {
 
     drag = {
       id: e.pointerId,
-      view: hit.view,
       box: hit.box,
       region: hit.region,
       x: p.x,
       y: p.y,
       // The window as it was when the gesture began. Every move recomputes
       // from this rather than accumulating, so a drag cannot drift.
-      win: plot.getWindow(hit.view),
-      anchor: plot.dataAt(hit.view, hit.box, p.x, p.y),
+      win: plot.getWindow(),
+      anchor: plot.dataAt(hit.box, p.x, p.y),
       moved: false,
     };
     try { cv.setPointerCapture(e.pointerId); } catch (err) { /* older engines */ }
@@ -1446,18 +1699,19 @@ function wireCanvasGestures() {
       if (Math.abs(dx) > 2 || Math.abs(dy) > 2) drag.moved = true;
 
       if (drag.region === 'body') {
-        plot.setWindow(drag.view, panned(drag.win, drag.box, dx, dy));
+        plot.setWindow(panned(drag.win, drag.box, dx, dy));
       } else if (drag.region === 'x') {
         // Drag right and the axis stretches: the span shrinks, the value you
         // grabbed stays under the pointer.
         const w = Math.max(1, drag.box.R - drag.box.L);
-        plot.setWindow(drag.view, scaled(drag.win, 'x', Math.exp(-dx / (w * 0.5)), drag.anchor.x));
+        plot.setWindow(scaled(drag.win, 'x', Math.exp(-dx / (w * 0.5)), drag.anchor.x));
       } else {
         const h = Math.max(1, drag.box.B - drag.box.T);
-        plot.setWindow(drag.view, scaled(drag.win, 'y', Math.exp(dy / (h * 0.5)), drag.anchor.y));
+        plot.setWindow(scaled(drag.win, 'y', Math.exp(dy / (h * 0.5)), drag.anchor.y));
       }
-      syncFrameButtons();
-      scheduleDraw();
+      // The picture follows the pointer at once; the SOLVE is debounced, so a
+      // drag is one integration at the end of it and not one per pointermove.
+      frameChanged();
     };
 
     const up = (ev) => {
@@ -1481,9 +1735,8 @@ function wireCanvasGestures() {
     const hit = plot.hit(p.x, p.y);
     if (!hit) return;
     e.preventDefault();
-    plot.resetWindow(hit.view);
-    syncFrameButtons();
-    scheduleDraw();
+    plot.resetWindow();
+    frameChanged(0);
   });
 
   // Wheel zooms about the cursor. Over an axis strip it zooms that axis only,
@@ -1495,13 +1748,12 @@ function wireCanvasGestures() {
     e.preventDefault();
     const step = e.deltaMode === 1 ? e.deltaY * 16 : e.deltaMode === 2 ? e.deltaY * 400 : e.deltaY;
     const f = Math.exp(clamp(step, -260, 260) / 420);
-    const at = plot.dataAt(hit.view, hit.box, p.x, p.y);
-    const win = plot.getWindow(hit.view);
-    if (hit.region === 'x') plot.setWindow(hit.view, scaled(win, 'x', f, at.x));
-    else if (hit.region === 'y') plot.setWindow(hit.view, scaled(win, 'y', f, at.y));
-    else plot.setWindow(hit.view, zoomed(win, f, at.x, at.y));
-    syncFrameButtons();
-    scheduleDraw();
+    const at = plot.dataAt(hit.box, p.x, p.y);
+    const win = plot.getWindow();
+    if (hit.region === 'x') plot.setWindow(scaled(win, 'x', f, at.x));
+    else if (hit.region === 'y') plot.setWindow(scaled(win, 'y', f, at.y));
+    else plot.setWindow(zoomed(win, f, at.x, at.y));
+    frameChanged();
   }, { passive: false });
 }
 
@@ -1514,11 +1766,8 @@ function wireCanvasGestures() {
 // - and one click promotes it into a real slider, sitting on the row that
 // defines the number it drives. The × on it goes back to the offer.
 //
-// `t` is no longer an exception to any of that. Its row says `t = [0, 20]`, it
-// is offered a slider like every other variable, and it arrives promoted the
-// way a demo's knobs do - because the playhead is what the plot is for. What
-// dragging it means is the only difference: a parameter slider rewrites its row
-// and re-solves, `t`'s moves the playhead through a solution already computed.
+// `t` is not one of these and never will be again: the span is the window, and
+// a window already has a way to be moved.
 //
 // Range and step live in an overlay that opens on demand - they are set once,
 // while the value is watched constantly, so giving them permanent screen space
@@ -1531,7 +1780,7 @@ const GEAR_SVG =
   '<circle cx="3" cy="8" r="1.5"/><circle cx="8" cy="8" r="1.5"/>' +
   '<circle cx="13" cy="8" r="1.5"/></svg>';
 
-/** name -> slider record. Every variable that has been asked for, `t` included. */
+/** name -> slider record, for every parameter that has been asked for. */
 const sliders = new Map();
 let openSlider = null;
 
@@ -1548,12 +1797,7 @@ function wireRange(s) {
     if (!isFinite(v)) return;
     s.value = v;
     paintSlider(s);
-    if (s.kind === 'time') {
-      if (state.playing) setPlaying(false);
-      setTime(v, true);
-    } else {
-      writeParam(s);
-    }
+    writeParam(s);
   });
 }
 
@@ -1561,14 +1805,8 @@ function wireRange(s) {
  * A slider, on the row that defines the thing it drives. It carries no name and
  * no value readout, because the row above it says both - `k = 60` is the
  * readout, and dragging rewrites it live.
- *
- * `t` gets exactly this, from exactly this function. The only difference is
- * what dragging it means: a parameter slider rewrites its row and re-solves,
- * while `t`'s moves the playhead through a solution that is already there.
- *
- * @param {'param'|'time'} kind
  */
-function makeSlider(name, init, kind) {
+function makeSlider(name, init) {
   const wrap = document.createElement('div');
   wrap.className = 'knob';
   wrap.dataset.name = name;
@@ -1582,9 +1820,7 @@ function makeSlider(name, init, kind) {
   gear.type = 'button';
   gear.className = 'knob__btn knob__gear';
   gear.innerHTML = GEAR_SVG;
-  gear.title = kind === 'time'
-    ? 'The span t is integrated over'
-    : 'Range and step for ' + name;
+  gear.title = 'Range and step for ' + name;
   gear.setAttribute('aria-label', 'Range and step for ' + name);
   gear.setAttribute('aria-expanded', 'false');
 
@@ -1600,10 +1836,7 @@ function makeSlider(name, init, kind) {
   const knob = pendingKnobs.get(name);
   const s = {
     name,
-    kind: kind === 'time' ? 'time' : 'param',
-    label: kind === 'time'
-      ? 'the playhead'
-      : (knob && knob.label ? String(knob.label) : ''),
+    label: knob && knob.label ? String(knob.label) : '',
     el: wrap,
     nameBtn: gear,          // what the settings overlay hangs off and returns to
     valueEl: null,
@@ -1635,9 +1868,8 @@ function applyRange(s) {
 }
 
 function paintSlider(s) {
-  // No readout of its own: the row above it is the readout, and for `t` the
-  // readout on the plot is. The hover text is where a demo's description of the
-  // knob goes.
+  // No readout of its own: the row above it is the readout. The hover text is
+  // where a demo's description of the knob goes.
   s.range.title = s.name + ' = ' + fmtStepped(s.value, s.step) +
     (s.label ? ' · ' + s.label : '');
 }
@@ -1663,9 +1895,7 @@ function openSettingsFor(s) {
   el.settingsMin.value = String(s.min);
   el.settingsMax.value = String(s.max);
   el.settingsStep.value = String(s.step);
-  el.settingsFoot.textContent = s.kind === 'time'
-    ? 'min and max are the span; they rewrite the row · Esc to close'
-    : 'Esc to close';
+  el.settingsFoot.textContent = 'Esc to close';
 
   el.settings.hidden = false;
   positionSettings(s);
@@ -1700,9 +1930,7 @@ function readSettings() {
   const max = parseFloat(el.settingsMax.value);
   const step = parseFloat(el.settingsStep.value);
 
-  let spanChanged = false;
   if (isFinite(min) && isFinite(max) && max > min) {
-    spanChanged = s.min !== min || s.max !== max;
     s.min = min;
     s.max = max;
   }
@@ -1712,13 +1940,7 @@ function readSettings() {
 
   // A chosen range outlives the slider: deleting and retyping the row, or
   // dismissing and re-adding the slider, must not throw it away.
-  if (s.kind === 'param') {
-    knobRanges.set(s.name, { min: s.min, max: s.max, step: s.step });
-  }
-
-  // The span is written down in the document, so changing it here changes the
-  // row that says it - the same bargain a parameter slider makes.
-  if (s.kind === 'time' && spanChanged) writeSpan(s);
+  knobRanges.set(s.name, { min: s.min, max: s.max, step: s.step });
 }
 
 // -- parameter sliders write back into their own row ------------------------
@@ -1726,32 +1948,6 @@ function readSettings() {
 const NUM = String.raw`[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?`;
 
 const ASSIGN_RE = new RegExp(String.raw`^\s*([A-Za-z_][A-Za-z_0-9]*)\s*=\s*(${NUM})\s*$`);
-
-/**
- * The row that says how far time runs: `t = [0, 20]`.
- *
- * A list literal, because that is a row the parser already reads and the math
- * field already draws - no new row kind was invented to get `t` onto the page.
- * The solver rebinds `t` at every right-hand-side evaluation, so the row cannot
- * change what the equations mean; it is read by the shell and inert to the
- * engine, which is exactly what "the span" is.
- */
-const SPAN_RE = new RegExp(String.raw`^\s*t\s*=\s*\[\s*(${NUM})\s*,\s*(${NUM})\s*\]\s*$`);
-
-/** The first well-formed span row, or null when the document has none. */
-function scanSpan() {
-  for (const row of realRows()) {
-    const m = SPAN_RE.exec(rowSource(row).split('#')[0]);
-    if (!m) continue;
-    const t0 = Number(m[1]);
-    const t1 = Number(m[2]);
-    if (isFinite(t0) && isFinite(t1) && t1 > t0) return { row, t0, t1 };
-  }
-  return null;
-}
-
-/** The text of a span row, for writing one. */
-const spanRow = (t0, t1) => 't = [' + numText(t0, 0.001) + ', ' + numText(t1, 0.001) + ']';
 
 /** Every `name = <number>` row in the document, mapped to its row. */
 function scanAssignments() {
@@ -1762,25 +1958,6 @@ function scanAssignments() {
     if (m && !map.has(m[1])) map.set(m[1], { value: Number(m[2]), row });
   }
   return map;
-}
-
-/** Push a new span back into the row that states it, then re-solve. */
-function writeSpan(s) {
-  const hit = scanSpan();
-  if (!hit) return;
-  const raw = rowSource(hit.row);
-  const hash = raw.indexOf('#');
-  const note = hash >= 0 ? '  ' + raw.slice(hash) : '';
-  try {
-    hit.row.field.source = spanRow(s.min, s.max) + note;
-  } catch (err) {
-    console.error('[numpla] MathField.source= threw', err);
-    return;
-  }
-  state.t0 = s.min;
-  state.t1 = s.max;
-  setTime(state.t);              // the readout must not lag the new span
-  scheduleRecompute(220);
 }
 
 function writeParam(s) {
@@ -1854,12 +2031,11 @@ function demoteParam(name) {
 function syncKnobs(params) {
   const drivable = new Set();
   for (const name of params) {
-    if (name === 't') continue;       // its row is a span, not a plain number
     if (state.names.indexOf(name) >= 0) continue;   // it is a state, not a knob
     drivable.add(name);
   }
 
-  const wanted = new Map();     // row -> { name, value, kind, min?, max? }
+  const wanted = new Map();     // row -> { name, value }
   const seen = new Set();
   for (const row of realRows()) {
     const m = ASSIGN_RE.exec(rowSource(row).split('#')[0]);
@@ -1867,18 +2043,7 @@ function syncKnobs(params) {
     const name = m[1];
     if (!drivable.has(name) || seen.has(name)) continue;
     seen.add(name);
-    wanted.set(row, { name, value: Number(m[2]), kind: 'param' });
-  }
-
-  // `t` earns its knob the same way every other variable does - by having a
-  // row that says numbers a slider could drive. Its row says two, which is the
-  // span; the slider inside that span is the playhead.
-  const span = scanSpan();
-  if (span && !wanted.has(span.row)) {
-    seen.add('t');
-    wanted.set(span.row, {
-      name: 't', kind: 'time', value: state.t, min: span.t0, max: span.t1,
-    });
+    wanted.set(row, { name, value: Number(m[2]) });
   }
 
   const keyFor = (w) => (w ? (promoted.has(w.name) ? 'slider:' : 'offer:') + w.name : '');
@@ -1898,13 +2063,7 @@ function syncKnobs(params) {
     const key = keyFor(w);
     if (row.knobKey === key) continue;
     if (promoted.has(w.name)) {
-      const s = sliders.get(w.name) || (w.kind === 'time'
-        ? makeSlider('t', {
-            min: w.min, max: w.max,
-            step: niceStepFor(w.max - w.min),
-            value: clamp(state.t, w.min, w.max),
-          }, 'time')
-        : makeSlider(w.name, initialRangeFor(w.name, w.value), 'param'));
+      const s = sliders.get(w.name) || makeSlider(w.name, initialRangeFor(w.name, w.value));
       if (s.el.parentNode !== row.knobEl) row.knobEl.appendChild(s.el);
     } else {
       row.offerName = w.name;
@@ -1915,8 +2074,7 @@ function syncKnobs(params) {
     row.knobKey = key;
   }
 
-  // 3. drop the sliders whose variable left the document - `t` included, since
-  //    deleting its row is a perfectly good way to say you are done scrubbing
+  // 3. drop the sliders whose variable left the document
   for (const [name, s] of Array.from(sliders)) {
     if (seen.has(name)) continue;
     if (openSlider === s) closeSettings();
@@ -1927,99 +2085,38 @@ function syncKnobs(params) {
   // 4. keep the document's value and the slider's value in step
   for (const w of wanted.values()) {
     const s = sliders.get(w.name);
-    if (!s) continue;
-    if (w.kind === 'time') {
-      // The row is the authority on the range; the playhead is the value.
-      if (s.min !== w.min || s.max !== w.max) {
-        s.min = w.min;
-        s.max = w.max;
-        s.step = niceStepFor(w.max - w.min);
-        applyRange(s);
-      }
-      if (!s.dragging) setSliderValue(s, clamp(state.t, w.min, w.max));
-    } else if (s.kind === 'param' && !s.dragging) {
-      setSliderValue(s, w.value);
-    }
+    if (s && !s.dragging) setSliderValue(s, w.value);
   }
-}
-
-// ---------------------------------------------------------------------------
-// The playhead
-//
-// `t` has no widget of its own any more. It moves from three places - its
-// slider on its own row, play/pause on the plot, and the space bar - and what
-// it does is move a marker along the curve.
-// ---------------------------------------------------------------------------
-
-function updatePlayhead(redraw = true) {
-  const t = clamp(state.t, state.t0, state.t1);
-  state.t = t;
-
-  const ts = sliders.get('t');
-  if (ts) setSliderValue(ts, t);
-
-  const f = state.frame;
-  if (!f) {
-    el.readout.innerHTML = '';
-    if (redraw) scheduleDraw();
-    return;
-  }
-
-  let y = new Float64Array(0);
-  if (M) {
-    try {
-      y = toF64(M.eval(t));
-    } catch (err) {
-      console.error('[numpla] eval failed', err);
-    }
-  }
-
-  f.playT = t;
-  f.playY = y;
-  renderReadout(f.names, y);
-  if (redraw) scheduleDraw();
-}
-
-function setTime(t, fromSlider = false) {
-  state.t = clamp(t, state.t0, state.t1);
-  const ts = sliders.get('t');
-  if (ts) {
-    ts.value = state.t;
-    if (!fromSlider) ts.range.value = String(state.t);
-    paintSlider(ts);
-  }
-  updatePlayhead();
-}
-
-function setPlaying(on) {
-  state.playing = on;
-  el.play.classList.toggle('is-playing', on);
-  el.play.setAttribute('aria-label', on ? 'Pause' : 'Play');
-  if (on) {
-    state.lastFrameMs = performance.now();
-    requestAnimationFrame(tick);
-  }
-}
-
-function tick(now) {
-  if (!state.playing) return;
-  const dt = Math.min(0.1, (now - state.lastFrameMs) / 1000);
-  state.lastFrameMs = now;
-  const span = state.t1 - state.t0;
-  let t = state.t + (dt / PLAY_SECONDS) * span;
-  if (t > state.t1) t = state.t0 + ((t - state.t0) % (span || 1));
-  setTime(t);
-  requestAnimationFrame(tick);
 }
 
 // ---------------------------------------------------------------------------
 // The compute pipeline
 // ---------------------------------------------------------------------------
 
+/**
+ * How many points to ask for: one per device pixel across the canvas. Asking
+ * for more than the canvas can draw is waste, and asking for fewer is a lie
+ * about the curve (docs/ui-v5.md).
+ */
 function sampleCount() {
   const w = el.canvas.getBoundingClientRect().width || 900;
   const dpr = Math.min(4, Math.max(1, window.devicePixelRatio || 1));
-  return Math.round(Math.min(4000, Math.max(240, w * dpr * 1.2)));
+  return Math.round(clamp(w * dpr, 240, 4000));
+}
+
+/**
+ * THE SPAN. While `t–y` is on, the horizontal axis is time, so the window IS
+ * the integration range and there is nothing else to read it from.
+ *
+ * With `t–y` off, the horizontal axis is a state (phase) or a coordinate
+ * (polar), and panning it is not a statement about time at all - so the last
+ * span simply stands, unchanged, until `t–y` comes back. Silently re-solving
+ * over the phase plane's x range would be a number arrived at by accident.
+ */
+function spanFromFrame() {
+  if (activeViews().indexOf('time') < 0) return { t0: state.t0, t1: state.t1 };
+  const w = plot.getWindow();
+  return { t0: w.x0, t1: w.x1 };
 }
 
 function recompute() {
@@ -2055,24 +2152,14 @@ function recompute() {
     return;
   }
 
-  // The document says how far time runs. A `t = [0, 20]` row is the authority
-  // whenever there is one; delete it and the last span simply stands, which is
-  // the same courtesy every other deleted row gets.
-  const span = scanSpan();
-  if (span) {
-    state.t0 = span.t0;
-    state.t1 = span.t1;
-    state.t = clamp(state.t, span.t0, span.t1);
-  }
-
-  // `pending` is not an error, so the chips still track the document live:
+  // `pending` is not an error, so the views still track the document live:
   // `phase` lights up the moment a system gains its second state.
   updateCapabilities(names);
   syncKnobs(params);
 
   if (!names.length) {
     setSolveBadge('no states', null);
-    state.frame = null;
+    state.sol = null;
     el.statAccepted.textContent = '—';
     el.statRejected.textContent = '—';
     el.statRhs.textContent = '—';
@@ -2081,38 +2168,66 @@ function recompute() {
     return;
   }
 
-  const t0 = state.t0;
-  const t1 = state.t1;
+  // The window is the query: whatever the horizontal axis is showing is what
+  // gets integrated.
+  const { t0, t1 } = spanFromFrame();
   if (!isFinite(t0) || !isFinite(t1) || t1 <= t0) {
     setSolveBadge('bad span', 'bad');
     return;
   }
 
-  // 2. solve, with whichever integrator the reference has selected
+  // 2. solve, with whichever integrator is selected on the strip
   const report = parseJson(solveNow(t0, t1), 'SolveReport');
   if (!report || report.ok !== true) {
-    setSolveBadge(report && report.error ? String(report.error) : 'solve failed', 'bad');
+    const why = report && report.error ? String(report.error) : 'solve failed';
+    const kind = classifySolveFailure(why, issues);
+    // A refusal is data, not an exception: remember which method was turned
+    // down, so the strip says so instead of leaving a blank plot unexplained.
+    // Nothing else earns that mark - a document mid-sentence is not the
+    // integrator's fault.
+    lastMethodError = kind === 'refused' ? { method: currentMethod, message: why } : null;
+    renderMethods();
+
+    if (kind === 'waiting') {
+      // Not a failure: a document mid-sentence. Say what it is waiting FOR, in
+      // the muted style, and leave the last good curve exactly where it is -
+      // the same courtesy an `error` row already gets. The issue bar below has
+      // the names and the one-click rows that finish the thought.
+      setSolveBadge(waitingOn(), 'wait');
+      el.statSolve.title = why;
+      return;
+    }
+
+    setSolveBadge(why, 'bad');
     if (report) {
       el.statAccepted.textContent = report.accepted ?? '—';
       el.statRejected.textContent = report.rejected ?? '—';
       el.statRhs.textContent = report.rhsEvals ?? '—';
     }
+    // A refused solve has already invalidated the previous solution inside the
+    // model, so there is nothing left to draw and drawing the old curve would
+    // be a lie. Put the refusal itself on the canvas, where a plot that has
+    // gone blank would otherwise just look broken - this is how a symplectic
+    // method asked of a first-order document says so.
+    state.t0 = t0;
+    state.t1 = t1;
+    state.sol = { message: why };
+    el.readout.innerHTML = '';
+    syncFrameButtons();
+    scheduleDraw();
     return;
   }
 
   el.statAccepted.textContent = report.accepted ?? '—';
   el.statRejected.textContent = report.rejected ?? '—';
   el.statRhs.textContent = report.rhsEvals ?? '—';
-  // The report echoes the method it actually used, so the badge can never name
-  // one that did not run.
-  setSolveBadge(report.method ? 'solved · ' + report.method : 'solved', 'ok');
 
   const dim = Number.isInteger(report.dim) ? report.dim : names.length;
   const reportNames = Array.isArray(report.states) && report.states.length
     ? report.states
     : names;
 
-  // 3. sample the whole curve
+  // 3. sample the whole curve, at the resolution the canvas can draw
   const n = sampleCount();
   const data = toF64(M.sample(n));
   const stride = dim + 1;
@@ -2120,10 +2235,18 @@ function recompute() {
 
   state.t0 = isFinite(report.t0) ? report.t0 : t0;
   state.t1 = isFinite(report.t1) ? report.t1 : t1;
-  state.t = clamp(state.t, state.t0, state.t1);
+
+  // The report echoes the method it actually used, so the badge can never name
+  // one that did not run.
+  setSolveBadge(report.method ? 'solved · ' + report.method : 'solved', 'ok');
+  el.statSolve.title = (report.method ? report.method + ' · ' : '')
+    + 't ∈ [' + fmtValue(state.t0) + ', ' + fmtValue(state.t1) + ']'
+    + ' · ' + got + ' samples';
+  lastMethodError = null;
+  renderMethods();
 
   if (!got) {
-    state.frame = null;
+    state.sol = null;
     scheduleDraw();
     return;
   }
@@ -2131,23 +2254,40 @@ function recompute() {
   if (String(reportNames) !== String(names)) updateCapabilities(reportNames);
 
   const extra = derivedSeries(state.derived, got);
+  const sel = shownSelection(reportNames, extra);
 
-  state.frame = {
+  state.sol = {
     names: reportNames,
     dim,
     n: got,
     data,
     t0: state.t0,
     t1: state.t1,
-    playT: state.t,
-    playY: new Float64Array(0),
     polar: polarMapFor(reportNames),
     extra,
+    showStates: sel.states,
+    showExtra: sel.extra,
   };
 
   // A re-solve draws inside the frame the user left. It is never moved here.
   syncFrameButtons();
-  updatePlayhead();
+  renderReadout(reportNames, endValues());
+  scheduleDraw();
+}
+
+/**
+ * The state at the right-hand edge of the window - what the legend reads. There
+ * is no playhead to read instead, and the end of the span is the one time every
+ * curve on screen actually reaches.
+ */
+function endValues() {
+  if (!M) return new Float64Array(0);
+  try {
+    return toF64(M.eval(state.t1));
+  } catch (err) {
+    console.error('[numpla] eval failed', err);
+    return new Float64Array(0);
+  }
 }
 
 /**
@@ -2188,15 +2328,52 @@ function derivedSeries(names, n) {
 
 let debounceTimer = 0;
 
+function runRecompute() {
+  try {
+    recompute();
+  } catch (err) {
+    console.error('[numpla] recompute failed', err);
+    setSolveBadge('internal error', 'bad');
+  }
+}
+
 function scheduleRecompute(delay = 160) {
   clearTimeout(debounceTimer);
-  debounceTimer = setTimeout(() => {
-    try {
-      recompute();
-    } catch (err) {
-      console.error('[numpla] recompute failed', err);
-      setSolveBadge('internal error', 'bad');
-    }
+  clearTimeout(resolveTimer);       // an edit subsumes a pending window solve
+  debounceTimer = setTimeout(runRecompute, delay);
+}
+
+// ---------------------------------------------------------------------------
+// The window -> span loop
+//
+// Every frame gesture calls this. It is debounced exactly the way typing is,
+// and for the same reason: a pointermove is not a decision. The picture follows
+// the pointer at 60fps (scheduleDraw redraws the curve already in hand inside
+// the new window), and ONE integration happens when the hand stops - so a drag
+// across the canvas costs one solve, not two hundred.
+//
+// The guard is the span itself, not "did something move": panning vertically,
+// scaling y, or moving the frame with `t–y` switched off all leave the span
+// exactly where it was, and re-solving for an identical span would be work
+// nobody asked for.
+// ---------------------------------------------------------------------------
+
+const RESOLVE_MS = 180;
+let resolveTimer = 0;
+
+function spanUnchanged(a, b) {
+  // Compared relatively: at t ∈ [0, 400] a difference of 1e-9 is not a pan.
+  const scale = Math.max(1e-12, Math.abs(a.t1 - a.t0));
+  return Math.abs(a.t0 - b.t0) < scale * 1e-9 && Math.abs(a.t1 - b.t1) < scale * 1e-9;
+}
+
+function scheduleResolve(delay = RESOLVE_MS) {
+  clearTimeout(resolveTimer);
+  resolveTimer = setTimeout(() => {
+    const want = spanFromFrame();
+    if (!isFinite(want.t0) || !isFinite(want.t1) || want.t1 <= want.t0) return;
+    if (spanUnchanged(want, { t0: state.t0, t1: state.t1 })) return;
+    runRecompute();
   }, delay);
 }
 
@@ -2230,7 +2407,9 @@ function scheduleRecompute(delay = 160) {
 const FALLBACK_METHODS = ['Tsit5', 'Verlet', 'Yoshida4'];
 let methodApi = null;                 // { call(t0,t1,name), list } once present
 let methodNames = FALLBACK_METHODS.slice();
+let methodInfo = new Map();           // name -> { adaptive, symplectic, order }
 let currentMethod = FALLBACK_METHODS[0];
+let lastMethodError = null;           // { method, message } after a refusal
 
 function probeMethodApi(model, ctor) {
   const fn = typeof model.solve_with === 'function' ? 'solve_with'
@@ -2251,12 +2430,86 @@ function probeMethodApi(model, ctor) {
 
   if (list && list.length) {
     methodNames = list.map((m) => m.name);
+    methodInfo = new Map(list.map((m) => [m.name, m]));
     currentMethod = methodNames[0];
   }
   return { call: (t0, t1, name) => model[fn](t0, t1, name), list };
 }
 
-/** Integrate with whatever the reference has selected, or plainly. */
+/**
+ * Does this document have the position/velocity structure a symplectic method
+ * needs? A second-order row is lowered to two states with the velocity named
+ * `x'`, so a primed state name is exactly that structure showing through
+ * `Diagnostics.states` (docs/wasm-api.md, "State order").
+ *
+ * This only DIMS the entry - it never blocks the click. The engine's refusal
+ * names the offending row and says what to write instead, and that sentence is
+ * worth more than a disabled button.
+ */
+function hasSecondOrderRows() {
+  return (state.names || []).some((n) => typeof n === 'string' && n.indexOf("'") >= 0);
+}
+
+/**
+ * The integrator switch on the plot's strip: discrete versus continuous, one
+ * click, the live choice legible without hovering anything. Built from
+ * `Model.methods()` so a method added to numpla-ode arrives here on its own.
+ */
+let methodsSignature = null;
+
+function renderMethods() {
+  if (!el.methods) return;
+
+  const structural = hasSecondOrderRows();
+  // Rebuilding these on every solve would tear the strip apart under a drag -
+  // and take the focus ring with it. Nothing here changes unless one of these
+  // three facts does.
+  const signature = [
+    currentMethod, structural ? '2' : '1',
+    lastMethodError ? lastMethodError.method + ':' + lastMethodError.message : '',
+    methodNames.join(','),
+  ].join('|');
+  if (signature === methodsSignature) return;
+  methodsSignature = signature;
+
+  el.methods.textContent = '';
+  for (const name of methodNames) {
+    const info = methodInfo.get(name) || {};
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'modechip';
+    btn.dataset.method = name;
+    btn.textContent = name;
+
+    const live = name === currentMethod;
+    const refused = !!(lastMethodError && lastMethodError.method === name);
+    const needsStructure = info.symplectic === true && !structural;
+
+    btn.classList.toggle('is-on', live);
+    btn.classList.toggle('is-refused', live && refused);
+    btn.classList.toggle('is-unavailable', needsStructure && !live);
+    btn.setAttribute('aria-pressed', live ? 'true' : 'false');
+
+    const kind = info.adaptive === true ? 'adaptive'
+      : info.adaptive === false ? 'fixed step' : '';
+    const order = Number.isFinite(info.order) ? ', order ' + info.order : '';
+    btn.title = refused && live
+      ? lastMethodError.message
+      : name + (kind ? ' — ' + kind + order : '')
+        + (info.symplectic ? ' · symplectic' : '')
+        + (needsStructure ? ' · this document has no x\'\' rows to preserve' : '');
+
+    if (!methodApi) {
+      btn.setAttribute('aria-disabled', 'true');
+      btn.title = 'the loaded app/pkg/ build has no solve_with — rebuild the WASM';
+    } else {
+      btn.addEventListener('click', () => chooseMethod(name));
+    }
+    el.methods.append(btn);
+  }
+}
+
+/** Integrate with whichever integrator is selected, or plainly. */
 function solveNow(t0, t1) {
   if (methodApi) {
     try {
@@ -2270,8 +2523,10 @@ function solveNow(t0, t1) {
 
 function chooseMethod(name) {
   if (!methodApi || methodNames.indexOf(name) < 0) return false;
+  if (currentMethod !== name) lastMethodError = null;
   currentMethod = name;
-  renderReference();
+  renderMethods();
+  if (!el.info.hidden) renderReference();
   scheduleRecompute(0);
   return true;
 }
@@ -2279,7 +2534,7 @@ function chooseMethod(name) {
 const REFERENCE = [
   {
     group: 'Row kinds',
-    note: 'One row per line. Each of these writes a new row into the document.',
+    note: 'One row per line, in any order — the compiler reads the whole document at once, so an initial condition may sit above its ODE row and a parameter may be used before the row that defines it. Each of these writes a new row into the document.',
     rows: true,
     entries: [
       { sig: "x' = -y", desc: 'An ODE row. `x` becomes a state variable, and `t` is bound to the current time on the right-hand side.', keys: 'ode derivative state' },
@@ -2287,7 +2542,6 @@ const REFERENCE = [
       { sig: "x'(0) = 0", desc: 'The starting velocity of a second-order row.', keys: 'initial velocity' },
       { sig: 'x(0) = 1', desc: 'An initial condition. Leave it out and it is 0 — reported, not assumed in silence.', keys: 'initial condition start' },
       { sig: 'k = 0.4', desc: 'A parameter, visible to every row. A plain numeric one can be given a slider on its own row.', keys: 'parameter constant knob' },
-      { sig: 't = [0, 20]', desc: 'How far time runs. `t` is a variable in the system like any other — this row says its span, and the slider you can put on it is the playhead inside that span. The solver rebinds `t` while it integrates, so the row cannot change what the equations mean.', keys: 'time span playhead integration range scrub transport' },
       { sig: 'f(u) = u^2', desc: 'A function definition — and what makes `f(u)` a call rather than a coefficient anywhere else in the document.', keys: 'function definition' },
       { sig: '# a note', desc: 'A comment row: prose for the reader, skipped by the parser, never numbered and never diagnosed.', keys: 'comment prose' },
     ],
@@ -2353,7 +2607,7 @@ const REFERENCE = [
       { sig: "x'", desc: "A prime: the derivative of x. On a right-hand side it is the velocity state a second-order row introduced.", insert: "x'", keys: 'prime derivative velocity' },
       { sig: 'x^2', desc: 'Powers, right-associative: 2^3^2 is 512. Unary minus binds looser, so −2^2 is −4.', insert: 'x^2', keys: 'power exponent caret' },
       { sig: 'f(u) versus g (u)', desc: '`f(u)` is a call only when the document has an `f(u) = …` row; every other name followed by ( is a coefficient. So `f(y − x)^3` cubes the result of a call while `g (y − x)^3` cubes the difference and then scales it — the same tokens, two different systems.', insert: 'f(u) = u^2', asRow: true, keys: 'call coefficient ambiguity parser' },
-      { sig: 't', desc: 'Bound to the current time inside any right-hand side. Its span is a row of its own — see `t = [0, 20]`.', insert: 't', keys: 'time' },
+      { sig: 't', desc: 'Bound to the current time inside any right-hand side. There is no row and no slider for it: the span it runs over is whatever the plot’s horizontal axis is showing.', insert: 't', keys: 'time span window integration range' },
       { sig: '[a, b, c]', desc: 'A list. Arithmetic broadcasts a scalar across a list and zips two lists of equal length; the builtin functions take scalars only.', insert: '[', keys: 'list vector array' },
       { sig: '+ − * / ^', desc: 'The whole operator set. No comparisons, no factorial, no % — `mod` is a function, and `=` splits a row into a statement rather than comparing.', keys: 'operators precedence comparison factorial' },
     ],
@@ -2371,12 +2625,15 @@ const REFERENCE = [
   {
     group: 'Features',
     entries: [
-      { sig: 't is a variable, not a widget', desc: 'The row `t = [0, 20]` says the span; the slider you promote on that row is the playhead. Dragging it moves a marker along the curve and redraws the trajectory travelled-versus-ahead — it does not re-solve, because the solution does not depend on where you are looking. Widening the span in the gear rewrites the row, and that does.', keys: 'time transport play scrub span playhead slider' },
+      { sig: 'the window is the span', desc: 'What is on screen is what gets solved. Pan or zoom the horizontal axis and the model re-integrates over the new interval, at one sample per pixel of canvas. There is no `t` slider, no playhead and no play button, because the frame already knows where you are looking. Zooming far out is a genuinely longer integration and may take longer — the telemetry says so.', keys: 'time span window zoom pan integration range playhead transport scrub' },
       { sig: 'add slider', desc: 'Every plain `k = number` row offers one, in the line it already reserves for its diagnostic. It sits on the row that defines the number, and dragging it rewrites that row.', keys: 'slider knob parameter drag' },
-      { sig: 'three views, any number on', desc: 't–y, phase and polar are independent switches; the canvas is tiled between whichever are on. A view the document cannot support stays visible but inert — that is how you find out it exists.', keys: 'view phase polar toggle tile' },
-      { sig: 'the frame is yours', desc: '−5 to 5 on both axes to begin with, so two runs are comparable. Drag an axis to scale it, drag the body to pan, wheel to zoom about the cursor, double-click a tile to put it back. A re-solve never moves it.', keys: 'axes zoom pan scale window frame reset' },
-      { sig: 'gray, not red', desc: 'An incomplete document is muted, never an error, and only a real error pauses the solve — the last good curve stays on screen while you type.', keys: 'pending error diagnostic' },
-      { sig: 'the issue bar', desc: 'What the document still needs, as a sentence, with the row the compiler would have written one click away.', keys: 'fix missing initial condition' },
+      { sig: 'one plot, everything in it', desc: 't–y, phase and polar all draw into ONE frame, overlapping — nothing is tiled. A view the model supports turns itself on; the views menu on the strip is how you turn one off when it is in the way.', keys: 'view phase polar toggle overlap menu tile' },
+      { sig: 'discrete versus continuous', desc: 'The integrator is on the strip: Tsit5 against Verlet and Yoshida4, one click, the live one marked. A symplectic method asked of a document with no second-order rows is refused by name and the sentence is drawn on the plot — there is deliberately no silent fallback.', keys: 'integrator method symplectic verlet yoshida tsit5 switch mode' },
+      { sig: 'what to draw', desc: 'A demo may declare `show: [...]` — the series that are the picture. Only those are drawn and only those are in the legend; the rest are still solved.', keys: 'show series legend filter demo' },
+      { sig: 'the frame is yours', desc: '−5 to 5 on both axes to begin with, so two runs are comparable. Drag an axis to scale it, drag the body to pan, wheel to zoom about the cursor, double-click to put it back. A re-solve never moves it — moving it is what causes one.', keys: 'axes zoom pan scale window frame reset' },
+      { sig: 'rows in any order', desc: 'The whole document is compiled at once, twice over, so nothing has to be written before anything else: put an initial condition above its ODE row, use a parameter three rows before you define it, call a function you have not written yet. A name that is missing is reported as missing — never as out of order.', keys: 'order sequence sort forward reference declaration' },
+      { sig: 'gray, not red', desc: 'An incomplete document is muted, never an error, and only a real error pauses the solve — the last good curve stays on screen while you type. A solve waiting on an undefined name says “waiting on k”, in the same muted style, and keeps the curve too: half-written is a normal state, not a fault.', keys: 'pending error diagnostic waiting incomplete' },
+      { sig: 'the issue bar', desc: 'What the document still needs, by name — every missing name listed, with the rows the compiler would have written one click away.', keys: 'fix missing initial condition waiting undefined' },
     ],
   },
 ];
@@ -2514,7 +2771,7 @@ function renderReference() {
     let note = g.note || '';
     if (g.methods) {
       note += methodApi
-        ? ' Click one to switch; the live one is marked, and the report names the method that actually ran.'
+        ? ' The same switch is on the plot’s strip. Click one to switch; the live one is marked, and the report names the method that actually ran.'
         : ' The loaded app/pkg/ build has no solve_with, so these entries document the choice and copy their names — rebuild the WASM and they become buttons.';
     }
     if (note) {
@@ -2722,22 +2979,9 @@ function wireDivider() {
 // Wiring
 // ---------------------------------------------------------------------------
 
-/**
- * Would this key belong to the thing that has focus? A field, an input - and a
- * button, because space is how a focused button is pressed and play/pause has
- * no business stealing it.
- */
-function isTypingTarget(node) {
-  if (!node || node.nodeType !== 1) return false;
-  const tag = node.tagName;
-  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || tag === 'BUTTON') return true;
-  if (node.isContentEditable) return true;
-  return typeof node.closest === 'function' && !!node.closest('.row__field, .settings');
-}
-
 function wire() {
-  collectChips();
   applyViews();               // pushes the on-set at the plot for the first draw
+  renderMethods();
   wireDivider();
   wireCanvasGestures();
   wireInfo();
@@ -2770,7 +3014,7 @@ function wire() {
     applyOfferedFixes();
   });
 
-  el.play.addEventListener('click', () => setPlaying(!state.playing));
+  el.viewsBtn.addEventListener('click', toggleViewMenu);
 
   // a pointer released anywhere ends whatever slider drag was in progress
   const endDrag = () => { sliders.forEach((s) => { s.dragging = false; }); };
@@ -2821,6 +3065,12 @@ function wire() {
       el.demosBtn.focus();
       return;
     }
+    if (e.key === 'Escape' && el.viewmenu && !el.viewmenu.hidden) {
+      e.preventDefault();
+      closeViews();
+      el.viewsBtn.focus();
+      return;
+    }
     if (e.key === 'Escape' && !el.info.hidden) {
       e.preventDefault();
       closeInfo();
@@ -2832,12 +3082,7 @@ function wire() {
       const back = openSlider.nameBtn;
       closeSettings();
       back.focus();
-      return;
     }
-    if (e.key !== ' ' && e.code !== 'Space') return;
-    if (isTypingTarget(e.target)) return;
-    e.preventDefault();
-    setPlaying(!state.playing);
   });
 
   // a click anywhere outside the overlay closes it
@@ -2850,6 +3095,10 @@ function wire() {
     if (!el.info.hidden && dt && typeof dt.closest === 'function' &&
         !dt.closest('.info') && !dt.closest('#info-btn')) {
       closeInfo();
+    }
+    if (el.viewmenu && !el.viewmenu.hidden && dt && typeof dt.closest === 'function' &&
+        !dt.closest('.viewmenu') && !dt.closest('#views-btn')) {
+      closeViews();
     }
     if (!openSlider) return;
     const t = e.target;
@@ -2866,6 +3115,7 @@ function wire() {
 
   window.addEventListener('resize', () => {
     closeSettings();
+    closeViews();
     if (!el.info.hidden) positionInfo();
     setDocWidth(docWidth, false);   // re-clamp; the user's choice is kept
     scheduleDraw();
@@ -2902,11 +3152,6 @@ async function boot() {
     fail('Could not load ./mathfield.js.', err);
     return;
   }
-
-  // `t` arrives with its slider already on, the way a demo's knobs do: the
-  // playhead is what the plot is for. It is an ordinary promotion, so the x on
-  // it puts `t` back to an offer like any other variable.
-  promoted.add('t');
 
   try {
     buildDemoMenu();

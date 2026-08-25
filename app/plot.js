@@ -1,32 +1,31 @@
 // ============================================================================
 // plot.js - the single plot surface for the Numpla shell.
 //
-// ONE canvas, THREE independent views. Each view is a switch, not a choice, so
-// any subset of them can be on at once:
+// ONE canvas, ONE frame, and every enabled view drawn INTO it:
 //
 //   'time'   every state variable against t, one coloured polyline each
 //   'phase'  state[1] against state[0]   (needs exactly 2 states)
-//   'polar'  r against the angle, drawn on a polar grid (needs an `r` state)
+//   'polar'  r against the angle, on the same cartesian frame
 //
 // HOW SEVERAL VIEWS SHARE THE CANVAS
 // ----------------------------------
-// They tile it. The canvas is split by recursive bisection along its longer
-// side: one view fills it, two split it in half, three give the first view half
-// and the other two a quarter each. Splitting always cuts the LONGER side, so
-// no pane ever ends up a sliver, and the order is fixed (t-y, phase, polar) so
-// turning a view on never reshuffles the ones already there. Overlaying was the
-// alternative and it is not legible: these views do not share an x axis, so
-// stacking them would put two unrelated coordinate systems under one set of
-// gridlines.
+// They overlap. There is no tiling and there are no panes: one set of axes, one
+// window, everything drawn over everything else. Tiling was the previous answer
+// and it was wrong - it turned "show me two things about this system" into a
+// layout problem, and it shrank the picture every time you asked for more of
+// it. The views share the frame deliberately (docs/ui-v5.md).
 //
-// THE WINDOW IS THE USER'S
-// ------------------------
-// Every view carries its own window - x0..x1, y0..y1 - defaulting to -5..5 on
-// both axes rather than fitting the data, so two runs are comparable. Nothing
-// in here ever changes a window on the user's behalf: a re-solve redraws inside
-// the frame they left. Panning, axis scaling and zooming are all done by the
-// shell calling setWindow(); this module only supplies the geometry to do it
-// with (hit) and the arithmetic (dataAt, panned, scaled, zoomed, fitted).
+// THE WINDOW IS THE USER'S - AND IT IS THE QUERY
+// ----------------------------------------------
+// There is one window - x0..x1, y0..y1 - defaulting to -5..5 on both axes
+// rather than fitting the data, so two runs are comparable. Nothing in here
+// ever changes it: panning, axis scaling and zooming are all done by the shell
+// calling setWindow(); this module only supplies the geometry to do it with
+// (hit) and the arithmetic (dataAt, panned, scaled, zoomed, fitted).
+//
+// While the t-y view is on, x0..x1 IS the integration span: the shell re-solves
+// over whatever the horizontal axis is showing. That loop lives in main.js;
+// this module just draws whatever window it is given.
 //
 // Light theme: the canvas is paper. Gridlines are barely there, axis rules are
 // a shade stronger, labels are grey, and the curves carry all the saturation.
@@ -59,12 +58,7 @@ const INK = {
   label:    '#78818f',
   faint:    '#9aa2b0',
   title:    '#a7aeba',
-  playhead: 'rgba(15, 125, 112, 0.42)',
-  halo:     'rgba(15, 125, 112, 0.13)',
 };
-
-/** How much of a curve that has not been reached yet still shows. */
-const AHEAD_ALPHA = 0.24;
 
 const MONO =
   'ui-monospace, SFMono-Regular, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace';
@@ -80,7 +74,6 @@ export const DEFAULT_WINDOW = Object.freeze({ x0: -5, x1: 5, y0: -5, y1: 5 });
 
 const MIN_SPAN = 1e-9;
 const MAX_SPAN = 1e12;
-const PANE_GAP = 14;
 
 // ---------------------------------------------------------------------------
 // numeric helpers
@@ -230,42 +223,43 @@ function prepare(canvas) {
 /** Snap to a half-pixel so 1px strokes are not smeared across two pixels. */
 const crisp = (v, dpr) => Math.round(v * dpr) / dpr + 0.5 / dpr;
 
+/**
+ * A sentence in the middle of the box. It wraps, because the sentence that
+ * matters most here is a refusal - "Verlet needs second-order rows - x is a
+ * first-order row ..." - and a refusal truncated to one line is a broken plot
+ * with an excuse on it.
+ */
 function centredText(ctx, box, msg, colour) {
   ctx.save();
   ctx.fillStyle = colour || INK.faint;
   ctx.font = `12px ${MONO}`;
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
-  ctx.fillText(msg, (box.L + box.R) / 2, (box.T + box.B) / 2);
+
+  const maxW = Math.max(80, (box.R - box.L) * 0.82);
+  const words = String(msg).split(/\s+/).filter(Boolean);
+  const lines = [];
+  let line = '';
+  for (const word of words) {
+    const next = line ? line + ' ' + word : word;
+    if (line && ctx.measureText(next).width > maxW) {
+      lines.push(line);
+      line = word;
+    } else {
+      line = next;
+    }
+  }
+  if (line) lines.push(line);
+  if (!lines.length) lines.push('');
+
+  const lh = 16;
+  const cx = (box.L + box.R) / 2;
+  const cy = (box.T + box.B) / 2 - ((lines.length - 1) * lh) / 2;
+  lines.forEach((text, i) => ctx.fillText(text, cx, cy + i * lh));
   ctx.restore();
 }
 
-/** Split a rectangle in two along its longer side, leaving a gap between. */
-function bisect(cell) {
-  const w = cell.R - cell.L;
-  const h = cell.B - cell.T;
-  if (w >= h) {
-    const m = cell.L + w / 2;
-    return [
-      { L: cell.L, R: m - PANE_GAP / 2, T: cell.T, B: cell.B },
-      { L: m + PANE_GAP / 2, R: cell.R, T: cell.T, B: cell.B },
-    ];
-  }
-  const m = cell.T + h / 2;
-  return [
-    { L: cell.L, R: cell.R, T: cell.T, B: m - PANE_GAP / 2 },
-    { L: cell.L, R: cell.R, T: m + PANE_GAP / 2, B: cell.B },
-  ];
-}
-
-/** n cells by recursive bisection: the first view keeps the largest share. */
-function cellsFor(area, n) {
-  if (n <= 1) return [area];
-  const [first, rest] = bisect(area);
-  return [first].concat(cellsFor(rest, n - 1));
-}
-
-/** The data box inside a cell: room for tick labels on the left and below. */
+/** The data box inside the canvas: room for tick labels on the left and below. */
 function boxIn(cell) {
   const w = cell.R - cell.L;
   const h = cell.B - cell.T;
@@ -280,7 +274,41 @@ function boxIn(cell) {
 }
 
 // ---------------------------------------------------------------------------
-// Plot - one canvas, a tile per active view
+// `show` - a document saying what is worth looking at
+//
+// A twelve-state document draws twelve curves and nobody wants twelve. `show`
+// names the series that are the picture; the rest are still solved, they are
+// just not drawn (docs/ui-v5.md). Absent means draw everything, which is right
+// for a two-state system.
+//
+// The shell resolves the names to indices before it gets here, so this module
+// never has to know what a state is called.
+// ---------------------------------------------------------------------------
+
+/** The state columns to draw: the `show` list, or every one of them. */
+function statesShown(sol) {
+  if (Array.isArray(sol.showStates)) return sol.showStates;
+  const all = [];
+  for (let d = 0; d < sol.dim; d++) all.push(d);
+  return all;
+}
+
+/**
+ * The derived series to draw. Each keeps its `slot` - its position in the full
+ * derived list - so hiding one never recolours another.
+ */
+function extrasShown(sol) {
+  const extra = sol.extra || [];
+  const out = [];
+  for (let e = 0; e < extra.length; e++) {
+    if (Array.isArray(sol.showExtra) && sol.showExtra.indexOf(e) < 0) continue;
+    out.push({ ...extra[e], slot: e });
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Plot - one canvas, one frame, every enabled view drawn into it
 // ---------------------------------------------------------------------------
 
 export class Plot {
@@ -291,12 +319,15 @@ export class Plot {
     this.canvas = canvas;
     /** The views that are ON, in VIEWS order. Never changed from in here. */
     this.views = ['time'];
-    /** view id -> the window the user is looking through. */
-    this.windows = new Map(VIEWS.map((v) => [v, { ...DEFAULT_WINDOW }]));
-    /** view id -> false when the model cannot support it (drawn as a reason). */
+    /** The one window every view is drawn through. */
+    this.window = { ...DEFAULT_WINDOW };
+    /** view id -> false when the model cannot support it. The shell's menu
+     *  reads this; nothing in here switches a view on or off. */
     this.support = { time: true, phase: true, polar: true };
-    /** The panes as last drawn: what hit testing and the pointer gestures use. */
-    this.panes = [];
+    /** The data box as last drawn: what hit testing and the gestures use. */
+    this.box = null;
+    /** The whole drawable area as last drawn. */
+    this.area = null;
   }
 
   /** @param {string[]} list the views that are on; order is canonical. */
@@ -309,53 +340,42 @@ export class Plot {
     for (const v of VIEWS) this.support[v] = !!(support && support[v]);
   }
 
-  getWindow(view) {
-    const w = this.windows.get(view);
-    return w ? { ...w } : { ...DEFAULT_WINDOW };
+  getWindow() {
+    return { ...this.window };
   }
 
-  setWindow(view, win) {
-    if (!this.windows.has(view)) return;
-    this.windows.set(view, normaliseWindow(win, this.windows.get(view)));
+  setWindow(win) {
+    this.window = normaliseWindow(win, this.window);
   }
 
-  resetWindow(view) {
-    if (this.windows.has(view)) this.windows.set(view, { ...DEFAULT_WINDOW });
+  resetWindow() {
+    this.window = { ...DEFAULT_WINDOW };
   }
 
-  resetAllWindows() {
-    for (const v of VIEWS) this.windows.set(v, { ...DEFAULT_WINDOW });
-  }
-
-  /** True when every window is still the default one. */
+  /** True while the frame is still the default one. */
   isDefaultFrame() {
-    for (const v of VIEWS) {
-      if (!sameWindow(this.windows.get(v), DEFAULT_WINDOW)) return false;
-    }
-    return true;
+    return sameWindow(this.window, DEFAULT_WINDOW);
   }
 
   /**
-   * The pane under a point, in CSS pixels relative to the canvas, plus which
-   * part of it: 'body' pans, 'x' and 'y' scale that one axis.
-   * @returns {{view:string, cell:object, box:object, region:string}|null}
+   * Which part of the frame a point is in: 'body' pans, 'x' and 'y' scale that
+   * one axis. There is only one frame now, so there is nothing to identify.
+   * @returns {{box:object, region:string}|null}
    */
   hit(px, py) {
-    for (const pane of this.panes) {
-      const c = pane.cell;
-      if (px < c.L || px > c.R || py < c.T || py > c.B) continue;
-      const b = pane.box;
-      let region = 'body';
-      if (px < b.L) region = py <= b.B ? 'y' : 'body';
-      else if (py > b.B) region = 'x';
-      return { view: pane.view, cell: c, box: b, region };
-    }
-    return null;
+    const a = this.area;
+    const b = this.box;
+    if (!a || !b) return null;
+    if (px < a.L || px > a.R || py < a.T || py > a.B) return null;
+    let region = 'body';
+    if (px < b.L) region = py <= b.B ? 'y' : 'body';
+    else if (py > b.B) region = 'x';
+    return { box: b, region };
   }
 
-  /** Pixel -> data, inside a pane's box. */
-  dataAt(view, box, px, py) {
-    const w = this.getWindow(view);
+  /** Pixel -> data, inside the frame's box. */
+  dataAt(box, px, py) {
+    const w = this.window;
     const bw = Math.max(1, box.R - box.L);
     const bh = Math.max(1, box.B - box.T);
     return {
@@ -365,10 +385,10 @@ export class Plot {
   }
 
   /**
-   * The window that would show all of `sol` in `view`, or null when there is
-   * nothing to fit. Only ever called because someone asked for it.
+   * The window that would show every enabled view's curve, or null when there
+   * is nothing to fit. Only ever called because someone asked for it.
    */
-  fitWindow(view, sol) {
+  fitWindow(sol) {
     if (!sol || !sol.n || !sol.dim) return null;
     const { dim, n, data } = sol;
     const stride = dim + 1;
@@ -378,29 +398,26 @@ export class Plot {
       if (isFinite(y)) { if (y < ylo) ylo = y; if (y > yhi) yhi = y; }
     };
 
-    if (view === 'time') {
-      for (let i = 0; i < n; i++) {
-        const t = data[i * stride];
-        for (let d = 0; d < dim; d++) take(t, data[i * stride + 1 + d]);
+    if (this.views.indexOf('time') >= 0) {
+      for (const d of statesShown(sol)) {
+        for (let i = 0; i < n; i++) take(data[i * stride], data[i * stride + 1 + d]);
       }
-      // Derived rows share the time axis, so fitting must see them too.
-      for (const ex of sol.extra || []) {
+      // Derived rows share the frame, so fitting must see them too.
+      for (const ex of extrasShown(sol)) {
         for (let i = 0; i < ex.n; i++) take(ex.pairs[i * 2], ex.pairs[i * 2 + 1]);
       }
-    } else if (view === 'phase') {
-      if (dim !== 2) return null;
+    }
+    if (this.views.indexOf('phase') >= 0 && dim === 2) {
       for (let i = 0; i < n; i++) take(data[i * stride + 1], data[i * stride + 2]);
-    } else if (view === 'polar') {
+    }
+    if (this.views.indexOf('polar') >= 0 && sol.polar && sol.polar.r >= 0) {
       const map = sol.polar;
-      if (!map || map.r < 0) return null;
       for (let i = 0; i < n; i++) {
         const r = data[i * stride + 1 + map.r];
         const a = map.theta >= 0 ? data[i * stride + 1 + map.theta] : data[i * stride];
         if (!isFinite(r) || !isFinite(a)) continue;
         take(r * Math.cos(a), r * Math.sin(a));
       }
-    } else {
-      return null;
     }
 
     if (!isFinite(xlo) || !isFinite(ylo)) return null;
@@ -411,83 +428,57 @@ export class Plot {
 
   /**
    * @param {object|null} sol  { names, dim, n, data:Float64Array, t0, t1,
-   *                             playT, playY, polar:{r,theta}|null }
+   *                             polar:{r,theta}|null, extra, showStates,
+   *                             showExtra, message }
    */
   draw(sol) {
     const p = prepare(this.canvas);
     if (!p) return;
     const { ctx, w, h, dpr } = p;
-    this.panes = [];
 
     const area = { L: 6, R: w - 6, T: 4, B: h - 4 };
+    const box = boxIn(area);
+    this.area = area;
+    this.box = box;
+
+    this._title(ctx, area, this.views.map((v) => VIEW_LABEL[v] || v).join('  ·  '));
+
+    if (box.R - box.L < 60 || box.B - box.T < 46) return;
+
+    const win = this.getWindow();
+    const pane = { box, win };
+    this._axes(ctx, dpr, pane, true);
+    if (this.views.indexOf('polar') >= 0) this._polarGrid(ctx, dpr, pane);
+    this._rules(ctx, dpr, box);
 
     if (!this.views.length) {
-      centredText(ctx, area, 'no view is on — turn one on above');
+      centredText(ctx, box, 'no view is on — turn one on in the views menu');
+      return;
+    }
+    if (!sol || !sol.n || !sol.dim) {
+      centredText(ctx, box, (sol && sol.message) || 'no solution yet');
       return;
     }
 
-    const cells = cellsFor(area, this.views.length);
-    const many = this.views.length > 1;
-
-    this.views.forEach((view, i) => {
-      const cell = cells[i];
-      const box = boxIn(cell);
-      const pane = { view, cell, box, win: this.getWindow(view) };
-      this.panes.push(pane);
-
-      if (many) {
-        ctx.save();
-        ctx.strokeStyle = INK.paneEdge;
-        ctx.lineWidth = 1 / dpr;
-        ctx.strokeRect(
-          crisp(cell.L, dpr), crisp(cell.T, dpr),
-          Math.max(0, cell.R - cell.L), Math.max(0, cell.B - cell.T),
-        );
-        ctx.restore();
-      }
-
-      this._title(ctx, cell, VIEW_LABEL[view] || view);
-
-      if (box.R - box.L < 60 || box.B - box.T < 46) return;
-
-      const reason = this._reasonToNotDraw(view, sol);
-      this._axes(ctx, dpr, pane, view !== 'polar');
-      if (view === 'polar') this._polarGrid(ctx, dpr, pane);
-      this._rules(ctx, dpr, box);
-
-      if (reason) { centredText(ctx, box, reason); return; }
-
-      if (view === 'time') this._time(ctx, dpr, pane, sol);
-      else if (view === 'phase') this._phase(ctx, pane, sol);
-      else if (view === 'polar') this._polar(ctx, pane, sol);
-    });
-  }
-
-  /** Why this pane has no curve in it - a sentence, never an empty box. */
-  _reasonToNotDraw(view, sol) {
-    if (view === 'phase' && !this.support.phase) {
-      return 'the phase plane needs exactly 2 states';
+    // Everything overlaps, in a fixed order so a view turning on never moves
+    // one already there: the time curves first, the portraits over them.
+    if (this.views.indexOf('time') >= 0) this._time(ctx, pane, sol);
+    if (this.views.indexOf('phase') >= 0 && sol.dim === 2) this._phase(ctx, pane, sol);
+    if (this.views.indexOf('polar') >= 0 && sol.polar && sol.polar.r >= 0) {
+      this._polar(ctx, pane, sol);
     }
-    if (view === 'polar' && !this.support.polar) {
-      return 'no polar content: define a state named r';
-    }
-    if (!sol || !sol.n || !sol.dim) return (sol && sol.message) || 'no solution yet';
-    if (view === 'phase' && sol.dim !== 2) return 'the phase plane needs exactly 2 states';
-    if (view === 'polar' && (!sol.polar || sol.polar.r < 0)) {
-      return 'no polar content in this document';
-    }
-    return null;
   }
 
   // -- shared chrome --------------------------------------------------------
 
-  _title(ctx, cell, text) {
+  _title(ctx, area, text) {
+    if (!text) return;
     ctx.save();
     ctx.fillStyle = INK.title;
     ctx.font = `10px ${MONO}`;
     ctx.textAlign = 'left';
     ctx.textBaseline = 'top';
-    ctx.fillText(text, cell.L + 6, cell.T + 4);
+    ctx.fillText(text, area.L + 6, area.T + 2);
     ctx.restore();
   }
 
@@ -504,7 +495,7 @@ export class Plot {
     ctx.restore();
   }
 
-  /** The scales for a pane. `gridlines` off leaves the labels and the ticks. */
+  /** The scales for the frame. `gridlines` off leaves the labels and ticks. */
   _axes(ctx, dpr, pane, gridlines) {
     const b = pane.box;
     const w = pane.win;
@@ -561,7 +552,7 @@ export class Plot {
     ctx.restore();
   }
 
-  /** Rings and spokes about the origin, in the pane's own (possibly
+  /** Rings and spokes about the origin, in the frame's own (possibly
    *  anisotropic) scaling - an ellipse here is the honest picture of an axis
    *  the user has stretched. */
   _polarGrid(ctx, dpr, pane) {
@@ -636,22 +627,16 @@ export class Plot {
   }
 
   /**
-   * One polyline. `upTo` < Infinity stops at the last sample whose time is not
-   * past it, which is what makes travelled and ahead two different strokes of
-   * the same curve.
-   */
-  /**
    * Stroke a flat [t, value] series. Derived rows are sampled on their own
-   * grid — the compiler raises the count to at least one per accepted step, so
-   * a conserved quantity is not aliased into a drifting one — which is why they
+   * grid - the compiler raises the count to at least one per accepted step, so
+   * a conserved quantity is not aliased into a drifting one - which is why they
    * cannot share the state array's stride.
    */
-  _strokePairs(ctx, ex, sx, sy, upTo) {
+  _strokePairs(ctx, ex, sx, sy) {
     ctx.beginPath();
     let pen = false;
     for (let i = 0; i < ex.n; i++) {
       const x = ex.pairs[i * 2];
-      if (x > upTo) break;
       const y = ex.pairs[i * 2 + 1];
       if (!isFinite(x) || !isFinite(y)) { pen = false; continue; }
       const px = sx(x);
@@ -661,12 +646,10 @@ export class Plot {
     ctx.stroke();
   }
 
-  _stroke(ctx, sol, xOf, yOf, sx, sy, upTo) {
-    const stride = sol.dim + 1;
+  _stroke(ctx, sol, xOf, yOf, sx, sy) {
     ctx.beginPath();
     let pen = false;
     for (let i = 0; i < sol.n; i++) {
-      if (sol.data[i * stride] > upTo) break;
       const x = xOf(i);
       const y = yOf(i);
       if (!isFinite(x) || !isFinite(y)) { pen = false; continue; }
@@ -677,87 +660,38 @@ export class Plot {
     ctx.stroke();
   }
 
-  /** The playhead dot: a soft halo, a filled core, a paper-coloured ring. */
-  _marker(ctx, b, x, y, colour) {
-    if (!isFinite(x) || !isFinite(y)) return;
-    if (x < b.L - 10 || x > b.R + 10 || y < b.T - 10 || y > b.B + 10) return;
-    ctx.save();
-    ctx.beginPath();
-    ctx.arc(x, y, 9, 0, Math.PI * 2);
-    ctx.fillStyle = INK.halo;
-    ctx.fill();
-    ctx.beginPath();
-    ctx.arc(x, y, 4.5, 0, Math.PI * 2);
-    ctx.fillStyle = colour || seriesColor(0);
-    ctx.fill();
-    ctx.lineWidth = 2;
-    ctx.strokeStyle = INK.bg;
-    ctx.stroke();
-    ctx.restore();
-  }
-
   // -- view: t vs y ---------------------------------------------------------
 
-  _time(ctx, dpr, pane, sol) {
+  _time(ctx, pane, sol) {
     const b = pane.box;
     const { dim, data } = sol;
     const stride = dim + 1;
     const sx = pane.sx;
     const sy = pane.sy;
-    const pt = typeof sol.playT === 'number' && isFinite(sol.playT) ? sol.playT : Infinity;
 
     this._clip(ctx, b);
     ctx.lineWidth = 1.8;
 
-    for (let d = 0; d < dim; d++) {
+    // `show` is a display choice: everything is still solved, and the states
+    // left out are simply not drawn.
+    for (const d of statesShown(sol)) {
       const xOf = (i) => data[i * stride];
       const yOf = (i) => data[i * stride + 1 + d];
       ctx.strokeStyle = seriesColor(d);
-
-      // what has not happened yet, ghosted...
-      ctx.globalAlpha = AHEAD_ALPHA;
-      this._stroke(ctx, sol, xOf, yOf, sx, sy, Infinity);
-      // ...and what has, at full strength. Scrubbing reads as motion.
-      ctx.globalAlpha = 1;
-      this._stroke(ctx, sol, xOf, yOf, sx, sy, pt);
+      this._stroke(ctx, sol, xOf, yOf, sx, sy);
     }
 
     // Derived rows, dashed so they read as measurements of the solution rather
     // than as more of it. This is the conservation monitor: a symplectic method
     // holds this line in a band, an adaptive one lets it walk away.
-    const extra = sol.extra || [];
-    for (let e = 0; e < extra.length; e++) {
-      ctx.strokeStyle = seriesColor(dim + e);
-      ctx.setLineDash([5, 4]);
-      ctx.globalAlpha = AHEAD_ALPHA;
-      this._strokePairs(ctx, extra[e], sx, sy, Infinity);
-      ctx.globalAlpha = 1;
-      this._strokePairs(ctx, extra[e], sx, sy, pt);
+    ctx.setLineDash([5, 4]);
+    for (const ex of extrasShown(sol)) {
+      ctx.strokeStyle = seriesColor(dim + ex.slot);
+      this._strokePairs(ctx, ex, sx, sy);
     }
     ctx.setLineDash([]);
 
     ctx.restore();
-
-    if (!isFinite(pt)) return;
-
-    const x = crisp(sx(pt), dpr);
-    if (x >= b.L && x <= b.R) {
-      ctx.save();
-      ctx.strokeStyle = INK.playhead;
-      ctx.lineWidth = 1 / dpr;
-      ctx.setLineDash([3, 4]);
-      ctx.beginPath();
-      ctx.moveTo(x, b.T);
-      ctx.lineTo(x, b.B);
-      ctx.stroke();
-      ctx.restore();
-    }
-
-    const py = sol.playY;
-    if (!py || py.length < dim) return;
-    for (let d = 0; d < dim; d++) {
-      this._marker(ctx, b, sx(pt), sy(py[d]), seriesColor(d));
-    }
   }
 
   // -- view: phase plane ----------------------------------------------------
@@ -766,25 +700,15 @@ export class Plot {
     const b = pane.box;
     const { data } = sol;
     const stride = sol.dim + 1;
-    const sx = pane.sx;
-    const sy = pane.sy;
-    const pt = typeof sol.playT === 'number' && isFinite(sol.playT) ? sol.playT : Infinity;
 
     const xOf = (i) => data[i * stride + 1];
     const yOf = (i) => data[i * stride + 2];
 
     this._clip(ctx, b);
     ctx.strokeStyle = seriesColor(0);
-    ctx.lineWidth = 1.4;
-    ctx.globalAlpha = AHEAD_ALPHA;
-    this._stroke(ctx, sol, xOf, yOf, sx, sy, Infinity);
-    ctx.globalAlpha = 1;
     ctx.lineWidth = 1.9;
-    this._stroke(ctx, sol, xOf, yOf, sx, sy, pt);
+    this._stroke(ctx, sol, xOf, yOf, pane.sx, pane.sy);
     ctx.restore();
-
-    const py = sol.playY;
-    if (py && py.length >= 2) this._marker(ctx, b, sx(py[0]), sy(py[1]), seriesColor(0));
   }
 
   // -- view: polar ----------------------------------------------------------
@@ -793,11 +717,8 @@ export class Plot {
     const b = pane.box;
     const { data, polar } = sol;
     const stride = sol.dim + 1;
-    const sx = pane.sx;
-    const sy = pane.sy;
     const ri = polar.r;
     const ai = polar.theta;             // < 0 means "the angle is t"
-    const pt = typeof sol.playT === 'number' && isFinite(sol.playT) ? sol.playT : Infinity;
 
     const rOf = (i) => data[i * stride + 1 + ri];
     const aOf = (i) => (ai >= 0 ? data[i * stride + 1 + ai] : data[i * stride]);
@@ -806,21 +727,8 @@ export class Plot {
 
     this._clip(ctx, b);
     ctx.strokeStyle = seriesColor(ri);
-    ctx.lineWidth = 1.4;
-    ctx.globalAlpha = AHEAD_ALPHA;
-    this._stroke(ctx, sol, xOf, yOf, sx, sy, Infinity);
-    ctx.globalAlpha = 1;
     ctx.lineWidth = 1.9;
-    this._stroke(ctx, sol, xOf, yOf, sx, sy, pt);
+    this._stroke(ctx, sol, xOf, yOf, pane.sx, pane.sy);
     ctx.restore();
-
-    const pv = sol.playY;
-    if (pv && pv.length > ri) {
-      const r = pv[ri];
-      const a = ai >= 0 && pv.length > ai ? pv[ai] : sol.playT;
-      if (isFinite(r) && isFinite(a)) {
-        this._marker(ctx, b, sx(r * Math.cos(a)), sy(r * Math.sin(a)), seriesColor(ri));
-      }
-    }
   }
 }

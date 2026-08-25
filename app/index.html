@@ -90,24 +90,25 @@
          aria-orientation="vertical" aria-label="Resize the expression pane"
          title="Drag to resize · arrow keys to nudge"><span class="divider__grip" aria-hidden="true"></span></div>
 
-    <!-- One plot surface. Its control strip owns everything that acts on the
-         picture: play/pause, which views are on, and the frame. There is no
-         bottom bar - the plot has that height instead - and no `t` widget:
-         `t` is a row in the system like any other variable. -->
+    <!-- One plot surface, one frame, every enabled view drawn into it. The
+         control strip owns everything that acts on the picture: the
+         integrator, the views menu, the frame. There is no bottom bar - the
+         plot has that height instead - and no `t` anything: the visible window
+         IS the integration span (docs/ui-v5.md). -->
     <section class="pane pane--plot">
       <div class="plot">
         <div class="plot__head">
-          <button id="play" class="playbtn" type="button" aria-label="Play" title="Play / pause (space)">
-            <svg class="icon icon--play" viewBox="0 0 16 16" aria-hidden="true"><path d="M4.5 2.8v10.4L13 8z"/></svg>
-            <svg class="icon icon--pause" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 2.6h3v10.8H4zM9 2.6h3v10.8H9z"/></svg>
-          </button>
+          <!-- Discrete versus continuous. The thing worth reaching for
+               constantly, so it gets the width the view chips used to spend.
+               Filled from Model.methods() - never a hard-coded list. -->
+          <div class="modes" id="methods" role="group" aria-label="Integrator"></div>
 
-          <!-- Independent switches, not a choice: any number may be on. -->
-          <div class="views" id="views" role="group" aria-label="Plot views">
-            <button class="viewchip is-on" type="button" data-view="time" aria-pressed="true">t–y</button>
-            <button class="viewchip" type="button" data-view="phase" aria-pressed="false">phase</button>
-            <button class="viewchip" type="button" data-view="polar" aria-pressed="false">polar</button>
-          </div>
+          <!-- The views are a menu, not three permanent chips: everything the
+               model supports is on already, so this is the way to turn one
+               OFF. -->
+          <button id="views-btn" class="framebtn" type="button"
+                  aria-haspopup="menu" aria-expanded="false" aria-controls="viewmenu"
+                  title="Which views are drawn">views</button>
 
           <!-- Hear. Deliberately quiet: sound is a way of looking at a
                signal, not the headline control. -->
@@ -129,8 +130,8 @@
                     title="Back to the default frame: −5 to 5 on both axes">−5…5</button>
           </div>
 
-          <!-- The readout is the legend, and it is where `t` is read: colour,
-               name, value at the playhead. -->
+          <!-- The readout is the legend: colour, name, and the value at the
+               right-hand edge of the window. -->
           <div class="readout" id="readout"></div>
         </div>
         <div class="plot__canvas"><canvas id="canvas"></canvas></div>
@@ -173,12 +174,18 @@
      coordinates, so opening it cannot resize or reflow the workspace. -->
 <div class="demomenu" id="demomenu" role="menu" aria-label="Demos" hidden></div>
 
+<!-- Which views are drawn. An overlay for the same reason as every other panel
+     here: opening it must not reflow the workspace. Its contents are built from
+     the plot's own view vocabulary, so a view added to plot.js appears here
+     without an edit to this file. -->
+<div class="viewmenu" id="viewmenu" role="menu" aria-label="Plot views" hidden></div>
+
 <!-- Slider range settings. A document-level overlay, positioned in fixed
      coordinates, so opening it can never resize or reflow anything. -->
 <div class="settings" id="slider-settings" role="dialog" aria-modal="false"
      aria-label="Slider range" hidden>
   <div class="settings__head">
-    <span class="settings__name" id="settings-name">t</span>
+    <span class="settings__name" id="settings-name">k</span>
     <span class="settings__hint">range &amp; step</span>
   </div>
   <div class="settings__grid">

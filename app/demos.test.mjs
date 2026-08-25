@@ -656,7 +656,9 @@ for (const demo of DEMOS) {
     ok(Array.isArray(demo.tSpan) && demo.tSpan.length === 2, 'needs a tSpan pair');
     ok(demo.tSpan[1] > demo.tSpan[0], 'tSpan must run forwards');
     ok(Array.isArray(demo.knobs) && demo.knobs.length > 0, 'a demo without a knob is a picture');
-    ok(demo.source.includes('#'), 'the source must explain itself');
+    // An example is read by looking at it. The title and blurb carry the
+    // words; the source carries only the mathematics.
+    ok(!demo.source.includes('#'), 'a demo source must carry no comments');
   });
 
   test(at('knob ranges are sane and start where the document does'), () => {
@@ -720,6 +722,22 @@ for (const demo of DEMOS) {
 
   test(at('obeys its physics'), () => {
     const check = PHYSICS[demo.id];
+    // `show` is a display choice, but a name that does not exist is a typo the
+    // shell would silently ignore — so it is checked here instead.
+    if (demo.show !== undefined) {
+      ok(Array.isArray(demo.show) && demo.show.length > 0,
+         '`show`, when present, must be a non-empty array');
+      const m = new wasm.Model();
+      const d = JSON.parse(m.set_source(demo.source));
+      const known = new Set([...(d.states || []), ...(d.derived || [])]);
+      for (const name of demo.show || []) {
+        ok(known.has(name),
+           `show lists ${name}, which is neither a state nor a derived row`);
+      }
+      ok(demo.show.length < (d.states || []).length,
+         '`show` that lists everything is pointless — drop it instead');
+    }
+
     ok(typeof check === 'function', 'no physics check is written for this demo');
     check(demo);
   });

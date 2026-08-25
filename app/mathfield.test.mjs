@@ -701,9 +701,24 @@ verbatim('# ### not a heading, just hashes ###', 'inner hashes');
 
 {
   const lines = DEMOS.flatMap((d) => d.source.split('\n'));
-  const comments = lines.filter((l) => l.trimStart().startsWith('#'));
-  ok('the demo gallery still teaches through comments', comments.length >= 50,
-    'found ' + comments.length);
+
+  // The gallery deliberately carries no comments now — an example is read by
+  // looking at it — so comment round-tripping is pinned with its own fixtures.
+  // People still write comments in their own documents, and mangling one would
+  // break the document, so this stays as thoroughly tested as it ever was.
+  const comments = [
+    '# a plucked string',
+    '#',
+    '## twice hashed',
+    '#    leading spaces inside are kept',
+    '# punctuation: k(x_{i+1} - 2x_i), 50% of it, "quoted"',
+    '# unicode — em dash, theta, +/-',
+    '# sin cos sqrt must not inflate here',
+    '# trailing spaces are kept   ',
+  ];
+  ok('the demo gallery carries no comments',
+    lines.filter((l) => l.trimStart().startsWith('#')).length === 0,
+    'found ' + lines.filter((l) => l.trimStart().startsWith('#')).length);
 
   for (const line of comments) {
     const m = new MathModel();
@@ -1557,8 +1572,18 @@ const press = (f, k) => f.el.fire('keydown', {
 }
 
 {
-  // The bug that started this: a whole demo document, one field per line.
-  const doc = DEMOS[0].source.split('\n');
+  // The bug that started this: a whole document, one field per line. The demo
+  // gallery no longer carries comments, so the commented rows are supplied
+  // here — a sharper fixture anyway, since it mixes prose and mathematics in
+  // one document on purpose.
+  const doc = [
+    '# a damped oscillator',
+    'k = 0.4',
+    "x'' = -x - k x'",
+    '# released from rest',
+    'x(0) = 1',
+    "x'(0) = 0",
+  ].concat(DEMOS[0].source.split('\n'));
   const out = doc.map((line) => {
     const f = new MathField(new ShimEl('div'), { value: line });
     const src = f.source;
@@ -1568,8 +1593,9 @@ const press = (f, k) => f.el.fire('keydown', {
   const mangled = doc.filter((line, i) => line.startsWith('#') && out[i] !== line);
   eq('no comment line is mangled by the field', mangled.length, 0,
     JSON.stringify(mangled.slice(0, 3)));
-  ok('the document still has its teaching material',
-    out.filter((l) => l.startsWith('#')).length >= 5);
+  ok('every comment in the document survives the field',
+    out.filter((l) => l.startsWith('#')).length ===
+      doc.filter((l) => l.startsWith('#')).length);
 }
 
 // ---------------------------------------------------------------------------

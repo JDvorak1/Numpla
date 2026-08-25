@@ -1,7 +1,8 @@
 # Numpla — browser shell
 
-Write a system of differential equations as **mathematical notation**, watch it
-integrate, and drag time — or any parameter — while the curve moves under you.
+Write a system of differential equations as **mathematical notation**, then
+**look somewhere** — the visible window is the integration span, so what is on
+screen is what gets solved, at the resolution the screen can show.
 
 No bundler, no build step, no dependencies, no network. Plain HTML, CSS and ES
 modules, talking to the Rust core through `app/pkg/numpla_wasm.js`.
@@ -32,8 +33,8 @@ of hanging. Same for a missing `mathfield.js`.
 | `index.html` | markup: loading screen, expression rows, the plot and its control strip, the overlays |
 | `styles.css` | the light theme, the fixed layout, the eased loader → app hand-off |
 | `main.js` | boot, WASM binding, the row list, diagnostics, sliders, the frame gestures, the reference |
-| `plot.js` | `Plot` — one HiDPI canvas, tiled between whichever of `time` / `phase` / `polar` are on, each with its own window |
-| `demos.js` | the gallery: source, `tSpan`, and the knobs each demo declares |
+| `plot.js` | `Plot` — one HiDPI canvas, one frame, and `time` / `phase` / `polar` all drawn into it, overlapping |
+| `demos.js` | the gallery: source, `tSpan`, `show`, and the knobs each demo declares |
 | `mathfield.js` / `mathfield.css` | the math field itself (see `docs/ui-v2.md` Part A) |
 | `serve.mjs` | the dependency-free dev server |
 
@@ -87,41 +88,39 @@ is muted and the message is grey. Only `"error"` gets error styling, and only
 an `"error"` pauses the solve — the last good curve, chips, legend and sliders
 all stay exactly as they were while you finish typing.
 
-### 3. One plot, and the views are switches
+### 3. One plot, everything in it, nothing tiled
 
-One canvas, and a control strip on it carrying everything that acts on the
-picture: play/pause, the view switches, the frame, and the readout.
-**There is no bottom bar** — the plot has that height instead.
+One canvas, one frame, and a control strip carrying everything that acts on the
+picture: the **integrator**, the **views** menu, the frame controls, and the
+readout. **There is no bottom bar** — the plot has that height instead — and
+**there is no `t` widget of any kind**.
 
-Three chips, and each one is **on or off independently**. Any number may be on
-at once:
+Three views, and every one the model supports draws into the **same frame**,
+overlapping:
 
-| chip | supported when |
+| view | supported when |
 |---|---|
-| `t–y` | always |
+| `t–y` | always — every state against time |
 | `phase` | the document has **exactly 2 states** |
 | `polar` | a **state named `r`** exists (the angle is a state named `theta`/`phi` if there is one, otherwise `t`) |
 
-**Several views share the canvas by tiling it.** The canvas is split by
-recursive bisection along its longer side: one view fills it, two split it in
-half, three give the first view half and the other two a quarter each. The cut
-always crosses the longer side, so no tile is ever a sliver, and the order is
-fixed (`t–y`, `phase`, `polar`) so turning one on never reshuffles the tiles
-already there. Overlaying was the alternative and it is not legible — these
-views do not share an x axis, and stacking them would put two unrelated
-coordinate systems under one set of gridlines.
+Tiling is gone. Splitting the canvas turned "show me two things about this
+system" into a layout problem and shrank the picture every time you asked for
+more of it. They share the frame deliberately.
 
-A chip the document cannot support stays **visible but muted**, never hidden —
-seeing `phase` light up the moment a system gains its second state is how you
-find out the software can do it. And **nothing is ever switched off on your
-behalf**: a view that was on when its support went away keeps its tile and says
-why on it, and its chip stays clickable so you can still put it away yourself.
+**A supported view turns itself on.** That is the right default now that an
+extra view is an extra curve rather than a tile taken out of the picture:
+`phase` lights up the moment a system gains its second state, without being
+asked. The **views menu** on the strip is the other direction — how you turn one
+*off* when it is in the way — and it keeps that decision across recompiles and
+demo loads. A view the document cannot support is listed **with the reason**
+rather than hidden, because that is how the capability is discovered.
 
-#### The frame is yours
+#### The frame is yours — and it is the query
 
-Every view starts at **−5 to 5 on both axes** — a fixed, predictable frame,
-because that is what makes two runs comparable, and it is what Desmos does. It
-is not fitted to the data, and **a re-solve never moves it**.
+The frame starts at **−5 to 5 on both axes** — fixed and predictable, because
+that is what makes two runs comparable, and it is what Desmos does. It is not
+fitted to the data, and **a re-solve never moves it**.
 
 | gesture | effect |
 |---|---|
@@ -129,20 +128,84 @@ is not fitted to the data, and **a re-solve never moves it**.
 | drag along the x labels | scale x, about the value you grabbed |
 | drag along the y labels | scale y, about the value you grabbed |
 | wheel | zoom about the cursor — over an axis strip, that axis only |
-| double-click a tile | that tile back to −5…5 |
-| `−5…5` | every tile back to the default frame; it lights up while any tile has moved |
-| `fit` | every visible tile around its own curve, once, because you asked |
+| double-click | back to −5…5 |
+| `−5…5` | back to the default frame; it lights up while the frame has moved |
+| `fit` | around the curve, once, because you asked — vertically only while `t–y` is on, since x there is already the span |
 
-Each tile carries its own window, so scaling the phase plane does not touch the
-`t–y` one.
+#### The window **is** the integration span
 
-#### The playhead is visible on the curve
+`t` was a slider, then a row, and it was useless both times, because it answered
+a question nobody asks. Nobody wants to *set* a span; they want to **look
+somewhere** and have the software compute what they are looking at.
 
-`t` used to change a number and nothing else, which is exactly why it felt
-useless. Now the trajectory is drawn **travelled-versus-ahead** — what has
-happened at full strength, what has not ghosted behind it — with a marker riding
-the curve at `t` (one per series in `t–y`, plus a dashed rule). Scrubbing reads
-as motion.
+> **What is on screen is what gets solved, at the resolution the screen can
+> show.**
+
+- The frame's `x0…x1` is passed straight to `solve_with(t0, t1, method)`.
+- Panning or zooming the horizontal axis **re-solves over the new span**. The
+  curve already in hand redraws inside the moving frame at once, and one
+  integration happens when the hand stops: the solve is debounced (180 ms)
+  exactly the way editing is, so a drag across the canvas costs **one** solve
+  rather than one per `pointermove`. The last good curve stays on screen the
+  whole time.
+- The guard is the span itself, not "did something move" — panning vertically,
+  scaling y, or moving the frame with `t–y` **off** all leave the span alone, so
+  they cost nothing.
+- **With `t–y` off the span freezes.** The horizontal axis is then a state
+  (phase) or a coordinate (polar), and panning it is not a statement about time;
+  re-solving over the phase plane's x range would be a number arrived at by
+  accident. The last span simply stands until `t–y` comes back, and turning it
+  back on hands the axis its meaning — and the span — back.
+- **The sample count follows the pixel width**: one point per device pixel of
+  canvas (clamped to 240…4000). Asking for more than the canvas can draw is
+  waste; asking for fewer is a lie about the curve.
+- Zooming out far enough is a genuinely longer integration and may take longer.
+  That is honest, and the telemetry (`acc` / `rej` / `rhs`) says so.
+
+A demo still declares a `tSpan` — and it sets the **frame**, not the other way
+round. There is no row and no widget left to write it into.
+
+#### 3b. The integrator is on the strip
+
+The width the view chips used to spend goes to the thing worth reaching for
+constantly: **discrete versus continuous**. Adaptive Runge–Kutta (`Tsit5`)
+against the fixed-step symplectic methods (`Verlet`, `Yoshida4`), one click,
+the live one legible at a glance. Paired with a derived energy row it is the
+whole Ge–Marsden lesson in one gesture.
+
+The list is built from `Model.methods()`, never from a hard-coded one, so a
+method added to `numpla-ode` reaches the strip without an edit here. The badge
+is labelled from `SolveReport.method` — what actually ran — and never from what
+was requested; they differ exactly when something went wrong.
+
+**A symplectic method is refused, not downgraded.** `Verlet` and `Yoshida4`
+integrate positions and velocities separately, so a document of plain `x' =`
+rows has no structure for them to preserve. There is deliberately no silent
+fallback to `Tsit5` — it would draw a `Tsit5` curve under a label reading
+`Verlet` and teach the opposite of what the switch exists to show. So:
+
+- the entry is **dimmed** when the document has no `x'' =` rows, but stays
+  clickable, because the engine's sentence names the offending row and the fix
+  and that is worth more than a disabled button;
+- the refused chip turns red and the solve badge carries the message;
+- and the sentence itself is **drawn on the plot**, wrapped, where a blank
+  canvas would otherwise just look broken.
+
+#### A document can say what to look at
+
+`colliding-strings` has twelve states and is about **two strings**. A demo may
+declare which series are the picture:
+
+```js
+{ id: 'colliding-strings', show: ['a_2', 'b_2'], ... }
+```
+
+`show` names states or derived rows. When present, **only those are drawn and
+only those appear in the legend**; absent means draw everything, which is right
+for a two-state system. The states left out are **still solved** — this is a
+display choice, not a model change — so they are still in the hear panel and
+still in the sample buffer. A `show` list that matches nothing in the current
+document is ignored rather than drawing an empty plot.
 
 ### 4. A slider lives on the variable it drives — and only if asked for
 
@@ -165,39 +228,33 @@ those are.
   which they are actually interesting; its author has already answered the
   question the offer asks.
 
-**`t` is not an exception any more.** It used to be a widget in a bar of its
-own, which is what made it feel like a dial attached to nothing. It is a
-variable in the system now, with a row like any other:
-
-```
-t = [0, 20]
-```
-
-That row says **how far time runs**, and it gets the same offer, the same knob,
-the same gear and the same `×` as `k` does. The slider promoted on it is the
-**playhead** inside that span: dragging it moves the marker along the curve and
-does *not* re-solve, because the solution does not depend on where you are
-looking. Widening the span in the gear rewrites the row, and *that* does.
-
-The row is a **list literal**, which today's parser already reads and the math
-field already draws — no new row kind was invented to get `t` onto the page. The
-solver rebinds `t` at every right-hand-side evaluation
-(`crates/numpla-model/src/system.rs`), so the row is inert to the engine and
-cannot change what the equations mean; it is read by the shell, which is exactly
-what "the span" is. Delete the row and the last span simply stands, the same
-courtesy every other deleted row gets.
-
-A demo declares its span in `tSpan` rather than in its source, so loading one
-writes the row that says it. It is an ordinary row from that moment on.
-
-`t` is read on the plot's readout, at the front, alongside the state values.
+**`t` is not one of these, and never will be again.** It was a widget in a bar
+of its own, then a `t = [0, 20]` row with a slider on it, and both times it was
+a dial attached to nothing. The span it runs over is now **the visible window**,
+and a window already has a way to be moved — so there is no `t` row, no `t`
+slider, no playhead, no play button and no `t` chip in the legend.
 
 A slider's **min / max / step** open in a small overlay when you click the `⋯`
-affordance (or, for `t`, its name). Opening one closes any other; `Esc` closes
+affordance. Opening one closes any other; `Esc` closes
 it. Range and step get set once; the value is watched constantly, which is why
 only the value is on screen.
 
-### 5. The issue bar says what is missing
+### 5. Half-written is a normal state
+
+#### Rows go in any order
+
+The whole document is compiled at once — twice over, to settle calls against
+coefficients — so **nothing has to be written before anything else**. An initial
+condition may sit above its ODE row; a parameter may be used three rows before
+the row that defines it; a function may be called before it is written; a
+derived row may read states declared below it. A name that is missing is
+reported as *missing*, never as *out of order*, and the shell never implies a
+sequence it does not have.
+
+The clearest demonstration is the issue bar's own fix: it appends `k = 1` at the
+**end** of the document, below every row that reads `k`, and the model solves.
+
+#### The issue bar says what is missing, by name
 
 The strip along the bottom of the expression pane is where the document tells
 you what it still needs. Quiet when nothing is missing (`clean`, or a count).
@@ -209,13 +266,52 @@ button that writes the default in:
 y has no starting point                        [ add y(0) = 0 ]
 ```
 
-Clicking it appends that row to the document and re-solves. If several issues
-carry fixes, one button applies them all (`add all 3 defaults`) — they are all
-the same kind of answer, "this is what it would otherwise have assumed", and
-each row still carries its own message, so batching hides nothing. `fix` is
-optional in the contract: without it there is simply no button, and a genuine
-error outranks a missing default, because there is no point completing a
+When several things are missing, **every one of them is named**:
+
+```
+k is not defined yet · also q, y(0)            [ add all 3 defaults ]
+```
+
+Not "1 issue · and 2 more". "What is it waiting for" is the only question being
+asked at that moment, and each fix already knows the answer — so the first keeps
+its full sentence and the rest are listed by name, with the full set in the
+hover text. One button applies them all, because they are all the same kind of
+answer — "this is what it would otherwise have assumed" — and clicking through
+them one re-solve at a time is exactly the asking-for-things this is meant to
+remove. Every row still carries its own message, so batching hides nothing.
+
+`fix` is optional in the contract: without it there is simply no button, and a
+genuine error outranks a missing default, because there is no point completing a
 document that cannot be read yet.
+
+#### Waiting is not failing — gray-not-red, applied to the solve
+
+A missing **initial condition** does not stop anything: it is reported *and*
+defaulted to 0 in the same pass, so the model still draws.
+
+A name used but never defined *does* stop the solve, and the engine says so:
+`the model is still incomplete — line 5: k is not defined yet`. That is not a
+failure. It is the ordinary state of a document being written, and showing it in
+red teaches someone that half-typing is a mistake. So the solve badge reads
+
+```
+waiting on k
+```
+
+in the **muted** style — not the error style — with the engine's full sentence in
+the hover text, and **the last good curve stays exactly where it is**, the same
+courtesy an `error` row already gets. Nothing blanks out because a name has not
+been typed yet. The badge names only what actually blocks: undefined names, never
+a starting point the compiler has already supplied.
+
+The three ways a solve can decline to run are three different events wearing one
+shape (`ok: false` and a sentence), and the shell tells them apart:
+
+| | badge | the curve |
+|---|---|---|
+| waiting on a name | muted, `waiting on k` | stays |
+| a method refused (no `x''` rows) | red, the engine's sentence | cleared — the model has already invalidated it — and the sentence is drawn on the plot |
+| anything else | red, the engine's sentence | cleared |
 
 ### 6. The reference answers "what can I type here?"
 
@@ -226,13 +322,13 @@ Rust. It is searchable by name *and* by description ("noise", "symplectic",
 
 | group | what is in it |
 |---|---|
-| Row kinds | `x' =`, `x'' =`, `x'(0) =`, `x(0) =`, `k =`, `f(u) =`, `t = [0, 20]`, `#` |
+| Row kinds | `x' =`, `x'' =`, `x'(0) =`, `x(0) =`, `k =`, `f(u) =`, `#` — and the note that they go in any order |
 | Functions | every builtin with its **exact arity** — the trigonometric set, `sqrt` `exp` `ln`, `log(x)` base 10 *and* `log(b, x)` base-first, `abs` `floor` `ceil` `round` `sign`, `min` `max`, `mod` |
 | Constants | `pi` `tau` `e` `inf` |
 | Noise | `white` `pink` `brown` `blue` `smooth` `telegraph`, their `(t, rate, seed)` arguments, and `rand()` / `randn()` / `rand(s)` with their "a number, not a draw" semantics |
 | Notation | implicit multiplication, one-letter names, subscripts, primes, `^`, lists, the whole operator set, and the **call-versus-coefficient rule** |
-| The integrator | Tsit5 versus Verlet versus Yoshida4 — what each costs and buys |
-| Features | the playhead, sliders, the view switches, the frame, gray-not-red, the issue bar |
+| The integrator | Tsit5 versus Verlet versus Yoshida4 — what each costs and buys; the same switch that is on the plot's strip |
+| Features | the window-is-the-span, one plot, the integrator switch, `show`, sliders, rows-in-any-order, gray-not-red, the issue bar |
 
 **Every entry is insertable**, because a reference you can only read leaves you
 to retype what it just told you. A row kind writes a new row; anything else is
@@ -295,14 +391,16 @@ The panes have explicit sizes and content scrolls *inside* them.
 - Each row reserves a line for its diagnostic message, so a message appearing
   or clearing cannot push anything. **The slider offer lives in that same
   reserved line**, so it cannot push anything either.
+- **A row's suggestion lives in that reserved line too**, beside its message,
+  so the answer appearing next to the problem shifts nothing either.
 - The issue bar is a fixed-height strip: what it says never changes the height
   of the workspace. When it has a fix to offer, the keyboard hint yields the
   space rather than the bar growing.
-- The slider settings, the demo gallery and the reference are all
-  `position: fixed` overlays, not expanding panels.
-- The plot's control strip is a fixed-height row: play/pause, the view switches,
-  the frame controls and the readout all live in it, and nothing in it can
-  change the size of the canvas below.
+- The slider settings, the demo gallery, the views menu and the reference are
+  all `position: fixed` overlays, not expanding panels.
+- The plot's control strip is a fixed-height row: the integrator switch, the
+  views menu, the frame controls and the readout all live in it, and nothing in
+  it can change the size of the canvas below.
 - The canvas is absolutely positioned inside its box, so its size can never feed
   back into the grid that sizes it.
 
@@ -320,9 +418,8 @@ settings overlay opening.
 
 | key | action |
 |---|---|
-| `space` | play / pause — unless you are typing in a field or on a button |
 | `F1` | open (or close) the reference |
-| `Esc` | close the reference, the demo gallery, or the slider settings overlay |
+| `Esc` | close the reference, the demo gallery, the views menu, or the slider settings overlay |
 | `↑` `↓` | in the reference: move between entries |
 | `Enter` | in the reference: insert the selected entry |
 | `tab` | move focus; every focusable control has a visible ring |
@@ -331,7 +428,10 @@ settings overlay opening.
 
 | gesture | action |
 |---|---|
-| drag the body of a tile | pan it |
-| drag along its x or y labels | scale that axis, about the value under the pointer |
+| drag the body | pan the frame |
+| drag along the x or y labels | scale that axis, about the value under the pointer |
 | wheel | zoom about the cursor; over an axis strip, that axis alone |
-| double-click | that tile back to −5…5 |
+| double-click | back to −5…5 |
+
+Every one of these that moves the **horizontal** axis is also a new query: the
+solve is re-run over the new span, once, 180 ms after the gesture stops.
