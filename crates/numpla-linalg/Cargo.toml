@@ -1,0 +1,9 @@
+[package]
+name = "numpla-linalg"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Numpla: linalg"
+
+[dependencies]

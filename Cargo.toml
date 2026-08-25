@@ -1,0 +1,31 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/numpla-expr",
+    "crates/numpla-ode",
+    "crates/numpla-linalg",
+    "crates/numpla-autodiff",
+    "crates/numpla-cas",
+    "crates/numpla-plot",
+    "crates/numpla-wasm",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/johannes/Numpla"
+
+[workspace.dependencies]
+numpla-expr = { path = "crates/numpla-expr", version = "0.0.1" }
+numpla-ode = { path = "crates/numpla-ode", version = "0.0.1" }
+numpla-linalg = { path = "crates/numpla-linalg", version = "0.0.1" }
+numpla-autodiff = { path = "crates/numpla-autodiff", version = "0.0.1" }
+numpla-cas = { path = "crates/numpla-cas", version = "0.0.1" }
+numpla-plot = { path = "crates/numpla-plot", version = "0.0.1" }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"

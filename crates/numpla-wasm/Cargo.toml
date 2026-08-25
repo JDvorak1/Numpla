@@ -1,0 +1,14 @@
+[package]
+name = "numpla-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Numpla: wasm-bindgen boundary. Thin by policy - no logic lives here."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+numpla-expr.workspace = true
+wasm-bindgen = "0.2"
