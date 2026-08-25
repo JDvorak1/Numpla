@@ -129,6 +129,21 @@
   <h2>Tab completion &mdash; type a prefix and press <kbd>Tab</kbd></h2>
   <div class="grid" id="complete"></div>
 
+  <h2>Names the document defines</h2>
+  <p class="hint">
+    A run of two or more letters is one name or several variables, and the
+    document decides which. The builtins are only half of it: names fed in
+    through <code>setDocumentNames({ functions })</code> &mdash; the Compute
+    worksheet's commands, a user's own <code>fg(u) = &hellip;</code> &mdash;
+    count the same. Type <kbd>e</kbd><kbd>x</kbd><kbd>p</kbd><kbd>a</kbd><kbd>n</kbd><kbd>d</kbd>
+    into the first field: <code>exp</code> inflates on the third letter and then
+    dissolves back into letters on the fourth, because something longer is still
+    reachable &mdash; the same mechanism that makes <code>sinh</code> typeable
+    after <code>sin</code>. In the second field, where nothing is defined, the
+    same keystrokes give <code>exp(and)</code>.
+  </p>
+  <div class="grid" id="docnames"></div>
+
   <h2>Calls and coefficients (the same row, read two ways)</h2>
   <div class="grid" id="calls"></div>
 
@@ -280,6 +295,26 @@ mount('complete', 'x then Tab -> the row kinds for x', '');
 mount('complete', 'com then Tab -> a comment row', '');
 mount('complete', "document names: try d, k or q (d is a function here)", '',
   { documentNames: { functions: ['d'], params: ['k_1', 'q_max'], states: ['theta'] } });
+
+// --- document names ---------------------------------------------------------
+const CAS_NAMES = {
+  functions: ['expand', 'factor', 'solve', 'evalf', 'equal', 'subs', 'product'],
+  params: [],
+  states: [],
+};
+mount('docnames', 'type expand, factor, solve - the worksheet knows these', '',
+  { documentNames: CAS_NAMES });
+mount('docnames', 'the same keystrokes with nothing defined: exp wins', '');
+mount('docnames', 'and exp itself is untouched either way - type exp(2)', '',
+  { documentNames: CAS_NAMES });
+mount('docnames', 'a command, read back from source', 'expand((x + 1)^(2))',
+  { documentNames: CAS_NAMES });
+mount('docnames', 'without the names it reads as exp times and(...)',
+  'expand((x + 1)^(2))');
+mount('docnames', "a user's own pair: type f, then fg", '',
+  { documentNames: { functions: ['f', 'fg'], params: [], states: [] } });
+mount('docnames', 'single letters are unaffected: d is a coefficient here',
+  "x'' = -m x / d(x, y)");
 
 // --- calls and coefficients -------------------------------------------------
 // `f(u)` is a call, `g (u)` is `g` times `u`, and only the whole document knows

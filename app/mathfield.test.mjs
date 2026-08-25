@@ -2439,6 +2439,283 @@ roundTrip('dx/dt = ax - y - x(x^(2) + y^(2))');
 }
 
 // ---------------------------------------------------------------------------
+// 24. Multi-letter names the document defines
+//
+// `expand` cannot be typed if `exp` inflates on sight and nothing longer is
+// ever considered. growWord() already solved that shape for `sinh` and `pink`,
+// but only against the builtin table; the CAS worksheet's commands arrive
+// through setDocumentNames() instead. So the rule is the same rule, measured
+// against the names the row knows *now* rather than against a constant.
+// ---------------------------------------------------------------------------
+
+/** A model that knows a document's function names, as the panes supply them. */
+function knowing(functions, src = '') {
+  const m = new MathModel(src);
+  m.setDocumentNames({ functions, params: [], states: [] });
+  return m;
+}
+
+const CAS = ['expand', 'factor', 'solve', 'evalf', 'equal', 'subs', 'product'];
+
+{
+  // The bug, letter by letter.
+  const m = knowing(CAS);
+  m.type('expand');
+  eq('expand can be typed', m.source, 'expand()');
+  eq('and the caret is inside the call', JSON.stringify(m.st.path) + '@' + m.st.index,
+    '[[1,"body"]]@0');
+
+  for (const name of CAS) {
+    const f = knowing(CAS);
+    f.type(name);
+    eq('so can ' + name, f.source, name + '()');
+    eq('with the caret in its argument, every time',
+      JSON.stringify(f.st.path) + '@' + f.st.index, '[[1,"body"]]@0');
+  }
+
+  const g = knowing(CAS);
+  g.type('expand(x^2');
+  eq('and it carries on being typed into', g.source, 'expand(x^(2))');
+}
+
+{
+  // ...without costing `exp` its own behaviour, which is the whole difficulty.
+  const m = knowing(CAS);
+  m.type('exp');
+  eq('exp still inflates on sight', m.source, 'exp()');
+  eq('with the caret inside it', JSON.stringify(m.st.path) + '@' + m.st.index,
+    '[[1,"body"]]@0');
+
+  const n = knowing(CAS);
+  n.type('expx');
+  eq('and takes its argument', n.source, 'exp(x)');
+
+  const o = knowing(CAS);
+  o.type('exp(2');
+  eq('exp( then a digit still works', o.source, 'exp(2)');
+
+  const p = knowing(CAS);
+  p.type('exp(2)+1');
+  eq('and finishes the way it reads', p.source, 'exp(2) + 1');
+
+  // The builtin pairs this mechanism was written for are untouched.
+  const pairs = [['sinh', 'sinh()'], ['cosh', 'cosh()'], ['tanh', 'tanh()'],
+    ['arctan', 'arctan()'], ['randn', 'randn()'], ['pink', 'pink()'],
+    ['sin', 'sin()'], ['pi', 'pi'], ['tau', 'tau']];
+  for (const [text, want] of pairs) {
+    const f = knowing(CAS);
+    f.type(text);
+    eq('a document name does not disturb ' + text, f.source, want);
+  }
+}
+
+{
+  // The latent case nobody had hit: a user's own definitions. `f` is a single
+  // letter, so it is a variable that may be called; `fg` is a run of two, so it
+  // is one name or two variables, and the document says which.
+  const m = knowing(['f', 'fg']);
+  m.type('fg');
+  eq('f followed by g is the call the document defines', m.source, 'fg()');
+  eq('caret inside', JSON.stringify(m.st.path) + '@' + m.st.index, '[[1,"body"]]@0');
+
+  const n = knowing(['f', 'fg']);
+  n.type('f');
+  eq('while f on its own is still a name, not a call', n.source, 'f');
+  n.type('(u)');
+  eq('and calling it is still calling it', n.source, 'f(u)');
+
+  const o = knowing(['f', 'fg']);
+  o.type('fgh');
+  eq('and the call takes its argument', o.source, 'fg(h)');
+
+  const p = knowing(['f']);
+  p.type('fg');
+  eq('without the definition it is two variables again', p.source, 'fg');
+}
+
+{
+  // A single-letter function name must NOT become a word: `d(x, y)` is read by
+  // the var/isCall path, and turning `d` into a function atom would change how
+  // every orbit row parses.
+  const m = knowing(['d'], "x'' = -m x / d(x, y)");
+  eq('a single-letter definition still reads as a call', m.source,
+    "x'' = -(mx)/(d(x, y))");
+  eq('and its atoms are still a variable', m.root[0].type, 'var');
+  const n = knowing(['d']);
+  n.type('dx');
+  eq('and typing it is still two variables', n.source, 'dx');
+}
+
+{
+  // The deeper half: what typing produces has to read back. Before this,
+  // `expand(x^2)` parsed as `exp` times `and(x^2)` - the same collision one
+  // layer down, which is why one fact fixes both.
+  const round = (text) => {
+    const m = knowing(CAS, text);
+    eq('reads back ' + JSON.stringify(text), m.source, text);
+    eq('and is a fixed point', knowing(CAS, m.source).source, text);
+  };
+  round('expand(x^(2))');
+  round('factor(x^(2) - 1)');
+  round('solve(x)');
+  round('subs(x, 1)');
+  round('y = expand((x + 1)^(2))');
+  round('evalf(pi)');
+
+  const m = knowing(CAS, 'expand(x^2)');
+  eq('and it is one call, not two names', m.root.map((a) => a.type).join(','),
+    'func,group');
+  eq('with the document name on it', m.root[0].name, 'expand');
+
+  // Without the names it is arithmetic again, and honestly so.
+  const bare = new MathModel('expand(x)');
+  eq('a document that defines nothing reads exp times and(x)',
+    bare.root[0].type + ':' + bare.root[0].name, 'func:exp');
+}
+
+{
+  // The set is live. It can change between one letter and the next, and a name
+  // going away must not strand what is half-typed.
+  const m = knowing(CAS);
+  m.type('expa');
+  const half = m.source;
+  eq('a half-typed name is just its letters', half, 'ex pa');
+  ok('which is stable', new MathModel(half).source === half);
+  m.setDocumentNames({ functions: [], params: [], states: [] });
+  eq('and losing the name leaves those letters alone', m.source, half);
+  ok('the caret is still somewhere valid', m.st.index >= 0 && m.st.path.length === 0);
+  m.type('nd');
+  eq('typing on carries on as ordinary letters', m.source, 'ex pand');
+
+  // A finished call, when its name goes away, is re-read rather than stranded.
+  const n = knowing(CAS);
+  n.type('expand');
+  eq('a finished call', n.source, 'expand()');
+  n.setDocumentNames({ functions: [], params: [], states: [] });
+  eq('is re-read as what the letters now mean', n.source, 'exp and()');
+  ok('and that is stable too', new MathModel(n.source).source === 'exp and()');
+
+  // And a name arriving lets the next word inflate, with no reload in between.
+  const o = knowing([]);
+  o.type('exp');
+  eq('typed before the name existed', o.source, 'exp()');
+  o.setDocumentNames({ functions: CAS, params: [], states: [] });
+  const q = knowing(CAS);
+  q.type('expand');
+  eq('a name that arrives is usable immediately', q.source, 'expand()');
+
+  // A subscripted name in the set is not a run of letters and must not confuse
+  // the word list.
+  const r = knowing(['k_1', 'expand']);
+  r.type('expand');
+  eq('a subscripted name in the set changes nothing', r.source, 'expand()');
+}
+
+{
+  // Typing a name in full and completing it with Tab land in the same place -
+  // the property inflateWord() was written to keep, now including the names the
+  // document defines.
+  for (const name of ['expand', 'factor', 'product']) {
+    const typedIn = knowing(CAS);
+    typedIn.type(name);
+    const tabbed = knowing(CAS);
+    tabbed.type(name.slice(0, name.length - 2));
+    const r = tabbed.tab();
+    eq('Tab completes ' + name + ' from a prefix outright', r.action, 'applied');
+    eq('typed and completed agree on ' + name, tabbed.source, typedIn.source);
+    eq('and on where the caret ends up: ' + name,
+      JSON.stringify(tabbed.st.path) + '@' + tabbed.st.index,
+      JSON.stringify(typedIn.st.path) + '@' + typedIn.st.index);
+  }
+}
+
+{
+  // And through the field, where the phone keyboard and the key handler meet.
+  const keys = new MathField(new ShimEl('div'), {
+    value: '', documentNames: { functions: CAS, params: [], states: [] },
+  });
+  keys.focus();
+  for (const ch of 'expand') press(keys, ch);
+  eq('the key handler types it', keys.source, 'expand()');
+
+  const api = new MathField(new ShimEl('div'), {
+    value: '', documentNames: { functions: CAS, params: [], states: [] },
+  });
+  api.focus();
+  api.insert('expand');
+  eq('insert() types the same thing', api.source, keys.source);
+  eq('and lands the caret in the same place', caretOf(api), caretOf(keys));
+  ok('it renders as an upright function name',
+    keys.el.classes().join(' ').includes('mf-func'));
+  eq('the field still reports the names it was given',
+    keys.documentNames.functions.join(','), CAS.join(','));
+
+  // The names arriving after the field was built work just as well.
+  const late = new MathField(new ShimEl('div'), { value: '' });
+  late.focus();
+  late.setDocumentNames({ functions: CAS, params: [], states: [] });
+  late.insert('factor');
+  eq('a field told later types it too', late.source, 'factor()');
+
+  keys.destroy();
+  api.destroy();
+  late.destroy();
+}
+
+{
+  // A name inflates with its parentheses already drawn, so the `(` typed next
+  // is the one on screen. Nesting a second pair inside the first is what turned
+  // the worksheet's `factor` chip into `factor(())`.
+  const t = (text, names) => {
+    const m = names ? knowing(names) : new MathModel();
+    m.type(text);
+    return m.source;
+  };
+  eq('exp( steps into the call it just made', t('exp(2)'), 'exp(2)');
+  eq('and the half-typed form is the same call', t('exp(2'), 'exp(2)');
+  eq('a document name types the same way', t('expand(x^2)', CAS), 'expand(x^(2))');
+  eq('a two-argument builtin arrives with its comma, and is typed through too',
+    t('min(a,b)'), 'min(a, b)');
+  eq('so does max', t('max(1,2)'), 'max(1, 2)');
+  eq('an optional-argument call is stepped back into', t('rand(s)'), 'rand(s)');
+  eq('and an empty one is left empty', t('rand()'), 'rand()');
+
+  // ...without swallowing a `(` that is a group the person can see.
+  eq('a radical draws no parentheses, so a typed pair is a real group',
+    t('sqrt(2)'), 'sqrt((2))');
+  eq('a coefficient still opens a group', t('2(x+1)'), '2(x + 1)');
+  eq('a single-letter call still opens its own', t('f(x)', ['f']), 'f(x)');
+  eq('and a call that already has an argument opens a second group',
+    t('sin(x)(y)'), 'sin(x)(y)');
+
+  const m = new MathModel();
+  m.type('exp(');
+  eq('the caret is in the call, not in a group inside it',
+    JSON.stringify(m.st.path) + '@' + m.st.index, '[[1,"body"]]@0');
+  eq('and nothing was inserted', m.source, 'exp()');
+
+  const n = new MathModel();
+  n.type('rand');
+  eq('an optional-argument call leaves the caret after it',
+    JSON.stringify(n.st.path) + '@' + n.st.index, '[]@2');
+  n.type('(');
+  eq('and a typed ( steps into it', JSON.stringify(n.st.path) + '@' + n.st.index,
+    '[[1,"body"]]@0');
+
+  // Through the field, so the phone keyboard's `(` key agrees.
+  const f = new MathField(new ShimEl('div'), {
+    value: '', documentNames: { functions: CAS, params: [], states: [] },
+  });
+  f.focus();
+  f.insert('factor(');
+  eq('a command chip that types name-then-paren gets one call', f.source, 'factor()');
+  eq('with the caret inside it', caretOf(f), '1:body@0');
+  f.insert('x^2');
+  eq('and typing carries on into the argument', f.source, 'factor(x^(2))');
+  f.destroy();
+}
+
+// ---------------------------------------------------------------------------
 
 console.log((failed ? 'FAILED  ' : 'ok  ') + passed + ' passed, ' + failed + ' failed');
 process.exit(failed ? 1 : 0);

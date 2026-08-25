@@ -96,7 +96,37 @@ function varKey(atom) {
   const sub = atom.sub.map((a) => a.ch || a.name || '').join('');
   return sub ? atom.name + '_' + sub : atom.name;
 }
-const MAX_WORD = WORDS.reduce((m, w) => Math.max(m, w.length), 0);
+/**
+ * The names a row currently knows, as runs of letters that stay whole: the
+ * engine's builtins, plus the multi-letter function names the document itself
+ * defines (see setDocumentNames()). The CAS worksheet's `expand`, `factor`
+ * and `solve` arrive that way, and so would a user's own `fg(u) = ...`.
+ *
+ * Single letters are deliberately left out. Numpla's identifier is one letter
+ * plus an optional subscript, so `f` is a variable that may be called and the
+ * var/isCall path already reads it; only a run of two or more letters has to be
+ * decided between "one name" and "several variables", which is exactly what
+ * this list decides.
+ *
+ * It is read live, on every keystroke, because setDocumentNames() can change it
+ * between one letter and the next.
+ */
+function longNames(funcs) {
+  const out = [];
+  if (funcs) for (const n of funcs) {
+    if (n.length > 1 && /^[A-Za-z]+$/.test(n)) out.push(n);
+  }
+  return out;
+}
+
+function wordsOf(st) {
+  const extra = longNames(st && st.funcs);
+  return extra.length ? WORDS.concat(extra) : WORDS;
+}
+
+function maxWordLength(words) {
+  return words.reduce((m, w) => Math.max(m, w.length), 0);
+}
 
 // ---------------------------------------------------------------------------
 // Atoms
@@ -430,17 +460,22 @@ function wordStructureAt(st) {
 }
 
 /**
- * `sin` is a name, and so is `sinh`; `pi` is a name, and so is `pink`. Since
- * the shorter one inflates the moment it is typed, the longer one would be
- * unreachable from the keyboard. So when the next letter could still be going
- * somewhere longer, the structure dissolves back into its letters and carries
- * on - `sin(` + `h` is `sinh(`, not `sin(h)`.
+ * `sin` is a name, and so is `sinh`; `pi` is a name, and so is `pink`; `exp` is
+ * a name, and so is the worksheet's `expand`. Since the shorter one inflates
+ * the moment it is typed, the longer one would be unreachable from the
+ * keyboard. So when the next letter could still be going somewhere longer, the
+ * structure dissolves back into its letters and carries on - `sin(` + `h` is
+ * `sinh(`, not `sin(h)`, and `exp(` + `a` is on its way to `expand(`.
+ *
+ * "Somewhere longer" is measured against the names this row knows *now*
+ * (wordsOf), which is why a document name reaches this at all: `expand` is not
+ * a builtin, it arrives through setDocumentNames().
  */
 function growWord(st, ch) {
   const w = wordStructureAt(st);
   if (!w) return false;
   const grown = w.name + ch;
-  if (!WORDS.some((x) => x.length > w.name.length && x.startsWith(grown))) return false;
+  if (!wordsOf(st).some((x) => x.length > w.name.length && x.startsWith(grown))) return false;
   w.list.splice(w.from, w.count, ...Array.from(w.name).map((c) => A.var(c)));
   st.path = w.path;
   st.index = w.from + w.name.length;
@@ -460,17 +495,19 @@ function inflateWord(st) {
   let start = st.index;
   while (start > 0 && L[start - 1].type === 'var' && !L[start - 1].sub) start--;
   const letters = L.slice(start, st.index).map((a) => a.name).join('');
-  for (let len = Math.min(letters.length, MAX_WORD); len >= 2; len--) {
+  const words = wordsOf(st);
+  for (let len = Math.min(letters.length, maxWordLength(words)); len >= 2; len--) {
     const w = letters.slice(letters.length - len);
-    if (!WORDS.includes(w)) continue;
+    if (!words.includes(w)) continue;
     const from = st.index - len;
-    if (FUNCS.includes(w)) {
-      // The same insertion Tab performs, so a name typed out in full and a name
-      // completed land the caret in the same place.
-      insertCall(st, w, from, len);
-    } else {
+    if (CONSTS.includes(w)) {
       L.splice(from, len, A.konst(w));
       st.index = from + 1;
+    } else {
+      // A builtin or a name the document defines - either way a call, and the
+      // same insertion Tab performs, so a name typed out in full and a name
+      // completed land the caret in the same place.
+      insertCall(st, w, from, len);
     }
     return true;
   }
@@ -506,6 +543,51 @@ export function startSub(st) {
   st.path.push([st.index - 1, 'sub']);
   st.index = prev.sub.length;
   return true;
+}
+
+/**
+ * Is the caret sitting in the empty parentheses a call arrived with? A name
+ * inflates into `exp(|)`, parentheses and all, so the `(` the person types next
+ * is the one already on the screen.
+ */
+function inEmptyCallBody(st) {
+  if (!st.path.length) return false;
+  const [i, k] = st.path[st.path.length - 1];
+  if (k !== 'body') return false;
+  const outer = listAt(st.root, st.path.slice(0, -1));
+  const owner = outer && outer[i];
+  if (!owner || owner.type !== 'group' || owner.open !== '(') return false;
+  // Empty, or holding nothing but the separators a two-argument call arrives
+  // with (`min(|,)`) - either way the caret is at the first argument, which is
+  // where a typed `(` was trying to get to.
+  if (st.index !== 0) return false;
+  if (!owner.body.every((b) => b.type === 'op' && b.ch === ',')) return false;
+  const fn = outer[i - 1];
+  return !!(fn && fn.type === 'func');
+}
+
+/**
+ * A `(` typed where a call's parentheses already are. Rather than nesting a
+ * second pair inside the first, it is the pair on screen:
+ *
+ *   exp(|)     the caret is already where the argument goes - nothing to do
+ *   min(|,)    likewise, at the first of the two
+ *   rand()|    the call came back complete and empty; step inside it
+ *
+ * @returns true when the `(` was that pair and has been consumed.
+ */
+function typeThroughCallParen(st) {
+  if (inEmptyCallBody(st)) return true;
+  const L = curList(st);
+  const prev = L[st.index - 1];
+  const fn = L[st.index - 2];
+  if (prev && prev.type === 'group' && prev.open === '(' && !prev.body.length
+      && fn && fn.type === 'func') {
+    st.path.push([st.index - 1, 'body']);
+    st.index = 0;
+    return true;
+  }
+  return false;
 }
 
 function startGroup(st, open) {
@@ -571,7 +653,19 @@ export function typeChar(st, ch) {
     case '^': startSup(st); return true;
     case '_': return startSub(st);
     case '(':
-    case '[': startGroup(st, ch); return true;
+    case '[':
+      // The parentheses of a call are on screen the moment its name inflates,
+      // so the `(` typed next is that one: step through it rather than opening
+      // a second pair inside it. `exp(2)` is what someone typing `exp(2)` means,
+      // and `expand(` from the worksheet's command chip is one call, not two
+      // nested groups. The same type-through rule as `)` and `,`.
+      //
+      // A radical is deliberately not included: it draws no parentheses of its
+      // own, so a `(` typed inside one is a group the person can see and asked
+      // for.
+      if (ch === '(' && typeThroughCallParen(st)) return false;
+      startGroup(st, ch);
+      return true;
     case ')':
     case ']': return closeGroup(st, ch);
     case "'": insert(st, [A.prime()]); return true;
@@ -980,6 +1074,12 @@ export function parseSource(text, funcs = null) {
   const tail = hash === -1 ? [] : textAtoms(raw.slice(hash));
   let i = 0;
 
+  // Runs of letters that stay whole: the builtins, plus the multi-letter names
+  // this document defines. Without the second half, `expand(x)` reads back as
+  // `exp` times `and(x)` - the same collision that stops it being typed, one
+  // layer down, and the reason the fix has to be the same fact in both places.
+  const wordFuncs = FUNCS.concat(longNames(userFuncs));
+
   const ws = () => { while (i < s.length && /\s/.test(s[i])) i++; };
   const isDigitStart = (j) => /[0-9]/.test(s[j] || '')
     || (s[j] === '.' && /[0-9]/.test(s[j + 1] || ''));
@@ -1000,7 +1100,7 @@ export function parseSource(text, funcs = null) {
 
   function readWord(out) {
     const rest = s.slice(i);
-    const f = longestWord(rest, FUNCS);
+    const f = longestWord(rest, wordFuncs);
     if (f) {
       i += f.length;
       if (f === 'sqrt') {
