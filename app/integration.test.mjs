@@ -996,6 +996,500 @@ if (hearBtn) {
 }
 
 // ---------------------------------------------------------------------------
+// PHONES: the narrow layout, and the keyboard that replaces the OS one
+//
+// Two things are being proved here and they pull in opposite directions:
+// the panel has to be there for a finger, and it has to be ABSENT for a mouse.
+// A desktop user who suddenly loses a third of the screen is the regression
+// this section exists to catch, so it is checked first, before anything has
+// touched the glass.
+// ---------------------------------------------------------------------------
+
+{
+  const kb = $('mathkb');
+  const rowMf = (i) => rowEls()[i].querySelector('.mf');
+  const focusRow = (i) => { rowMf(i).focus(); };
+  const press = (id) => inspect.press(id);
+  const kbKeys = () => inspect.keyboard().keys;
+  const tapKey = (id) => {
+    const btn = kb.querySelectorAll('.kbkey').find((b) => b.dataset.k === id)
+      || kb.querySelectorAll('.kbvar').find((b) => b.dataset.k === id);
+    if (!btn) return false;
+    dispatch(btn, 'pointerdown', { type: 'pointerdown', target: btn, pointerId: 3 });
+    dispatch(btn, 'pointerup', { type: 'pointerup', target: btn, pointerId: 3 });
+    return true;
+  };
+
+  ok('the keyboard panel exists in the markup', !!kb);
+  ok('the pane switch exists', !!$('panetabs') && !!$('tab-plot') && !!$('tab-system'));
+
+  // -- a mouse user is left completely alone -------------------------------
+  ok('a mouse user is not in touch mode', inspect.touch().on === false,
+     JSON.stringify(inspect.touch()));
+  ok('the layout is the wide one', inspect.layout().narrow === false,
+     JSON.stringify(inspect.layout()));
+  focusRow(0);
+  await settle(6);
+  ok('FOCUSING A ROW ON A DESKTOP RAISES NOTHING', kb.hidden && !inspect.keyboard().open);
+  ok('and the way back to it is not on screen either', $('kb-open').hidden);
+  ok('the body does not claim to be narrow or touched',
+     !doc.body.classList.contains('is-narrow') && !doc.body.classList.contains('is-touch'));
+
+  // -- the breakpoint ------------------------------------------------------
+  inspect.setViewport(390, 720);
+  await settle(6);
+  ok('below 720px the narrow layout activates', inspect.layout().narrow === true,
+     JSON.stringify(inspect.layout()));
+  ok('and the body says so', doc.body.classList.contains('is-narrow'));
+  ok('one pane is on screen at a time, and it starts on the plot',
+     inspect.layout().pane === 'plot' && doc.body.classList.contains('pane-plot'));
+  ok('the switch reflects it',
+     $('tab-plot').classList.contains('is-on') &&
+     $('tab-plot').getAttribute('aria-selected') === 'true' &&
+     $('tab-system').getAttribute('aria-selected') === 'false');
+
+  click($('tab-system'));
+  await settle(6);
+  ok('the switch moves to the system', inspect.layout().pane === 'system' &&
+     doc.body.classList.contains('pane-system') && !doc.body.classList.contains('pane-plot'));
+  ok('and it is still not a touch device, so still no keyboard',
+     kb.hidden && inspect.touch().on === false);
+
+  // Narrow alone is enough for the `keys` button: this screen might be a phone
+  // that has not been touched yet, and the panel must be reachable.
+  ok('the way back to the keyboard appears on a narrow screen', !$('kb-open').hidden);
+
+  // -- a finger arrives ----------------------------------------------------
+  inspect.setTouch(true);
+  await settle(6);
+  ok('touch mode arms', inspect.touch().on === true, JSON.stringify(inspect.touch()));
+  ok('and the body carries it, for the 44px targets',
+     doc.body.classList.contains('is-touch'));
+  ok('the field is told not to raise the OS keyboard',
+     inspect.keyboard().api.touchDriven !== false);
+
+  focusRow(1);
+  await settle(6);
+  ok('FOCUSING A ROW WITH A FINGER RAISES THE PANEL',
+     !kb.hidden && inspect.keyboard().open === true);
+  ok('the document pane came forward with it', inspect.layout().pane === 'system');
+  ok('and the re-open button stands down while it is up', $('kb-open').hidden);
+
+  // -- the keys ------------------------------------------------------------
+  const keys = kbKeys();
+  for (const need of ['0', '1', '9', 'dot', 'plus', 'minus', 'times', 'eq',
+    'lparen', 'rparen', 'comma', 'frac', 'sup', 'sqrt', 'prime',
+    'backspace', 'left', 'right', 'up', 'down', 'newrow']) {
+    ok(`the keyboard has a \`${need}\` key`, keys.indexOf(need) >= 0, keys.join(' '));
+  }
+  ok('the alphabet is reachable without leaving the panel',
+     !!$('kb-page-abc') && !!$('kb-page-fn'));
+
+  // The document's OWN names, which is what makes it fast to type this system
+  // rather than a generic one.
+  inspect.setDocument(['k = 0.4', "x' = -y - k*x", "y' = x", 'x(0) = 1', 'y(0) = 0'].join('\n'));
+  await settleSolve();
+  focusRow(1);
+  await settle(10);
+  const vars = inspect.keyboard().vars;
+  ok('the name row offers the document’s own names',
+     vars.indexOf('k') >= 0 && vars.indexOf('x') >= 0 && vars.indexOf('y') >= 0,
+     vars.join(' '));
+  ok('and x y t are always there', ['x', 'y', 't'].every((n) => vars.indexOf(n) >= 0),
+     vars.join(' '));
+  ok('with the constants on the same row',
+     vars.indexOf('π') >= 0 && vars.indexOf('e') >= 0, vars.join(' '));
+
+  // The constants have to be the constants THIS engine has. There is no `e`,
+  // so the key writes exp(1) rather than a variable nothing defines.
+  {
+    focusRow(rowEls().length - 1);
+    await settle(6);
+    tapKey('euler');
+    await settle(10);
+    ok('the e key writes the number, not an undefined name',
+       /exp\(1\)/.test(inspect.source()),
+       JSON.stringify(inspect.source().split('\n').pop()));
+    for (let i = 0; i < 8; i++) press('backspace');
+    await settle(10);
+    tapKey('pi');
+    await settle(10);
+    ok('and π writes pi', /\bpi\b/.test(inspect.source()),
+       JSON.stringify(inspect.source().split('\n').pop()));
+    for (let i = 0; i < 4; i++) press('backspace');
+    await settle(10);
+  }
+
+  // -- a key changes the document ------------------------------------------
+  {
+    focusRow(rowEls().length - 1);            // the trailing blank row
+    await settle(6);
+    const before = inspect.source();
+    ok('a tap on a key types into the row', tapKey('7'));
+    press('dot'); press('5');
+    await settle(10);
+    const after = inspect.source();
+    ok('AND THE DOCUMENT ACTUALLY CHANGES', after !== before && /7\.5/.test(after),
+       JSON.stringify(after.split('\n').pop()));
+
+    press('backspace'); press('backspace'); press('backspace');
+    await settle(10);
+    ok('backspace takes it back out', !/7\.5/.test(inspect.source()),
+       JSON.stringify(inspect.source().split('\n').pop()));
+  }
+
+  // -- STRUCTURE KEYS INSERT STRUCTURE -------------------------------------
+  //
+  // The whole point of the exercise. `√` must inflate a radical with the caret
+  // inside its radicand - not type the four letters s, q, r, t.
+  {
+    const i = rowEls().length - 1;
+    focusRow(i);
+    await settle(6);
+    press('sqrt');
+    await settle(10);
+    const row = rowEls()[i];
+    const radical = row.querySelector('.mf-sqrt');
+    ok('THE RADICAL KEY INFLATES A RADICAL', !!radical,
+       row.textContent);
+    const body = row.querySelector('.mf-sqrt-body');
+    ok('and the caret is inside it',
+       !!body && !!body.querySelector('.mf-pos--caret'));
+    press('2');
+    await settle(10);
+    ok('so what is typed next lands in the radicand', /sqrt\(2\)/.test(inspect.source()),
+       JSON.stringify(inspect.source().split('\n').pop()));
+
+    // the fraction key
+    press('frac');
+    await settle(10);
+    ok('the fraction key builds a fraction, not a slash',
+       !!rowEls()[i].querySelector('.mf-frac'), rowEls()[i].textContent);
+    press('3');
+    await settle(10);
+    ok('and the digit lands in the denominator', /\/\(?3\)?/.test(inspect.source()),
+       JSON.stringify(inspect.source().split('\n').pop()));
+
+    // the exponent key
+    press('sup');
+    press('2');
+    await settle(10);
+    ok('the exponent key builds a superscript',
+       !!rowEls()[i].querySelector('.mf-sup'), rowEls()[i].textContent);
+
+    // the prime key
+    focusRow(rowEls().length - 1);
+    await settle(6);
+    tapKey('var-x');
+    press('prime');
+    await settle(10);
+    const last = rowEls()[rowEls().length - 2];
+    ok('the prime key writes a prime', !!last.querySelector('.mf-prime'),
+       last.textContent);
+    ok("and the row reads x'", /x'/.test(inspect.source()),
+       JSON.stringify(inspect.source().split('\n').pop()));
+  }
+
+  // -- a new row, and the arrows -------------------------------------------
+  {
+    const rowsBefore = rowEls().length;
+    press('newrow');
+    await settle(10);
+    ok('a key makes the next row', rowEls().length > rowsBefore,
+       `${rowsBefore} -> ${rowEls().length}`);
+    const at = inspect.activeRow();
+    press('up');
+    await settle(10);
+    ok('the arrows walk out of a row and into the one above',
+       inspect.activeRow() === at - 1, `${at} -> ${inspect.activeRow()}`);
+    press('down');
+    await settle(10);
+    ok('and back down again - once, never twice',
+       inspect.activeRow() === at, `${at} -> ${inspect.activeRow()}`);
+  }
+
+  // -- NO SYNTHETIC KEY EVENTS ---------------------------------------------
+  {
+    let keydowns = 0;
+    const spy = () => { keydowns++; };
+    doc.addEventListener('keydown', spy, true);
+    press('1'); press('sqrt'); press('backspace'); press('left');
+    await settle(10);
+    doc.removeEventListener('keydown', spy);
+    ok('THE PANEL FIRES NO KEY EVENTS - it calls the field directly',
+       keydowns === 0, `${keydowns} keydowns`);
+    ok('and touch mode survived, which it would not have if it had',
+       inspect.touch().on === true);
+  }
+
+  // -- repeat on hold ------------------------------------------------------
+  {
+    focusRow(rowEls().length - 1);
+    await settle(6);
+    for (const d of ['1', '2', '3', '4', '5', '6']) press(d);
+    await settle(10);
+    const before = inspect.source().split('\n').pop();
+    ok('six digits are in the row', before.length >= 6, JSON.stringify(before));
+
+    const btn = kb.querySelectorAll('.kbkey').find((b) => b.dataset.k === 'backspace');
+    dispatch(btn, 'pointerdown', { type: 'pointerdown', target: btn, pointerId: 4 });
+    await wait(620);
+    dispatch(btn, 'pointerup', { type: 'pointerup', target: btn, pointerId: 4 });
+    await settle(10);
+    const after = inspect.source().split('\n').pop();
+    ok('BACKSPACE REPEATS WHILE IT IS HELD',
+       before.length - after.length >= 3,
+       `${JSON.stringify(before)} -> ${JSON.stringify(after)}`);
+
+    await wait(120);
+    const settled = inspect.source().split('\n').pop();
+    ok('and it stops the moment the finger lifts', settled === after,
+       `${JSON.stringify(after)} -> ${JSON.stringify(settled)}`);
+  }
+
+  // -- the panel must not cover the row being edited -----------------------
+  //
+  // The shim gives every element the same rect, which is not a screen. Give
+  // the list and the row real ones and check the arithmetic: the row sits at
+  // 560..620 and the panel starts at 720 - 300 = 420, so the list has to
+  // scroll by exactly the 210 that puts the row 10px clear of it.
+  {
+    const rowsHost = $('rows');
+    const realRows = rowsHost.getBoundingClientRect;
+    kb.offsetHeight = 300;
+    rowsHost.getBoundingClientRect = () => ({
+      left: 0, top: 60, right: 390, bottom: 720, width: 390, height: 660, x: 0, y: 60,
+    });
+    rowsHost.scrollTop = 0;
+
+    const i = rowEls().length - 1;
+    const row = rowEls()[i];
+    const realRow = row.getBoundingClientRect;
+    row.getBoundingClientRect = () => ({
+      left: 0, top: 560, right: 390, bottom: 620, width: 390, height: 60, x: 0, y: 560,
+    });
+
+    focusRow(i);
+    await settle(10);
+    const keep = inspect.keyboard().keep;
+    ok('the panel height is known', inspect.keyboard().height === 300,
+       String(inspect.keyboard().height));
+    ok('THE FOCUSED ROW IS SCROLLED CLEAR OF THE PANEL',
+       !!keep && keep.dy === 210 && rowsHost.scrollTop === 210,
+       JSON.stringify(keep) + ` scrollTop=${rowsHost.scrollTop}`);
+    ok('and the target is the top of the panel, not the bottom of the screen',
+       !!keep && keep.kbTop === 420 && keep.bottom === 410, JSON.stringify(keep));
+
+    // Already in view: nothing moves. Typing must not scroll the list about.
+    row.getBoundingClientRect = () => ({
+      left: 0, top: 120, right: 390, bottom: 180, width: 390, height: 60, x: 0, y: 120,
+    });
+    press('1');
+    await settle(10);
+    ok('a row already in view is left exactly where it is',
+       inspect.keyboard().keep.dy === 0 && rowsHost.scrollTop === 210,
+       JSON.stringify(inspect.keyboard().keep));
+    press('backspace');
+    await settle(10);
+
+    row.getBoundingClientRect = realRow;
+    rowsHost.getBoundingClientRect = realRows;
+    kb.offsetHeight = 100;
+    rowsHost.scrollTop = 0;
+  }
+
+  // -- dismissable, and easy to get back -----------------------------------
+  {
+    const hide = $('kb-hide');
+    dispatch(hide, 'pointerdown', { type: 'pointerdown', target: hide, pointerId: 5 });
+    dispatch(hide, 'pointerup', { type: 'pointerup', target: hide, pointerId: 5 });
+    await settle(6);
+    ok('the panel can be dismissed', kb.hidden && !inspect.keyboard().open);
+    ok('and the way back appears in its place', !$('kb-open').hidden);
+
+    click($('kb-open'));
+    await settle(6);
+    ok('one tap brings it back', !kb.hidden && inspect.keyboard().open);
+  }
+
+  // -- leaving the document behind takes the keyboard with it --------------
+  {
+    ok('the keyboard is up', inspect.keyboard().open === true);
+    click($('tab-plot'));
+    await settle(6);
+    ok('switching to the plot dismisses the keyboard',
+       $('mathkb').hidden && !inspect.keyboard().open);
+    ok('and the plot is what is on screen', inspect.layout().pane === 'plot');
+    click($('tab-system'));
+    await settle(6);
+    ok('and coming back brings it up again', inspect.keyboard().open === true);
+  }
+
+  // -- pages ---------------------------------------------------------------
+  {
+    click($('kb-page-abc'));
+    await settle(6);
+    ok('the alphabet page opens', inspect.keyboard().page === 'abc');
+    const alpha = kbKeys();
+    ok('and it carries the whole alphabet',
+       'abcdefghijklmnopqrstuvwxyz'.split('').every((c) => alpha.indexOf(c) >= 0),
+       alpha.join(''));
+    ok('with the subscript key, which is what letters need', alpha.indexOf('sub') >= 0);
+
+    click($('kb-page-fn'));
+    await settle(6);
+    ok('the function page opens', inspect.keyboard().page === 'fn');
+    const fns = kbKeys();
+    ok('with the functions the reference lists',
+       ['sin', 'cos', 'tan', 'ln', 'exp'].every((n) => fns.indexOf('fn-' + n) >= 0),
+       fns.join(' '));
+
+    focusRow(rowEls().length - 1);
+    await settle(6);
+    press('fn-sin');
+    await settle(10);
+    ok('a function key inflates a call, not three letters',
+       !!rowEls()[rowEls().length - 2].querySelector('.mf-func'),
+       rowEls()[rowEls().length - 2].textContent);
+    ok('and the panel goes back to the digits, because an argument comes next',
+       inspect.keyboard().page === '123');
+    press('t');
+    await settle(10);
+    ok('so the argument lands inside the call', /sin\(t\)/.test(inspect.source()),
+       JSON.stringify(inspect.source().split('\n').pop()));
+  }
+
+  // -- the caret leaving the document takes the panel with it --------------
+  {
+    focusRow(0);
+    await settle(10);
+    ok('the panel is up while a row has the caret', inspect.keyboard().open === true);
+    $('demos-btn').focus();
+    await settle(10);
+    ok('and it stands down when the caret leaves the document entirely',
+       !inspect.keyboard().open && $('mathkb').hidden);
+    focusRow(0);
+    await settle(10);
+    ok('a row taking the caret brings it straight back', inspect.keyboard().open === true);
+  }
+
+  // -- an app/mathfield.js that predates the command API -------------------
+  //
+  // The same bargain the shell makes with `vector_field`: probe, and degrade
+  // to what is definitely there. Every key above has to keep working with
+  // `insert` and `command` taken away.
+  {
+    const hidden = inspect.setFieldApi(false);
+    ok('the command API can be taken away', hidden.insert === false && hidden.command === false,
+       JSON.stringify(hidden));
+
+    focusRow(rowEls().length - 1);
+    await settle(6);
+    const before = inspect.source();
+    press('4'); press('2');
+    await settle(10);
+    ok('the keys still type without it', /42/.test(inspect.source()) &&
+       inspect.source() !== before, JSON.stringify(inspect.source().split('\n').pop()));
+
+    press('sqrt');
+    await settle(10);
+    const i = rowEls().length - 2;
+    ok('and structure is still structure',
+       !!rowEls()[i].querySelector('.mf-sqrt'), rowEls()[i].textContent);
+
+    press('backspace'); press('backspace'); press('backspace');
+    await settle(10);
+    ok('backspace still deletes', !/42/.test(inspect.source()),
+       JSON.stringify(inspect.source().split('\n').pop()));
+
+    const at = inspect.activeRow();
+    press('up');
+    await settle(10);
+    ok('and the arrows still walk between rows',
+       inspect.activeRow() === at - 1, `${at} -> ${inspect.activeRow()}`);
+
+    const back = inspect.setFieldApi(true);
+    ok('and it comes back', back.insert === true && back.command === true,
+       JSON.stringify(back));
+  }
+
+  // -- touch gestures on the canvas ----------------------------------------
+  //
+  // The window IS the integration span, so pinch and drag are how a phone
+  // re-solves. One finger pans; two zoom.
+  {
+    inspect.setPane('plot');
+    await settle(6);
+    const realRect = canvas.getBoundingClientRect;
+    canvas.getBoundingClientRect = () => ({ left: 0, top: 0, width: 900, height: 400 });
+    click($('frame-reset'));
+    await settleSolve();
+
+    const w0 = inspect.window();
+    const touch = (type, id, x, y) => dispatch(canvas, type, {
+      type, target: canvas, pointerId: id, pointerType: 'touch', clientX: x, clientY: y,
+    });
+
+    touch('pointerdown', 21, 400, 180);
+    touch('pointermove', 21, 300, 180);
+    touch('pointerup', 21, 300, 180);
+    await settleSolve();
+    const w1 = inspect.window();
+    ok('ONE FINGER PANS THE FRAME', w1.x0 !== w0.x0,
+       `${w0.x0} -> ${w1.x0}`);
+
+    // two fingers, spreading apart: zoom in
+    touch('pointerdown', 31, 380, 170);
+    touch('pointerdown', 32, 420, 190);
+    touch('pointermove', 31, 300, 120);
+    touch('pointermove', 32, 500, 240);
+    touch('pointerup', 31, 300, 120);
+    touch('pointerup', 32, 500, 240);
+    await settleSolve();
+    const w2 = inspect.window();
+    ok('TWO FINGERS PINCH THE FRAME', (w2.x1 - w2.x0) < (w1.x1 - w1.x0) * 0.95,
+       `${(w1.x1 - w1.x0).toFixed(3)} -> ${(w2.x1 - w2.x0).toFixed(3)}`);
+    ok('and a pinch is the span, so the solve followed it',
+       Math.abs(spanOf()[1] - spanOf()[0] - (w2.x1 - w2.x0)) < 1e-6 ||
+       /solved|waiting/.test($('stat-solve').textContent),
+       `${JSON.stringify(spanOf())} vs ${w2.x0}..${w2.x1}`);
+    ok('a pinch drops no seed', inspect.seeds().every((s) => s.locked) ||
+       inspect.seeds().length === 0, JSON.stringify(inspect.seeds()));
+
+    // and the handles are a finger's size once a finger is driving
+    const { Plot: P } = await import(new URL('./plot.js', APP).href);
+    const probe = new P(doc.createElement('canvas'));
+    probe.setTouch(true);
+    ok('SEED HANDLES ARE 44px UNDER A FINGER', probe.grab >= 22,
+       `grab radius ${probe.grab}`);
+    probe.setTouch(false);
+    ok('and back to a pixel-precise one for a mouse', probe.grab < 12,
+       `grab radius ${probe.grab}`);
+
+    canvas.getBoundingClientRect = realRect;
+    click($('frame-reset'));
+    await settleSolve();
+  }
+
+  // -- back to the desktop, with nothing left behind -----------------------
+  {
+    inspect.setTouch(false);
+    inspect.setViewport(1400, 900);
+    await settle(10);
+    ok('the wide layout comes back', inspect.layout().narrow === false &&
+       !doc.body.classList.contains('is-narrow'));
+    ok('both panes are on screen again', !doc.body.classList.contains('pane-system'));
+    ok('the keyboard is gone with the finger', kb.hidden && !inspect.keyboard().open);
+    ok('and so is the way back to it', $('kb-open').hidden);
+    ok('the desktop divider is wired again', !!$('divider'));
+
+    focusRow(0);
+    await settle(6);
+    ok('FOCUSING A ROW ON A DESKTOP STILL RAISES NOTHING', kb.hidden);
+  }
+}
+
+// ---------------------------------------------------------------------------
 
 console.log();
 if (failures.length) {

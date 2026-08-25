@@ -438,6 +438,36 @@ export class Plot {
     this.field = null;
     /** Seeds, in draw order: { id, x, y, sol, locked, hover, dragging }. */
     this.seeds = [];
+    /**
+     * How far from a handle's centre a press still counts as grabbing it, in
+     * CSS pixels. A mouse pointer is a pixel and 9.5 is generous; a fingertip
+     * is not, and the phone rule is 44px of TARGET - so setTouch() opens this
+     * to 22, which is that rule measured as a radius. The ring is DRAWN the
+     * same size either way: a handle that doubled in size when a finger came
+     * near would be a different picture of the same model.
+     */
+    this.grab = SEED_R + 4;
+    /**
+     * Where the "get rid of this one" badge sits, and how big it is. Coarse
+     * pointers get it further out and larger, because at the mouse geometry a
+     * fingertip on the badge is also a fingertip on the handle underneath it.
+     * It stays OUTSIDE `grab`, so a press can always be told apart from a drag.
+     */
+    this.badge = { ...SEED_BADGE };
+    this.touch = false;
+  }
+
+  /**
+   * Coarse pointer, or not. Hit testing only - the ring is DRAWN the same size
+   * either way, because a handle that grew when a finger came near would be a
+   * different picture of the same model. What does change is the badge, which
+   * has to be reachable without landing on the handle it belongs to.
+   * @param {boolean} on
+   */
+  setTouch(on) {
+    this.touch = !!on;
+    this.grab = on ? 22 : SEED_R + 4;
+    this.badge = on ? { dx: 17, dy: -17, r: 11 } : { ...SEED_BADGE };
   }
 
   /** @param {string[]} list the views that are on; order is canonical. */
@@ -516,11 +546,12 @@ export class Plot {
       const s = this.seeds[i];
       const p = this.pixelAt(s.x, s.y);
       if (!p) continue;
+      const bg = this.badge;
       if (!s.locked && (s.hover || s.dragging) &&
-          near(p.x + SEED_BADGE.dx, p.y + SEED_BADGE.dy, SEED_BADGE.r + 2)) {
+          near(p.x + bg.dx, p.y + bg.dy, bg.r + 2)) {
         return { id: s.id, part: 'remove', locked: false };
       }
-      if (near(p.x, p.y, SEED_R + 4)) {
+      if (near(p.x, p.y, this.grab)) {
         return { id: s.id, part: 'handle', locked: !!s.locked };
       }
     }
@@ -1116,15 +1147,16 @@ export class Plot {
         ctx.fill();
       } else if (live) {
         // the way to get rid of it, on the thing itself
-        const bx = p.x + SEED_BADGE.dx;
-        const by = p.y + SEED_BADGE.dy;
+        const bg = this.badge;
+        const bx = p.x + bg.dx;
+        const by = p.y + bg.dy;
         ctx.fillStyle = colour;
         ctx.beginPath();
-        ctx.arc(bx, by, SEED_BADGE.r, 0, Math.PI * 2);
+        ctx.arc(bx, by, bg.r, 0, Math.PI * 2);
         ctx.fill();
         ctx.strokeStyle = INK.bg;
         ctx.lineWidth = 1.5;
-        const k = 2.2;
+        const k = bg.r * 0.4;
         ctx.beginPath();
         ctx.moveTo(bx - k, by - k);
         ctx.lineTo(bx + k, by + k);

@@ -1441,7 +1441,7 @@ globalThis.document = {
   body: new ShimEl('body'),
 };
 
-const { MathField } = await import('./mathfield.js');
+const { MathField, COMMAND_NAMES, variableNamesIn } = await import('./mathfield.js');
 const press = (f, k) => f.el.fire('keydown', {
   key: k, ctrlKey: false, metaKey: false, altKey: false, preventDefault() {},
 });
@@ -1815,6 +1815,453 @@ const selectedIn = (menu) => menu.children.findIndex((c) => c.classes().join(' '
     g.setDocumentNames({ functions: ['d'] }));
   eq('and fixes the call', g.source, "x'' = -(mx)/(d(x, y))");
   g.destroy();
+}
+
+// ---------------------------------------------------------------------------
+// 21. The command API - the one path
+//
+// An on-screen keyboard taps `insert()` and `command()`; a desktop keyboard
+// sends key events. Both must end up in the same place, so the tests below
+// mostly compare the two against each other rather than against a literal.
+// ---------------------------------------------------------------------------
+
+/** Where the caret is, as a comparable string: slot path, then offset. */
+function caretOf(f) {
+  const st = f.model.st;
+  return st.path.map(([i, k]) => i + ':' + k).join('/') + '@' + st.index;
+}
+
+/** A field, driven by key events. */
+function byKeys(keys, opts = {}) {
+  const f = new MathField(new ShimEl('div'), Object.assign({ value: '' }, opts));
+  f.focus();
+  for (const k of keys) press(f, k);
+  return f;
+}
+
+/** A field, driven by the command API. Steps are strings to insert, or
+ *  ['cmd', name] pairs. */
+function byApi(steps, opts = {}) {
+  const f = new MathField(new ShimEl('div'), Object.assign({ value: '' }, opts));
+  f.focus();
+  for (const s of steps) {
+    if (Array.isArray(s)) f.command(s[1]);
+    else f.insert(s);
+  }
+  return f;
+}
+
+/**
+ * The property the whole refactor exists for: a keystroke and a tap produce a
+ * byte-identical row, and leave the caret in the same place.
+ */
+function samePath(label, keys, steps, opts) {
+  const a = byKeys(keys, opts);
+  const b = byApi(steps, opts);
+  eq('one path: ' + label + ' - source', b.source, a.source);
+  eq('one path: ' + label + ' - caret', caretOf(b), caretOf(a));
+  eq('one path: ' + label + ' - latex', b.latex, a.latex);
+  a.destroy();
+  b.destroy();
+}
+
+{
+  // --- structure: every command name, and where it leaves the caret --------
+  const f = byApi(['x', ['c', 'frac']]);
+  eq("command('frac') grabs the preceding operand", f.source, '(x)/()');
+  eq('and lands the caret in the denominator, as `/` does', caretOf(f), '0:den@0');
+  f.destroy();
+
+  const g = byApi([['c', 'frac']]);
+  eq("command('frac') on nothing opens an empty fraction", g.source, '()/()');
+  eq('with the caret in the numerator', caretOf(g), '0:num@0');
+  g.destroy();
+
+  const h = byApi(['x', ['c', 'sup']]);
+  eq("command('sup') raises an exponent", h.source, 'x^()');
+  eq('caret inside it', caretOf(h), '1:body@0');
+  h.destroy();
+
+  const i = byApi(['x', ['c', 'sub']]);
+  eq("command('sub') opens a subscript", i.source, 'x_{}');
+  eq('caret inside it', caretOf(i), '0:sub@0');
+  i.destroy();
+
+  const j = byApi([['c', 'sqrt']]);
+  eq("command('sqrt') inflates a real radical, not the letters", j.source, 'sqrt()');
+  eq('with the caret in the radicand', caretOf(j), '0:body@0');
+  ok('and the radical is drawn', j.el.classes().join(' ').includes('mf-radical'));
+  j.destroy();
+
+  const k = byApi(['x', ['c', 'prime']]);
+  eq("command('prime') marks a derivative", k.source, "x'");
+  eq('caret after the prime', caretOf(k), '@2');
+  k.destroy();
+
+  // --- deletion ------------------------------------------------------------
+  const l = byApi(['abc', ['c', 'backspace']]);
+  eq("command('backspace') deletes back", l.source, 'ab');
+  eq('caret follows it', caretOf(l), '@2');
+  l.destroy();
+
+  const m = byApi(['abc', ['c', 'home'], ['c', 'delete']]);
+  eq("command('delete') deletes forward", m.source, 'bc');
+  eq('caret stays put', caretOf(m), '@0');
+  m.destroy();
+
+  // --- navigation ----------------------------------------------------------
+  const n = byApi(['abc', ['c', 'left'], ['c', 'left']]);
+  eq("command('left') walks back", caretOf(n), '@1');
+  n.command('right');
+  eq("command('right') walks forward", caretOf(n), '@2');
+  n.command('home');
+  eq("command('home') goes to the start", caretOf(n), '@0');
+  n.command('end');
+  eq("command('end') goes to the end", caretOf(n), '@3');
+  eq('and none of it changed the row', n.source, 'abc');
+  n.destroy();
+
+  const o = byApi(['1', ['c', 'frac'], '2']);
+  eq('caret is in the denominator', caretOf(o), '0:den@1');
+  o.command('up');
+  eq("command('up') steps into the numerator", caretOf(o), '0:num@1');
+  o.command('down');
+  eq("command('down') steps back into the denominator", caretOf(o), '0:den@1');
+  o.destroy();
+
+  // A move that runs out of row is the shell's business, exactly as the arrow
+  // keys already report it.
+  const navs = [];
+  const p = byApi([], { onNavigate: (_f, dir) => navs.push(dir) });
+  p.command('left');
+  p.command('up');
+  ok("command('left') off the start reports to the host", navs.includes('left'));
+  ok("command('up') out of the row reports too", navs.includes('up'));
+  p.destroy();
+
+  let entered = 0;
+  const q = byApi([], { onEnter: () => { entered += 1; } });
+  q.command('enter');
+  eq("command('enter') submits the row, as Enter does", entered, 1);
+  q.destroy();
+
+  const r = byApi(['sq', ['c', 'tab']]);
+  eq("command('tab') completes, as Tab does", r.source, 'sqrt()');
+  r.destroy();
+}
+
+{
+  // --- insert(): characters, words, whole expressions ----------------------
+  const f = byApi(['7']);
+  eq('insert() of a digit', f.source, '7');
+  f.insert('+');
+  eq('insert() of an operator', f.source, '7 + ');
+  f.insert('sin');
+  eq('insert() of a function name inflates the call', f.source, '7 + sin()');
+  eq('with the caret in the argument', caretOf(f), '3:body@0');
+  f.destroy();
+
+  const g = byApi(['sqrt']);
+  eq('insert("sqrt") is a radical, not four letters', g.source, 'sqrt()');
+  eq('caret inside the radicand', caretOf(g), '0:body@0');
+  g.destroy();
+
+  const h = byApi(['arctan']);
+  eq('insert() of a longer name wins over its prefix', h.source, 'arctan()');
+  h.destroy();
+
+  const i = byApi(["x'' = -x - 0.4x'"]);
+  eq('insert() of a whole expression', i.source, "x'' = -x - 0.4x'");
+  i.destroy();
+
+  const j = byApi(['y = 2x/3']);
+  eq('insert() of an expression with structure in it', j.source, 'y = (2x)/(3)');
+  j.destroy();
+
+  // insert() is typing, not parsing: a typed `(` opens a group and a typed `/`
+  // then takes that whole group as its numerator, exactly as it does under the
+  // fingers. Anyone who wants the parser wants `field.source = ...`.
+  const j2 = byApi(['y = (a + b)/(2)']);
+  eq('insert() types parentheses rather than reading them',
+    j2.source, 'y = ((a + b))/((2))');
+  const j3 = new MathField(new ShimEl('div'), { value: 'y = (a + b)/(2)' });
+  eq('while the source setter parses', j3.source, 'y = (a + b)/(2)');
+  j2.destroy();
+  j3.destroy();
+
+  const k = new MathField(new ShimEl('div'), { value: 'y = ' });
+  k.focus();
+  k.command('end');
+  k.insert('2pit');
+  eq('insert() into an existing row appends at the caret', k.source, 'y = 2pit');
+  k.destroy();
+
+  const l = byApi(['']);
+  eq('insert("") does nothing', l.source, '');
+  ok('and says so', l.insert('') === false);
+  ok('insert(null) is harmless', l.insert(null) === false);
+  l.destroy();
+}
+
+{
+  // --- the one-path property, stated directly ------------------------------
+  samePath('a digit', ['4'], ['4']);
+  samePath('an operator', ['a', '+', 'b'], ['a+b']);
+  samePath('a function name', ['s', 'i', 'n'], ['sin']);
+  samePath('a radical typed out', ['s', 'q', 'r', 't'], [['c', 'sqrt']]);
+  samePath('a fraction', ['x', '/'], ['x', ['c', 'frac']]);
+  samePath('a fraction with a filled denominator', ['x', '/', '2'], ['x', ['c', 'frac'], '2']);
+  samePath('an exponent', ['x', '^', '2'], ['x', ['c', 'sup'], '2']);
+  samePath('a subscript', ['k', '_', '1'], ['k', ['c', 'sub'], '1']);
+  samePath('a prime', ['x', "'"], ['x', ['c', 'prime']]);
+  samePath('a second-order ODE row',
+    Array.from("x''=-x-0.4x'"),
+    ['x', ['c', 'prime'], ['c', 'prime'], '=-x-0.4x', ['c', 'prime']]);
+  samePath('a radical over a fraction',
+    Array.from('sqrt(a/b)'),
+    [['c', 'sqrt'], '(', 'a', ['c', 'frac'], 'b', ')']);
+  samePath('backspace', ['a', 'b', 'c', 'Backspace'], ['abc', ['c', 'backspace']]);
+  samePath('backspace out of a structure',
+    Array.from('1/2').concat(['Backspace', 'Backspace']),
+    ['1', ['c', 'frac'], '2', ['c', 'backspace'], ['c', 'backspace']]);
+  samePath('delete forward',
+    ['a', 'b', 'Home', 'Delete'], ['ab', ['c', 'home'], ['c', 'delete']]);
+  samePath('navigation into a numerator',
+    Array.from('1/2').concat(['ArrowUp', '3']),
+    ['1', ['c', 'frac'], '2', ['c', 'up'], '3']);
+  samePath('the whole caret walk',
+    Array.from('x^2').concat(['ArrowRight', '+', 'ArrowLeft', 'End', 'y']),
+    ['x', ['c', 'sup'], '2', ['c', 'right'], '+', ['c', 'left'], ['c', 'end'], 'y']);
+  samePath('a call with two arguments',
+    ['m', 'i', 'n', 'a', 'ArrowRight', 'b'], ['min', 'a', ['c', 'right'], 'b']);
+  samePath('a comment row', Array.from('# a note'), ['# a note']);
+  samePath('a declared function call',
+    Array.from('x/d(1)'), ['x', ['c', 'frac'], 'd(1)'], { functions: ['d'] });
+}
+
+{
+  // --- unknown commands are ignored, never thrown --------------------------
+  let changes = 0;
+  const f = new MathField(new ShimEl('div'), {
+    value: 'x = 1', onChange: () => { changes += 1; },
+  });
+  f.focus();
+  for (const bad of ['fraction', 'FRAC', 'sqr', '', ' ', 'left ', null, undefined,
+    0, 42, {}, [], 'toString', 'constructor', '__proto__', 'hasOwnProperty']) {
+    let threw = false;
+    let out = null;
+    try { out = f.command(bad); } catch (err) { threw = true; }
+    ok('unknown command ' + JSON.stringify(bad) + ' does not throw', !threw);
+    eq('and reports that it did nothing: ' + JSON.stringify(bad), out, false);
+  }
+  eq('an unknown command leaves the row alone', f.source, 'x = 1');
+  eq('and never fires onChange', changes, 0);
+  f.destroy();
+
+  ok('COMMAND_NAMES lists what does work', COMMAND_NAMES.length >= 13);
+  for (const name of ['frac', 'sup', 'sub', 'sqrt', 'prime', 'backspace',
+    'delete', 'left', 'right', 'up', 'down', 'home', 'end']) {
+    ok('COMMAND_NAMES includes ' + name, COMMAND_NAMES.includes(name));
+  }
+  const g = new MathField(new ShimEl('div'), { value: '' });
+  g.focus();
+  for (const name of COMMAND_NAMES) {
+    let threw = false;
+    try { g.command(name); } catch (err) { threw = true; }
+    ok('command(' + name + ') on an empty row is safe', !threw);
+  }
+  g.destroy();
+}
+
+{
+  // --- onChange, exactly as typing fires it --------------------------------
+  let changes = 0;
+  const f = new MathField(new ShimEl('div'), {
+    value: '', onChange: () => { changes += 1; },
+  });
+  f.focus();
+  f.insert('x');
+  eq('insert() fires onChange', changes, 1);
+  f.command('sup');
+  eq('a structure command fires it too', changes, 2);
+  f.insert('2');
+  eq('and again', changes, 3);
+  f.command('left');
+  eq('navigation does not - nothing changed', changes, 3);
+  f.command('home');
+  f.command('end');
+  eq('nor do home and end', changes, 3);
+  f.command('nonsense');
+  eq('nor does an unknown command', changes, 3);
+  f.command('backspace');
+  eq('backspace does', changes, 4);
+  for (let n = 0; n < 20; n++) f.command('backspace');
+  const emptied = changes;
+  f.command('backspace');
+  eq('but a backspace with nothing to delete does not', changes, emptied);
+
+  const before = changes;
+  f.insert('sqrt');
+  eq('insert() of a whole word is one change, not four', changes, before + 1);
+  eq('though it types the same thing', f.source, 'sqrt()');
+  f.destroy();
+}
+
+{
+  // --- the document's names, for a keyboard to offer -----------------------
+  const names = {
+    functions: ['d', 'g'], params: ['k_1', 'q'], states: ['theta', 'x'],
+  };
+  const f = new MathField(new ShimEl('div'), { value: '', documentNames: names });
+  eq('variableNames() offers states first, then parameters',
+    f.variableNames().join(','), 'theta,x,k_1,q');
+  ok('and leaves function names out - a keyboard offers those as calls',
+    !f.variableNames().includes('d'));
+  eq('the full set is still reachable', f.documentNames.functions.join(','), 'd,g');
+
+  f.setDocumentNames({ functions: [], params: ['a'], states: ['b'] });
+  eq('and it tracks setDocumentNames()', f.variableNames().join(','), 'b,a');
+  f.setDocumentNames(null);
+  eq('an empty document offers nothing', f.variableNames().length, 0);
+  f.destroy();
+
+  eq('duplicates across the two lists are offered once',
+    variableNamesIn({ params: ['x', 'k'], states: ['x'] }).join(','), 'x,k');
+  eq('and the bare helper takes nothing at all',
+    variableNamesIn(null).length, 0);
+  eq('braces in a name are normalised, as everywhere else',
+    variableNamesIn({ params: ['k_{1}'] }).join(','), 'k_1');
+}
+
+// ---------------------------------------------------------------------------
+// 22. touchDriven - the field takes focus without raising the OS keyboard
+// ---------------------------------------------------------------------------
+
+/** A tap: touchstart then touchend at the same point. Returns whether the
+ *  field prevented the default (which is what suppresses the synthetic click). */
+function tap(f, x = 0, y = 0, move = 0) {
+  let prevented = false;
+  f.el.fire('touchstart', { touches: [{ clientX: x, clientY: y }] });
+  f.el.fire('touchend', {
+    changedTouches: [{ clientX: x + move, clientY: y }],
+    cancelable: true,
+    preventDefault() { prevented = true; },
+  });
+  return prevented;
+}
+
+{
+  const f = new MathField(new ShimEl('div'), { value: 'x = 1' });
+  ok('a field is mouse-driven by default', f.touchDriven === false);
+  eq('so nothing is suppressed', f.el.attrs.inputmode, undefined);
+  eq('and no aria-readonly is claimed', f.el.attrs['aria-readonly'], undefined);
+  ok('no touch class', !f.el.classList.contains('mf--touch'));
+
+  f.touchDriven = true;
+  eq('touchDriven sets inputmode="none" - no virtual keyboard for this element',
+    f.el.attrs.inputmode, 'none');
+  eq('and aria-readonly, so assistive tech does not summon one either',
+    f.el.attrs['aria-readonly'], 'true');
+  ok('and the CSS hook for the browser\'s touch furniture',
+    f.el.classList.contains('mf--touch'));
+
+  eq('the focusable element is still a plain div - never an input',
+    f.el.tagName, 'div');
+  eq('still tabbable', f.el.tabIndex, 0);
+  eq('still a textbox to assistive tech', f.el.attrs.role, 'textbox');
+
+  f.touchDriven = false;
+  eq('turning it off removes inputmode', f.el.attrs.inputmode, undefined);
+  eq('and aria-readonly', f.el.attrs['aria-readonly'], undefined);
+  ok('and the class', !f.el.classList.contains('mf--touch'));
+
+  f.touchDriven = 'yes';
+  ok('the property is a boolean, whatever it is given', f.touchDriven === true);
+  f.touchDriven = 0;
+  ok('and coerces the other way too', f.touchDriven === false);
+  f.destroy();
+}
+
+{
+  const f = new MathField(new ShimEl('div'), { value: 'x = 1', touchDriven: true });
+  ok('touchDriven is a constructor option', f.touchDriven);
+  eq('applied before the first paint', f.el.attrs.inputmode, 'none');
+
+  f.focus();
+  ok('a touch field still takes focus', f.focused);
+  eq('and still paints exactly one caret',
+    f.el.classes().filter((c) => c.includes('mf-pos--caret')).length, 1);
+
+  // The keys still work: a tablet with a hardware keyboard is still a field.
+  press(f, 'End');
+  press(f, '2');
+  eq('and a hardware keyboard still types into it', f.source, 'x = 12');
+  f.destroy();
+}
+
+{
+  // Tapping places the caret under touch events alone - no mouse anywhere.
+  const f = new MathField(new ShimEl('div'), { value: 'x = 1', touchDriven: true });
+  f.command('end');
+  const atEnd = caretOf(f);
+  ok('a tap places the caret', tap(f, 0, 5));
+  ok('and focuses the field', f.focused);
+  ok('the caret moved to the tap', caretOf(f) !== atEnd || f._positions.length > 0);
+  ok('and it landed somewhere valid', f.model.st.index >= 0);
+  ok('a tap dismisses the completion menu, as a click does', !f.menuOpen);
+
+  // A finger that travelled was a scroll, not a tap.
+  f.command('end');
+  const before = caretOf(f);
+  ok('a drag is not a tap', tap(f, 0, 5, 40) === false);
+  eq('so the caret stays where it was', caretOf(f), before);
+
+  // A touchend with no touchstart behind it (the gesture began elsewhere).
+  let prevented = false;
+  f.el.fire('touchend', {
+    changedTouches: [{ clientX: 0, clientY: 0 }],
+    cancelable: true,
+    preventDefault() { prevented = true; },
+  });
+  ok('a stray touchend is ignored', prevented === false);
+  eq('and changes nothing', caretOf(f), before);
+  f.destroy();
+}
+
+{
+  // The compatibility mouse events a browser sends after a tap must not place
+  // the caret a second time, from stale coordinates.
+  const f = new MathField(new ShimEl('div'), { value: '1/2', touchDriven: true });
+  f.focus();
+  tap(f, 0, 5);
+  const afterTap = caretOf(f);
+  f.el.fire('mousedown', { clientX: 999, clientY: 999, preventDefault() {} });
+  eq('the tap\'s trailing mousedown is swallowed', caretOf(f), afterTap);
+  f.destroy();
+
+  // A mouse-driven field is untouched by any of this.
+  const g = new MathField(new ShimEl('div'), { value: '1/2' });
+  g.focus();
+  g.el.fire('mousedown', { clientX: 0, clientY: 0, preventDefault() {} });
+  ok('a plain click still places the caret', g._positions.length > 0);
+  ok('and a mouse field can still be tapped', tap(g, 0, 5));
+  g.destroy();
+}
+
+{
+  // Everything the command API does works the same on a touch field: it is the
+  // same path, and touchDriven only concerns the OS keyboard.
+  const a = new MathField(new ShimEl('div'), { value: '', touchDriven: true });
+  const b = new MathField(new ShimEl('div'), { value: '' });
+  a.focus(); b.focus();
+  for (const step of ['x', 'frac', '2']) {
+    if (step === 'frac') { a.command('frac'); b.command('frac'); }
+    else { a.insert(step); b.insert(step); }
+  }
+  eq('touchDriven does not change what typing produces', a.source, b.source);
+  eq('nor where the caret lands', caretOf(a), caretOf(b));
+  a.destroy();
+  b.destroy();
 }
 
 // ---------------------------------------------------------------------------

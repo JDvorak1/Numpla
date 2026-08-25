@@ -39,6 +39,16 @@
       <span class="brand__name">numpla</span>
       <span class="brand__slice">vertical slice</span>
     </div>
+    <!-- Narrow screens only. Below the breakpoint the two panes stop being side
+         by side and become two full-bleed cards; this is the switch between
+         them. A segmented control rather than a horizontal divider - see
+         app/README.md, "The narrow layout". -->
+    <div class="panetabs" id="panetabs" role="tablist" aria-label="Which pane is on screen">
+      <button id="tab-plot" class="panetab is-on" type="button" role="tab"
+              aria-selected="true" aria-controls="plotpane" data-pane="plot">plot</button>
+      <button id="tab-system" class="panetab" type="button" role="tab"
+              aria-selected="false" aria-controls="docpane" data-pane="system">system</button>
+    </div>
     <button id="demos-btn" class="demosbtn" type="button"
             aria-haspopup="menu" aria-expanded="false" aria-controls="demomenu">
       <svg class="icon" viewBox="0 0 16 16" aria-hidden="true">
@@ -66,7 +76,7 @@
   <main class="workspace">
 
     <!-- expression pane: fixed width, scrolls internally -->
-    <aside class="pane pane--doc">
+    <aside class="pane pane--doc" id="docpane">
       <div class="pane__head">
         <h2 class="pane__title">System</h2>
       </div>
@@ -82,6 +92,11 @@
         <span class="issuebar__msg" id="issue-msg">clean</span>
         <button class="issuebar__fix" id="issue-fix" type="button" hidden></button>
         <span class="pane__hint" id="rows-hint">Enter · new row &nbsp;·&nbsp; ↑ ↓ · move</span>
+        <!-- Re-opens the math keyboard after it has been dismissed. Present
+             only for a touch user (or a narrow screen); a mouse user has a
+             real keyboard and never sees it. -->
+        <button class="issuebar__keys" id="kb-open" type="button"
+                aria-controls="mathkb" aria-expanded="false" hidden>keys</button>
       </div>
     </aside>
 
@@ -95,7 +110,7 @@
          integrator, the views menu, the frame. There is no bottom bar - the
          plot has that height instead - and no `t` anything: the visible window
          IS the integration span (docs/ui-v5.md). -->
-    <section class="pane pane--plot">
+    <section class="pane pane--plot" id="plotpane">
       <div class="plot">
         <div class="plot__head">
           <!-- Discrete versus continuous. The thing worth reaching for
@@ -217,6 +232,36 @@
   </div>
   <div class="info__list" id="info-list" role="list" aria-label="Reference entries"></div>
   <p class="info__foot" id="info-foot"></p>
+</div>
+
+<!-- The math keyboard.
+     A fixed-position panel, like every other overlay here, so it can never
+     reflow the workspace. It drives the focused row through MathField's
+     command API - field.insert() / field.command() - and NEVER through
+     synthetic key events, so a tap and a keystroke take one path.
+     The keys themselves are built in main.js, because the variable row is the
+     document's own vocabulary and that is not knowable from markup. -->
+<div class="mathkb" id="mathkb" role="group" aria-label="Math keyboard" hidden>
+  <div class="mathkb__head">
+    <div class="mathkb__pages" role="tablist" aria-label="Keyboard page">
+      <button class="kbpage is-on" id="kb-page-123" type="button" role="tab"
+              aria-selected="true" data-page="123">123</button>
+      <button class="kbpage" id="kb-page-abc" type="button" role="tab"
+              aria-selected="false" data-page="abc">abc</button>
+      <button class="kbpage" id="kb-page-fn" type="button" role="tab"
+              aria-selected="false" data-page="fn">f(x)</button>
+    </div>
+    <button class="kbhide" id="kb-hide" type="button" aria-label="Hide the keyboard">
+      <svg viewBox="0 0 16 16" aria-hidden="true" class="icon">
+        <path d="M3.5 6.5L8 11l4.5-4.5" fill="none" stroke="currentColor"
+              stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+    </button>
+  </div>
+  <!-- The names this document already uses, plus x y t and the constants.
+       Offering the document's own vocabulary is what makes the panel fast. -->
+  <div class="mathkb__vars" id="kb-vars" role="group" aria-label="Names"></div>
+  <div class="mathkb__grid" id="kb-grid" role="group" aria-label="Keys"></div>
 </div>
 
 <script type="module" src="./main.js"></script>

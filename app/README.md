@@ -506,7 +506,7 @@ collapse, is persisted in `localStorage` (`numpla.docWidth`, in a `try/catch` �
 storage throws in some contexts) and survives a re-solve, a new row, and the
 settings overlay opening.
 
-## Keyboard
+## Keyboard (hardware)
 
 | key | action |
 |---|---|
@@ -528,7 +528,180 @@ settings overlay opening.
 | drag a seed handle | move it; its trajectory follows live |
 | the `×` on a hovered handle | remove that seed |
 | `seeds · N ×` on the strip | remove all of them |
+| one finger, dragging | pan the frame (a touch pointer is a pointer) |
+| two fingers | pinch: pan by their midpoint, zoom by their separation |
 
 Every one of these that moves the **horizontal** axis is also a new query: the
 solve is re-run over the new span, once, 180 ms after the gesture stops. Every
 one that moves the frame at all re-queries the **field**, on the same 180 ms.
+
+## Phones
+
+Two problems, and the second one is the point (`docs/mobile.md`).
+
+### The narrow layout — a switch, not a horizontal divider
+
+Below **720px** the two panes stop being side by side. The spec offered a
+horizontal divider or a segmented switch. This is the switch, and the reason is
+arithmetic:
+
+> a phone viewport is about 640 CSS pixels tall. Take the top bar (52) and the
+> math keyboard (about 348 while it is up — 44px keys, five rows of them, which
+> is what the touch rule costs) and **240 are left to divide**. Split that and
+> the plot gets 120px — and the plot's height is not decoration here,
+> because *the window is the query*: a 120px-tall frame is a worse question to
+> ask the solver, and a 120px-tall row list shows one equation. A divider would
+> only let you choose which of the two to make unusable.
+
+Three more reasons the drag loses:
+
+- the surface directly under the divider is a pan/pinch surface. A drag handle
+  sitting on top of one is a gesture ambiguity on every touch.
+- a 44px grab strip is 7% of the screen spent on a control that does nothing but
+  resize.
+- a thumb cannot place a divider precisely, and the two useful positions are
+  "all of it" and "all of the other one" — which is a switch.
+
+So: a `plot | system` segmented control in the top bar, both panes in the same
+grid cell, exactly one visible. Hidden with **`visibility`, never `display`**,
+so the canvas keeps its real size and coming back to the plot does not have to
+re-measure, re-sample and re-solve. Focusing a row switches to `system` by
+itself; switching to `plot` dismisses the keyboard, because nothing is being
+edited any more.
+
+The breakpoint is applied as a **class** (`body.is-narrow`, set by `main.js`),
+not as a media query. The shell has to know which layout it is in anyway — the
+pane switch, the keyboard and the touch targets all read it — and two sources of
+truth for one fact would drift.
+
+**The controls that spend width on a desktop** do not wrap and are not hidden:
+the plot's strip becomes one 56px row that **scrolls sideways**, with a mask on
+its right edge saying there is more. The integrator switch, the views menu,
+seeds, hear and the frame buttons are all still there, all still labelled, every
+one at least 44px tall. The demos button loses its word and keeps its icon; the
+telemetry is already down to the solve badge below 900px.
+
+**44px minimum, everywhere a finger goes.** Row delete buttons become 44×44 and
+stop hiding until hover (a finger has no hover). Seed handles keep the ring they
+have always been drawn with — a handle that grew when a finger came near would
+be a different picture of the same model — but `Plot.setTouch(true)` opens their
+*hit* radius to 22px and moves the remove badge out to where it can be pressed
+without landing on the handle underneath it.
+
+### Touch gestures on the plot
+
+The window **is** the integration span, so pinch and drag are how a phone
+re-solves. One finger pans (a touch pointer has always been a pointer); two
+fingers pinch — the frame is panned by their midpoint and zoomed by the distance
+between them, in one motion. A pinch never drops a seed.
+
+### The math keyboard
+
+A panel that slides up when a row has the caret and **replaces the OS keyboard
+entirely**. It drives the field through the command API and nothing else:
+
+```js
+field.insert(text)     // types text, inflating structure
+field.command(name)    // one editing command
+field.touchDriven      // suppresses the OS keyboard
+```
+
+**No synthetic key events, no hidden `<input>`.** A tap and a keystroke reach the
+model through one path, so the two cannot drift. Everything is **probed**,
+exactly the way `vector_field` and `trajectory_from` are: with `insert` and
+`command` absent the same operations go through the model the field has always
+exposed, followed by the render and the `onChange` the field would have fired
+itself. The keys work either way; the path they take is the only difference.
+
+The layout — six columns, five rows, three pages:
+
+```
+ 123 | abc | f(x)                                       ⌄
+ k   x   y   t   π   e            ← the document's own names, scrolling
+ ─────────────────────────────────────────────────────────
+  7   8   9   ▫⁄▫   (   )
+  4   5   6   ×    ▫˄   √
+  1   2   3   −    ′    ,
+  0   .   =   +    ⌫⌫
+  ←   →   ↑   ↓    ↵↵
+```
+
+- **`abc`** is the rest of the alphabet, a–z, plus the subscript key (a subscript
+  labels a letter, so it lives where the letters are).
+- **`f(x)`** is every function and constant the engine answers to, three to a
+  row. Pressing one inflates the call, drops the caret between the parentheses
+  and hands the panel back to the digits — because an argument comes next.
+- **The name row is the document's own vocabulary.** States, parameters and user
+  functions, then `x y t`, then the constants. That is what makes it fast to
+  type *this* system rather than a generic one. Read from `field.documentNames`
+  when the field publishes it, and from the shell's own `docNames()` otherwise.
+- **`e` writes `exp(1)`**, because the engine has `exp` and no `e` constant. The
+  key produces the number, not a variable nothing defines.
+- **The fraction key is the ÷ key.** In this notation they are one thing, so
+  there is one key and it is drawn as a fraction rather than lying about it.
+
+**Structure keys insert structure.** `√` does not type four letters — it inflates
+a real radical and leaves the caret inside the radicand, exactly as typing
+`sqrt` does on a desktop. Same for the exponent, the fraction and the prime.
+
+**Backspace and the arrows repeat on hold** — 380ms before the first repeat, so
+a deliberate single tap can never become two, then every 55ms.
+
+**The panel never covers the row being edited.** The row list is its own
+scroller and the panel is fixed to the bottom of the viewport, so this is one
+subtraction: the visible bottom of the list is the lower of the list's own
+bottom and the top of the panel, and the focused row is scrolled above it.
+Nothing is resized and nothing is reflowed — only `scrollTop` moves, which is
+what a scroller is for. The list carries an extra `--kb-pad` of bottom padding
+while the panel is up, so the *last* row can still reach the top of it; that
+padding changes once, when the panel opens, never while anything is typed.
+
+**Dismissable and easy to get back**: the `⌄` on the panel closes it, and a
+`keys` button appears in the issue bar in its place. Tapping into a row brings it
+straight back.
+
+### How the panel decides it is wanted
+
+Getting this wrong in the permissive direction costs a desktop user a third of
+their screen, so it arms on **evidence**, not on a guess:
+
+1. **Capability, but only the unambiguous kind.** `(pointer: coarse)` alone says
+   "the primary pointer is a finger" — and a touchscreen laptop reports coarse
+   for its screen while its owner is on the trackpad. So the panel arms at boot
+   only when the device *also* has no fine pointer at all
+   (`(any-pointer: fine)` does not match): a phone or a tablet, with no mouse
+   anywhere.
+2. **Evidence.** On everything else — a Surface, a touchscreen monitor — the
+   first `pointerdown` whose `pointerType` is `touch` or `pen` arms it. A hybrid
+   user gets the panel the moment a finger actually touches the glass, and never
+   before.
+3. **It unarms.** A real `keydown` carrying a character, while a row has the
+   caret, means a physical keyboard is present and being used — an iPad with a
+   case. The panel goes away and stops arming itself for the rest of the session.
+4. **It is always reachable.** The `keys` button opens it by hand on any device.
+   Nothing here is a trap in either direction.
+
+A mouse user who has never touched the screen never sees it: focusing a row
+raises nothing, and the `keys` button is not on screen either.
+
+On a screen wider than 720px the panel is a 420px card in the bottom-right
+corner rather than a full-width bar — a keyboard the width of a monitor is a row
+of keys a metre apart.
+
+### What the suite can inspect
+
+`globalThis.__numplaInspect` gained, for all of the above:
+
+| call | answers |
+|---|---|
+| `layout()` | `{ narrow, pane, breakpoint, width }` |
+| `setViewport(w, h)` | resize the window and re-run the breakpoint |
+| `setPane(name)` | `plot` or `system`, as the switch does |
+| `touch()` | `{ on, reason, locked }` |
+| `setTouch(on)` | force it; `null` re-runs the capability probe |
+| `keyboard()` | `{ open, page, height, keys, vars, keep, api }` — `keep` is what the last "keep the row visible" pass actually did |
+| `setKeyboard(on)` | open or close it by hand |
+| `press(id)` | press one key by id, exactly as a tap does |
+| `activeRow()` | which row the keys are typing into |
+| `source()` | the document as the compiler sees it |
+| `setFieldApi(on)` | hide `insert`/`command` on every row, so the fallback path can be proved |

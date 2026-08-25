@@ -1054,14 +1054,9 @@ body.is-resizing { cursor: col-resize; user-select: none; }
   .info { width: calc(100vw - 20px); }
 }
 
-@media (max-width: 760px) {
-  .workspace {
-    grid-template-columns: minmax(0, 1fr);
-    grid-template-rows: minmax(180px, 38%) minmax(0, 1fr);
-  }
-  .divider { display: none; }
-  .pane--doc { border-bottom: 1px solid var(--line); }
-}
+/* Below 720px the layout is not a narrower version of this one - it is a
+   different layout, driven by `body.is-narrow` from main.js. See "PHONES" at
+   the end of this file. Nothing about the split panes belongs here any more. */
 
 /* ── demos ──────────────────────────────────────────────────────────────
    The gallery is how someone discovers what the software can do, so the
@@ -1429,4 +1424,387 @@ body.is-resizing { cursor: col-resize; user-select: none; }
 .chip--derived .chip__dot {
   border-radius: 2px;
   opacity: .75;
+}
+
+/* ============================================================
+   PHONES
+   ------------------------------------------------------------
+   Two things live here, and the second is the point:
+
+     1. the narrow layout - below 720px the panes stop being
+        side by side and become a segmented switch between two
+        full-bleed cards (app/README.md, "The narrow layout")
+     2. the math keyboard - a panel that replaces the OS one
+
+   The breakpoint is applied as a CLASS, `body.is-narrow`, set
+   from main.js, not as a media query: the shell has to know
+   which layout it is in anyway (the pane switch, the keyboard,
+   the touch targets all read it) and two sources of truth for
+   one fact would drift. `body.is-touch` is the same idea for
+   the pointer.
+   ============================================================ */
+
+:root {
+  /* The panel's height. Capped against the viewport as well as in pixels: on a
+     phone in landscape 300px is most of the screen, and a keyboard that leaves
+     no room for the row it is typing into is not a keyboard. keyboardHeight()
+     measures the real element and only falls back to the 300. */
+  --kb-h:   min(348px, 62vh);
+  --kb-pad: 0px;     /* what the row list adds to its bottom while it is up */
+  --tap:    44px;    /* the smallest a target is ever allowed to be */
+}
+
+body.kb-open { --kb-pad: var(--kb-h); }
+
+/* The row list can always scroll its last row clear of the panel. This is the
+   ONLY thing the keyboard changes about the layout, it changes it once when
+   the panel opens rather than while anything is typed, and it changes padding
+   INSIDE a scroller - so nothing outside the list moves at all. */
+.rows { padding-bottom: calc(10px + var(--kb-pad)); }
+
+/* -- the pane switch ---------------------------------------
+   Present only on a narrow screen. On a desktop the two panes
+   are both on screen and there is nothing to switch. */
+
+.panetabs {
+  display: none;
+  gap: 2px;
+  padding: 3px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--paper-3);
+  flex: 0 0 auto;
+}
+body.is-narrow .panetabs { display: inline-flex; }
+
+.panetab {
+  appearance: none;
+  border: 0;
+  border-radius: 999px;
+  min-height: 36px;
+  padding: 0 16px;
+  background: transparent;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 12px;
+  letter-spacing: .02em;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: color 160ms var(--ease), background-color 160ms var(--ease),
+              box-shadow 160ms var(--ease);
+}
+.panetab.is-on {
+  background: var(--paper);
+  color: var(--accent);
+  box-shadow: var(--shadow-1);
+}
+.panetab:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/* -- the narrow workspace ----------------------------------
+   One cell, both panes in it, exactly one visible. `visibility`
+   rather than `display`, so the canvas keeps its real size and
+   coming back to the plot is instant instead of a re-measure,
+   a re-sample and a re-solve. */
+
+body.is-narrow .workspace {
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
+}
+body.is-narrow .divider { display: none; }
+body.is-narrow .pane { grid-area: 1 / 1; }
+body.is-narrow .pane--doc,
+body.is-narrow .pane--plot { visibility: hidden; pointer-events: none; }
+body.is-narrow.pane-system .pane--doc,
+body.is-narrow.pane-plot   .pane--plot { visibility: visible; pointer-events: auto; }
+
+/* The pane title is redundant once the switch is saying the same word. */
+body.is-narrow .pane--doc .pane__head { display: none; }
+
+body.is-narrow .topbar { gap: 10px; padding: 0 12px; }
+body.is-narrow .brand__name,
+body.is-narrow .brand__slice { display: none; }
+/* Icon only: the word costs more width than a phone has, and the icon is the
+   part people recognise. font-size:0 rather than a second markup path, so the
+   button is one element on every screen. */
+body.is-narrow .demosbtn {
+  margin-left: 0;
+  gap: 0;
+  padding: 0 12px;
+  min-height: var(--tap);
+  font-size: 0;
+}
+body.is-narrow .demosbtn .icon { width: 17px; height: 17px; }
+body.is-narrow .telemetry { gap: 6px; margin-left: auto; }
+body.is-narrow .stat--solve { max-width: 9ch; padding: 3px 8px; }
+body.is-narrow .panetab { padding: 0 13px; font-size: 11.5px; }
+
+/* -- the plot's control strip ------------------------------
+   The integrator, the views menu, seeds, hear and the frame
+   buttons cost more width than a phone has. Wrapping them is
+   the mess the spec names, and hiding them behind a menu costs
+   the discoverability that putting them on the strip bought.
+   So the strip scrolls sideways: one row, nothing wrapped,
+   nothing removed, every target a full 44px tall. The mask on
+   the right edge is what says there is more of it. */
+
+body.is-narrow .plot__head {
+  height: 56px;
+  gap: 8px;
+  padding: 0 12px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  flex-wrap: nowrap;
+  scrollbar-width: none;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior-x: contain;
+  -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 22px), transparent);
+  mask-image: linear-gradient(to right, #000 calc(100% - 22px), transparent);
+}
+body.is-narrow .plot { grid-template-rows: 56px minmax(0, 1fr); }
+body.is-narrow .plot__head::-webkit-scrollbar { display: none; }
+body.is-narrow .framebtn,
+body.is-narrow .modechip {
+  min-height: var(--tap);
+  padding: 0 14px;
+  font-size: 12.5px;
+  display: inline-flex;
+  align-items: center;
+}
+body.is-narrow .modes { padding: 2px; flex: 0 0 auto; }
+body.is-narrow .frames { display: inline-flex; gap: 6px; flex: 0 0 auto; }
+body.is-narrow .readout { display: none; }
+
+/* -- touch targets -----------------------------------------
+   Nothing smaller than 44px once a finger is driving. The row
+   delete button is the one that was genuinely too small AND
+   invisible until hover, which a finger does not have. */
+
+body.is-touch .row,
+body.is-narrow .row { grid-template-columns: 26px minmax(0, 1fr) var(--tap); }
+body.is-touch .row__del,
+body.is-narrow .row__del {
+  width: var(--tap);
+  height: var(--tap);
+  margin-top: 0;
+  opacity: 1;
+  font-size: 18px;
+}
+body.is-touch .row__idx,
+body.is-narrow .row__idx { padding-top: 14px; }
+body.is-touch .issuebar__fix,
+body.is-narrow .issuebar__fix { min-height: 38px; }
+body.is-touch .infobtn,
+body.is-narrow .infobtn { min-width: 38px; min-height: 38px; }
+
+/* -- the way back to the keyboard --------------------------
+   Present only where the panel could be wanted, so a mouse
+   user never sees it. */
+
+.issuebar__keys {
+  flex: 0 0 auto;
+  min-height: 38px;
+  padding: 0 14px;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  background: var(--paper);
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 12px;
+  cursor: pointer;
+}
+.issuebar__keys[hidden] { display: none; }
+.issuebar__keys:hover { color: var(--accent); border-color: var(--accent-line); }
+
+/* ============================================================
+   THE MATH KEYBOARD
+
+   A fixed-position panel, like every other overlay in this
+   file, so it can never reflow the workspace: it is not in the
+   grid, it does not resize a pane, and the only thing it moves
+   is `scrollTop` inside the row list.
+   ============================================================ */
+
+.mathkb {
+  position: fixed;
+  z-index: 90;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: var(--kb-h);
+  display: grid;
+  grid-template-rows: 34px 44px minmax(0, 1fr);
+  gap: 6px;
+  padding: 6px 8px calc(8px + env(safe-area-inset-bottom, 0px));
+  background: var(--paper-2);
+  border-top: 1px solid var(--line-strong);
+  box-shadow: 0 -10px 30px -14px rgba(22, 32, 46, .3);
+  user-select: none;
+  -webkit-user-select: none;
+  touch-action: manipulation;
+  animation: kbrise 180ms var(--ease) both;
+}
+.mathkb[hidden] { display: none; }
+
+@keyframes kbrise {
+  from { transform: translateY(14px); opacity: 0; }
+  to   { transform: none; opacity: 1; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .mathkb { animation: none; }
+}
+
+.mathkb__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 2px;
+}
+
+.mathkb__pages {
+  display: inline-flex;
+  gap: 2px;
+  padding: 3px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--paper-3);
+}
+
+.kbpage {
+  appearance: none;
+  border: 0;
+  border-radius: 999px;
+  min-width: 52px;
+  min-height: 28px;
+  padding: 0 12px;
+  background: transparent;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 12px;
+  cursor: pointer;
+}
+.kbpage.is-on { background: var(--paper); color: var(--accent); box-shadow: var(--shadow-1); }
+
+.kbhide {
+  margin-left: auto;
+  width: var(--tap);
+  height: 34px;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--paper);
+  color: var(--muted);
+  cursor: pointer;
+}
+.kbhide .icon { width: 16px; height: 16px; }
+.kbhide:hover { color: var(--text); border-color: var(--line-strong); }
+
+/* -- the name row ------------------------------------------
+   What THIS document calls things. Offering the document's own
+   vocabulary is what makes the panel fast: a system with `k`,
+   `theta` and `omega` in it is one tap per name rather than
+   five taps through the alphabet page. */
+
+.mathkb__vars {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+  -webkit-overflow-scrolling: touch;
+  touch-action: pan-x;
+  padding: 0 2px;
+}
+.mathkb__vars::-webkit-scrollbar { display: none; }
+
+.kbvar {
+  flex: 0 0 auto;
+  min-width: var(--tap);
+  min-height: var(--tap);
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--paper);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 15px;
+  line-height: 1;
+  cursor: pointer;
+}
+.kbvar--state { border-color: var(--accent-line); color: var(--accent-2); }
+.kbvar--param { color: var(--text-2); }
+.kbvar--func  { font-style: italic; }
+.kbvar--const { color: var(--muted); }
+.kbvar.is-down { background: var(--accent-tint); }
+
+/* -- the keys ----------------------------------------------
+   Six columns, and every key at least 44px tall - which is why
+   the grid rows are `minmax(var(--tap), 1fr)` rather than a
+   fraction that could shrink under them on a short screen. */
+
+.mathkb__grid {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  grid-auto-rows: minmax(var(--tap), 1fr);
+  gap: 6px;
+  min-height: 0;
+  overflow-y: auto;
+  touch-action: pan-y;
+  padding: 0 2px 2px;
+}
+.mathkb__grid--fn { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+
+.kbkey {
+  appearance: none;
+  min-height: var(--tap);
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--paper);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+  display: grid;
+  place-items: center;
+  box-shadow: var(--shadow-1);
+  transition: background-color 90ms var(--ease), color 90ms var(--ease);
+}
+.kbkey:active,
+.kbkey.is-down { background: var(--accent-tint); color: var(--accent); }
+.kbkey:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+/* Structure is the reason this panel exists, so the structure keys are the
+   ones that read as different: they do not type a character, they build one. */
+.kbkey--struct {
+  background: var(--paper-3);
+  color: var(--accent-2);
+  border-color: var(--accent-line);
+  font-size: 17px;
+}
+.kbkey--nav  { background: var(--paper-3); color: var(--text-2); font-size: 16px; }
+.kbkey--edit { background: var(--paper-3); color: var(--text-2); }
+.kbkey--go   { background: var(--accent-tint); color: var(--accent); border-color: var(--accent-line); }
+.kbkey--fn   { font-size: 13.5px; letter-spacing: .01em; }
+
+/* Short and wide - a phone in landscape. Fewer pixels for the panel, and the
+   keys stay at 44px by scrolling the grid rather than by shrinking. */
+@media (max-height: 480px) {
+  :root { --kb-h: min(260px, 66vh); }
+  .mathkb { grid-template-rows: 30px 40px minmax(0, 1fr); gap: 4px; }
+  .kbvar { min-height: 40px; }
+}
+
+/* On a wide screen the panel has no business being full width: a keyboard the
+   width of a monitor is a row of keys a metre apart. */
+@media (min-width: 721px) {
+  .mathkb {
+    left: auto;
+    right: 16px;
+    bottom: 16px;
+    width: 420px;
+    border: 1px solid var(--line-strong);
+    border-radius: var(--r);
+  }
 }

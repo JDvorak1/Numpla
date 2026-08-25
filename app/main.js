@@ -127,6 +127,21 @@ const el = {
 
   demosBtn: $('demos-btn'),
   demomenu: $('demomenu'),
+
+  // narrow layout
+  panetabs:  $('panetabs'),
+  tabPlot:   $('tab-plot'),
+  tabSystem: $('tab-system'),
+  docPane:   $('docpane'),
+  plotPane:  $('plotpane'),
+
+  // the math keyboard
+  kb:      $('mathkb'),
+  kbVars:  $('kb-vars'),
+  kbGrid:  $('kb-grid'),
+  kbHide:  $('kb-hide'),
+  kbOpen:  $('kb-open'),
+  kbPages: [$('kb-page-123'), $('kb-page-abc'), $('kb-page-fn')],
 };
 
 const plot = new Plot(el.canvas);
@@ -462,6 +477,10 @@ let lastActiveRow = null;
 function setActiveRow(row) {
   if (row) lastActiveRow = row;
   rows.forEach((r) => r.el.classList.toggle('is-active', r === row));
+  // A row taking the caret is the whole trigger for the math keyboard: on a
+  // touch device it slides up, and on a narrow screen the system pane has to
+  // be the one on screen for that to mean anything. See "The math keyboard".
+  if (row) onRowFocused(row);
 }
 
 /**
@@ -475,8 +494,18 @@ function navigate(row, dir) {
   if (i < 0) return;
   const j = i + (forward ? 1 : -1);
   if (j < 0 || j >= rows.length) return;
+  navHandled = true;      // the keyboard's arrow keys read this - see kbNavigate
   focusRow(j, !forward);
 }
+
+/**
+ * Set by navigate(). The keyboard's arrow keys have to know whether the FIELD
+ * already walked the caret out of its own edge and into the next row (which it
+ * does by calling onNavigate, which is navigate()), because otherwise a single
+ * tap on `→` at the end of a row would move two rows: once through the field's
+ * own edge handling and once through the keyboard's.
+ */
+let navHandled = false;
 
 // ---------------------------------------------------------------------------
 // Which names the document defines as functions
@@ -516,6 +545,8 @@ function refreshDocumentNames() {
       console.error('[numpla] MathField.setDocumentNames threw', err);
     }
   }
+  // The keyboard's name row is the same fact, drawn as keys.
+  renderKeyboardVars();
 }
 
 const sameNames = (a, b) => a.length === b.length && a.every((x, i) => x === b[i]);
@@ -614,6 +645,11 @@ function makeRow(source, at) {
   row.field = new MathField(host, {
     value: source || '',
     functions: docFunctions,
+    // A field told it is touch-driven does not raise the OS keyboard - the
+    // panel at the bottom of the screen is the keyboard. Passed as an option
+    // AND set again below, because a build of mathfield.js that predates the
+    // option must not lose the fact when one that has it lands.
+    touchDriven: touchMode,
     documentNames: docNames(),
     onChange: () => {
       // Typing into the blank row is what makes it a row. A fresh blank one
@@ -623,7 +659,7 @@ function makeRow(source, at) {
       scheduleRecompute();
     },
     onFocus: () => setActiveRow(row),
-    onBlur: () => row.el.classList.remove('is-active'),
+    onBlur: () => { row.el.classList.remove('is-active'); onRowBlurred(); },
     onEnter: () => insertAfter(row),
     onNavigate: (field, dir) => navigate(row, dir),
   });
@@ -669,6 +705,8 @@ function makeRow(source, at) {
     // so land at the start of whatever moved up into first place.
     focusRow(Math.max(0, i - 1), i > 0);
   }, true);
+
+  try { row.field.touchDriven = touchMode; } catch (err) { /* older field */ }
 
   renumber();
   return row;
@@ -1772,9 +1810,106 @@ const DBL_UNDO_MS = 900;
 const DBL_PX = 6;
 let lastSeedAdd = { t: -1e9, x: 0, y: 0, id: 0 };
 
+/**
+ * TWO FINGERS.
+ *
+ * The window IS the integration span, so on a phone pinch and drag are how a
+ * model gets re-solved over a different interval - which makes them the most
+ * important gestures in the app, not a nicety. `pointerdown` already covers a
+ * single finger (a touch pointer is a pointer), so what is missing is the
+ * second one: while two are down the frame is panned by their midpoint and
+ * zoomed by the distance between them, in one motion, the way a map behaves.
+ *
+ * Held in module scope so the pointerdown handler and the pinch handlers are
+ * looking at one set of pointers rather than two.
+ */
+const touchPoints = new Map();     // pointerId -> { x, y }
+let pinch = null;
+let pinchEndedAt = -1e9;
+
+/** The midpoint and separation of the two live pointers. */
+function pinchPose() {
+  const pts = Array.from(touchPoints.values());
+  if (pts.length < 2) return null;
+  const [a, b] = pts;
+  const dx = a.x - b.x;
+  const dy = a.y - b.y;
+  return {
+    mid: { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 },
+    dist: Math.max(1, Math.hypot(dx, dy)),
+  };
+}
+
+/**
+ * Data coordinates of a pixel in a GIVEN window - `plot.dataAt` answers for the
+ * window the plot currently holds, and a pinch has to anchor in the window the
+ * gesture started from, after this frame's pan has been applied to it.
+ */
+function dataIn(win, box, px, py) {
+  const w = Math.max(1, box.R - box.L);
+  const h = Math.max(1, box.B - box.T);
+  return {
+    x: win.x0 + ((px - box.L) / w) * (win.x1 - win.x0),
+    y: win.y0 + ((box.B - py) / h) * (win.y1 - win.y0),
+  };
+}
+
 function wireCanvasGestures() {
   const cv = el.canvas;
   let drag = null;
+
+  const pinchMove = (ev) => {
+    if (!pinch) return;
+    if (touchPoints.has(ev.pointerId)) {
+      const q = canvasPoint(ev);
+      touchPoints.set(ev.pointerId, q);
+    }
+    const pose = pinchPose();
+    if (!pose) return;
+    if (ev && typeof ev.preventDefault === 'function') ev.preventDefault();
+    const box = pinch.box;
+    // Pan by the midpoint first, then zoom about where the midpoint now is.
+    const moved = panned(pinch.win, box,
+      pose.mid.x - pinch.mid.x, pose.mid.y - pinch.mid.y);
+    const f = pinch.dist / pose.dist;    // fingers apart -> f < 1 -> zoom in
+    const at = dataIn(moved, box, pose.mid.x, pose.mid.y);
+    plot.setWindow(zoomed(moved, f, at.x, at.y));
+    frameChanged();
+  };
+
+  const pinchEnd = (ev) => {
+    if (ev) touchPoints.delete(ev.pointerId);
+    if (!pinch || touchPoints.size >= 2) return;
+    pinch = null;
+    pinchEndedAt = performance.now();
+    cv.removeEventListener('pointermove', pinchMove);
+    cv.removeEventListener('pointerup', pinchEnd);
+    cv.removeEventListener('pointercancel', pinchEnd);
+  };
+
+  const startPinch = () => {
+    const pose = pinchPose();
+    const box = plot.box;
+    if (!pose || !box) return;
+    // One gesture at a time: whatever the first finger had started doing, the
+    // second finger has just made it a pinch instead.
+    drag = null;
+    pinch = { win: plot.getWindow(), box, mid: pose.mid, dist: pose.dist };
+    cv.addEventListener('pointermove', pinchMove);
+    cv.addEventListener('pointerup', pinchEnd);
+    cv.addEventListener('pointercancel', pinchEnd);
+  };
+
+  // Every touch pointer is recorded before anything else looks at it, so the
+  // second one can turn the gesture into a pinch.
+  cv.addEventListener('pointerdown', (e) => {
+    if (e.pointerType !== 'touch' && e.pointerType !== 'pen') return;
+    touchPoints.set(e.pointerId, canvasPoint(e));
+    if (touchPoints.size === 2) startPinch();
+  }, true);
+  cv.addEventListener('pointerup', pinchEnd, true);
+  cv.addEventListener('pointercancel', pinchEnd, true);
+  cv.addEventListener('pointerleave', pinchEnd, true);
 
   const setHover = (id) => {
     if (hoverSeedId === id) return;
@@ -1815,6 +1950,7 @@ function wireCanvasGestures() {
 
     const hit = plot.hit(p.x, p.y);
     if (!hit) return;
+    if (pinch) return;                 // two fingers already own this gesture
     e.preventDefault();
     closeSettings();
 
@@ -1866,7 +2002,8 @@ function wireCanvasGestures() {
       const q = canvasPoint(ev);
       // A press on the plane that never turned into a pan is a click, and a
       // click on the plane is where a seed goes.
-      if (rec && !rec.moved && rec.region === 'body' && ev.type === 'pointerup') {
+      const wasPinch = pinch || performance.now() - pinchEndedAt < 400;
+      if (rec && !rec.moved && !wasPinch && rec.region === 'body' && ev.type === 'pointerup') {
         placeSeedAt(q, plot.dataAt(rec.box, q.x, q.y));
       }
       const h = plot.hit(q.x, q.y);
@@ -2614,6 +2751,97 @@ globalThis.__numplaInspect = {
     updateCapabilities(state.names);
     clearSeeds();
     scheduleField(0);
+  },
+
+  // --- the phone -----------------------------------------------------------
+
+  /** Side by side, or one pane at a time - and which one. */
+  layout: () => ({ narrow, pane, breakpoint: NARROW_MAX, width: viewportWidth() }),
+
+  /**
+   * Resize the window. The suite cannot resize a real one, and the whole
+   * narrow layout hangs off this number, so it is settable - the same handler
+   * the resize event runs is what reads it back.
+   */
+  setViewport: (w, h) => {
+    if (typeof w === 'number' && w > 0) window.innerWidth = w;
+    if (typeof h === 'number' && h > 0) window.innerHeight = h;
+    applyLayout();
+    return { narrow, pane };
+  },
+
+  /** Show the plot, or the system. Same call the segmented switch makes. */
+  setPane: (name) => { setPane(name, true); return pane; },
+
+  /** Armed or not, and what armed it. */
+  touch: () => ({ on: touchMode, reason: touchReason, locked: touchLocked }),
+
+  /**
+   * Force the answer. `true` is "a finger touched the glass", `false` is "a
+   * mouse user, leave the screen alone"; `null` un-locks it and re-runs the
+   * capability probe, which is what a fresh page load would do.
+   */
+  setTouch: (on) => {
+    if (on == null) {
+      touchLocked = false;
+      setTouchMode(coarseOnlyDevice(), 'probed');
+    } else {
+      touchLocked = true;
+      setTouchMode(!!on, 'set by the suite');
+    }
+    return touchMode;
+  },
+
+  /**
+   * The keyboard as it stands: open or not, which page, every key on it by id,
+   * the names it is offering, and what the last "keep the row visible" pass
+   * actually did - which is the only way to prove the panel is not sitting on
+   * top of the row being edited.
+   */
+  keyboard: () => ({
+    open: kbOpen,
+    page: kbPage,
+    height: keyboardHeight(),
+    keys: el.kbGrid ? el.kbGrid.querySelectorAll('.kbkey').map((b) => b.dataset.k) : [],
+    vars: el.kbVars ? el.kbVars.querySelectorAll('.kbvar').map((b) => b.textContent) : [],
+    keep: kbLastKeep,
+    api: {
+      insert: !!(lastActiveRow && typeof lastActiveRow.field.insert === 'function'),
+      command: !!(lastActiveRow && typeof lastActiveRow.field.command === 'function'),
+      touchDriven: !!(lastActiveRow && 'touchDriven' in lastActiveRow.field),
+    },
+  }),
+
+  /** Open or close it by hand, the way the `keys` button does. */
+  setKeyboard: (on) => { if (on) openKeyboard(); else closeKeyboard(); return kbOpen; },
+
+  /** Press one key, by id, exactly as a tap on it would. */
+  press: (id) => {
+    const key = keyById(id);
+    if (!key) return false;
+    return pressKey(key);
+  },
+
+  /** Which row the keys are typing into, by index. */
+  activeRow: () => indexOfRow(lastActiveRow),
+
+  /** The document as the compiler sees it. */
+  source: () => docSource(),
+
+  /**
+   * Hide the field's command API, or give it back. `false` shadows `insert`
+   * and `command` on every row so the shell sees the mathfield.js it had
+   * before they landed - which is the only way to prove the keyboard still
+   * types on a build that predates them. Anything else restores them.
+   */
+  setFieldApi: (on) => {
+    for (const r of rows) {
+      if (on === false) { r.field.insert = undefined; r.field.command = undefined; }
+      else { delete r.field.insert; delete r.field.command; }
+    }
+    const f = rows[0] && rows[0].field;
+    return { insert: !!(f && typeof f.insert === 'function'),
+             command: !!(f && typeof f.command === 'function') };
   },
 };
 
@@ -3583,6 +3811,752 @@ function wireDivider() {
 }
 
 // ---------------------------------------------------------------------------
+// THE NARROW LAYOUT - a switch, not a horizontal divider
+//
+// Below 720px the two panes stop being side by side. The spec offered a
+// horizontal divider or a segmented switch; this is the switch, and the reason
+// is arithmetic.
+//
+// A phone viewport is about 640 CSS pixels tall. Take the top bar (52) and the
+// math keyboard (about 348 while it is up, because 44px keys and five rows of
+// them is what the touch rule costs) and 240 are left to divide. Split that and
+// the plot gets 120px - and the plot's height is not decoration here,
+// because THE WINDOW IS THE QUERY: a 140px-tall frame is a worse question to
+// ask the solver, and a 140px-tall row list shows two equations. A divider
+// would only let you choose which of the two to make unusable.
+//
+// Three more reasons the drag loses:
+//
+//   - the surface directly under the divider is a pan/pinch surface. A drag
+//     handle sitting on top of one is a gesture ambiguity on every touch.
+//   - a 44px grab strip is 7% of the screen spent on a control that does
+//     nothing but resize.
+//   - a thumb cannot place a divider precisely, and the two useful positions
+//     are "all of it" and "all of the other one" - which is a switch.
+//
+// So: both panes occupy the same grid cell and exactly one is visible. Hidden
+// with `visibility`, never `display`, so the canvas keeps its real size and
+// coming back to it does not have to re-measure, re-sample and re-solve.
+// ---------------------------------------------------------------------------
+
+const NARROW_MAX = 720;
+let narrow = false;
+let pane = 'plot';         // 'plot' | 'system' - only meaningful while narrow
+
+function viewportWidth() {
+  const w = typeof window !== 'undefined' ? window.innerWidth : 0;
+  return typeof w === 'number' && w > 0 ? w : 1024;
+}
+
+function viewportHeight() {
+  const h = typeof window !== 'undefined' ? window.innerHeight : 0;
+  return typeof h === 'number' && h > 0 ? h : 768;
+}
+
+/** Which pane is on screen. Ignored while the panes are side by side. */
+function setPane(next, fromUser) {
+  pane = next === 'system' ? 'system' : 'plot';
+  document.body.classList.toggle('pane-plot', pane === 'plot');
+  document.body.classList.toggle('pane-system', pane === 'system');
+  for (const btn of [el.tabPlot, el.tabSystem]) {
+    if (!btn) continue;
+    const on = btn.dataset.pane === pane;
+    btn.classList.toggle('is-on', on);
+    btn.setAttribute('aria-selected', on ? 'true' : 'false');
+  }
+  if (pane === 'plot') {
+    // Leaving the document behind means leaving its keyboard behind too.
+    if (fromUser) closeKeyboard();
+    scheduleDraw();
+    scheduleField();
+  }
+}
+
+function applyLayout() {
+  const next = viewportWidth() <= NARROW_MAX;
+  if (next !== narrow) {
+    narrow = next;
+    document.body.classList.toggle('is-narrow', narrow);
+    // Side by side again: both panes are on screen, so the switch is moot and
+    // whatever it last said must not keep one of them hidden.
+    setPane(narrow ? pane : 'plot', false);
+    closeSettings();
+    closeViews();
+    scheduleDraw();
+    scheduleField();
+  }
+  syncKeyboardAffordances();
+  return narrow;
+}
+
+// ---------------------------------------------------------------------------
+// IS THIS A FINGER?
+//
+// Getting this wrong in the permissive direction costs a desktop user a third
+// of their screen, so the panel arms on evidence, not on a guess:
+//
+//   1. CAPABILITY, but only the unambiguous kind. `(pointer: coarse)` alone
+//      says "the primary pointer is a finger"; a touchscreen laptop reports
+//      coarse for its screen while its owner is on the trackpad. So the panel
+//      arms at boot only when the device ALSO has no fine pointer at all
+//      (`(any-pointer: fine)` does not match) - a phone or a tablet, with no
+//      mouse anywhere.
+//
+//   2. EVIDENCE. On everything else - a Surface, a touchscreen monitor - the
+//      first pointerdown whose `pointerType` is `touch` or `pen` arms it. A
+//      hybrid user gets the panel the moment a finger actually touches the
+//      glass, and never before.
+//
+//   3. IT UNARMS. A real keydown carrying a character, while a row has the
+//      caret, means a physical keyboard is present and being used - an iPad
+//      with a case, say. The panel goes away and stops arming itself for the
+//      rest of the session.
+//
+//   4. IT IS ALWAYS REACHABLE. The `keys` button in the issue bar opens it by
+//      hand, on any device. Nothing here is a trap in either direction.
+//
+// The media queries are only ever consulted through matchMedia when it exists,
+// so an engine without it simply falls back on (2) and (4).
+// ---------------------------------------------------------------------------
+
+let touchMode = false;
+let touchReason = 'none';
+let touchLocked = false;      // a keydown proved a real keyboard, or the user chose
+
+function mediaMatches(query) {
+  try {
+    if (typeof window.matchMedia !== 'function') return false;
+    const mq = window.matchMedia(query);
+    return !!(mq && mq.matches);
+  } catch (err) {
+    return false;
+  }
+}
+
+/** A coarse primary pointer AND no fine pointer anywhere on the device. */
+function coarseOnlyDevice() {
+  return mediaMatches('(pointer: coarse)') && !mediaMatches('(any-pointer: fine)');
+}
+
+function setTouchMode(on, reason) {
+  const next = !!on;
+  if (reason) touchReason = reason;
+  if (next === touchMode) return;
+  touchMode = next;
+  document.body.classList.toggle('is-touch', touchMode);
+  plot.setTouch(touchMode);
+  for (const row of rows) {
+    try { row.field.touchDriven = touchMode; } catch (err) { /* older field */ }
+  }
+  if (!touchMode) closeKeyboard();
+  syncKeyboardAffordances();
+  scheduleDraw();
+}
+
+function armTouch(reason) {
+  if (touchLocked || touchMode) return;
+  setTouchMode(true, reason);
+  if (lastActiveRow) openKeyboard();
+}
+
+function wireTouchDetection() {
+  if (coarseOnlyDevice()) setTouchMode(true, 'coarse-only device');
+
+  // Capture, and on the window, so it is seen whatever the target was.
+  window.addEventListener('pointerdown', (e) => {
+    if (e && (e.pointerType === 'touch' || e.pointerType === 'pen')) {
+      armTouch('a finger touched the screen');
+    }
+  }, true);
+  window.addEventListener('touchstart', () => armTouch('a finger touched the screen'), true);
+
+  // A physical keyboard, being used. That person does not want this panel.
+  document.addEventListener('keydown', (e) => {
+    if (!touchMode || !e || e.ctrlKey || e.metaKey || e.altKey) return;
+    const k = e.key;
+    const typing = typeof k === 'string' && (k.length === 1 || k === 'Backspace' || k === 'Enter');
+    if (!typing) return;
+    const t = e.target;
+    if (t && typeof t.closest === 'function' && t.closest('.mathkb')) return;
+    touchLocked = true;
+    setTouchMode(false, 'a physical keyboard was used');
+  }, true);
+}
+
+// ---------------------------------------------------------------------------
+// THE MATH KEYBOARD
+//
+// A phone keyboard cannot write mathematics: `^`, a radical, a fraction bar and
+// a prime are all several taps deep behind a symbols page, if they are there at
+// all. So this replaces it outright.
+//
+// It drives the focused row through MathField's command API and NOTHING else:
+//
+//     field.insert(text)     types text, inflating structure
+//     field.command(name)    one editing command
+//
+// No synthetic key events, no hidden <input> to keep in sync - a tap and a
+// keystroke reach the model through one path, so the two cannot drift.
+//
+// That API arrived in mathfield.js separately, so everything here is PROBED,
+// exactly the way `vector_field` and `trajectory_from` are: when the methods
+// are absent the same operations are performed through the model the field has
+// always exposed (`field.model`), followed by the render and the onChange the
+// field would have fired itself. The keys work either way; the path they take
+// is the only difference.
+//
+// STRUCTURE KEYS INSERT STRUCTURE. `√` does not type four letters: it inflates
+// a radical and leaves the caret inside it, because that is what typing `sqrt`
+// does. The fraction key is the ÷ key - in this notation they are one thing,
+// so there is one key and it is drawn as a fraction.
+// ---------------------------------------------------------------------------
+
+const KB_REPEAT_DELAY = 380;   // before a held key starts repeating
+const KB_REPEAT_MS = 55;       // and how fast it goes once it does
+const KB_HEIGHT = 348;         // fallback for --kb-h in styles.css
+
+let kbOpen = false;
+let kbPage = '123';
+let kbLastKeep = null;         // what the last "keep the row visible" pass did
+let kbRepeatTimer = 0;
+let kbRepeatKey = null;
+
+/**
+ * One key. `ins` is typed through insert(); `cmd` is a command name; `act` is
+ * something only the shell can do (a new row, a page change, hiding).
+ * `rep` marks the keys that repeat while they are held.
+ */
+const K = (id, label, spec) => ({ id, label, ...spec });
+
+const KB_MAIN = [
+  [K('7', '7', { ins: '7' }), K('8', '8', { ins: '8' }), K('9', '9', { ins: '9' }),
+    K('frac', '▫⁄▫', { cmd: 'frac', cls: 'kbkey--struct', title: 'fraction — the ÷ of this notation' }),
+    K('lparen', '(', { ins: '(' }), K('rparen', ')', { ins: ')' })],
+
+  [K('4', '4', { ins: '4' }), K('5', '5', { ins: '5' }), K('6', '6', { ins: '6' }),
+    K('times', '×', { ins: '*', title: 'multiply' }),
+    K('sup', '▫˄', { cmd: 'sup', cls: 'kbkey--struct', title: 'exponent' }),
+    K('sqrt', '√', { cmd: 'sqrt', cls: 'kbkey--struct', title: 'radical' })],
+
+  [K('1', '1', { ins: '1' }), K('2', '2', { ins: '2' }), K('3', '3', { ins: '3' }),
+    K('minus', '−', { ins: '-', title: 'minus' }),
+    K('prime', '′', { cmd: 'prime', cls: 'kbkey--struct', title: "prime — x' is dx/dt" }),
+    K('comma', ',', { ins: ',' })],
+
+  [K('0', '0', { ins: '0' }), K('dot', '.', { ins: '.' }), K('eq', '=', { ins: '=' }),
+    K('plus', '+', { ins: '+' }),
+    K('backspace', '⌫', { cmd: 'backspace', rep: true, span: 2, cls: 'kbkey--edit' })],
+
+  [K('left', '←', { cmd: 'left', rep: true, cls: 'kbkey--nav' }),
+    K('right', '→', { cmd: 'right', rep: true, cls: 'kbkey--nav' }),
+    K('up', '↑', { cmd: 'up', rep: true, cls: 'kbkey--nav' }),
+    K('down', '↓', { cmd: 'down', rep: true, cls: 'kbkey--nav' }),
+    K('newrow', '↵', { act: 'newrow', span: 2, cls: 'kbkey--go', title: 'a new row below' })],
+];
+
+/** The rest of the alphabet, without leaving the panel. */
+const KB_ALPHA = (() => {
+  const letters = 'abcdefghijklmnopqrstuvwx'.split('');
+  const grid = [];
+  for (let i = 0; i < letters.length; i += 6) {
+    grid.push(letters.slice(i, i + 6).map((c) => K(c, c, { ins: c })));
+  }
+  grid.push([
+    K('y', 'y', { ins: 'y' }), K('z', 'z', { ins: 'z' }),
+    K('sub', '▫ˍ', { cmd: 'sub', cls: 'kbkey--struct', title: 'subscript — k_1' }),
+    K('backspace2', '⌫', { cmd: 'backspace', rep: true, cls: 'kbkey--edit' }),
+    K('left2', '←', { cmd: 'left', rep: true, cls: 'kbkey--nav' }),
+    K('right2', '→', { cmd: 'right', rep: true, cls: 'kbkey--nav' }),
+  ]);
+  return grid;
+})();
+
+/**
+ * Everything the engine answers to by name, three to a row. Pressing one
+ * inflates the call and drops the caret between its parentheses, then hands
+ * the panel back to the digits - because the next thing wanted is an argument.
+ */
+const KB_FUNCS = [
+  ['sin', 'cos', 'tan'],
+  ['arcsin', 'arccos', 'arctan'],
+  ['sinh', 'cosh', 'tanh'],
+  ['ln', 'log', 'exp'],
+  ['sqrt', 'abs', 'sign'],
+  ['min', 'max', 'mod'],
+  ['floor', 'ceil', 'round'],
+  ['pi', 'tau', 'inf'],
+  ['white', 'pink', 'brown'],
+  ['blue', 'smooth', 'telegraph'],
+  ['rand', 'randn'],
+].map((r) => r.map((name) => K('fn-' + name, name, {
+  ins: name, act: 'fn', cls: 'kbkey--fn', title: name,
+})));
+
+/** The letters `x y t` always, and whatever this document already calls things. */
+function keyboardNames() {
+  const seen = new Set();
+  const out = [];
+  const push = (name, kind) => {
+    const n = String(name == null ? '' : name).trim();
+    if (!n || seen.has(n)) return;
+    seen.add(n);
+    out.push({ name: n, kind });
+  };
+
+  // Probed, the way everything optional here is: the field publishes what the
+  // document defines, and a build that does not yet is not an error - `x y t`
+  // is a working keyboard on its own.
+  let names = null;
+  try {
+    const f = lastActiveRow && lastActiveRow.field;
+    const d = f && f.documentNames;
+    if (d && typeof d === 'object') names = d;
+  } catch (err) {
+    names = null;
+  }
+  if (!names) names = docNames();
+
+  for (const n of (names.states || [])) push(n, 'state');
+  for (const n of (names.params || [])) push(n, 'param');
+  for (const n of (names.functions || [])) push(n, 'func');
+  for (const n of ['x', 'y', 't']) push(n, 'state');
+  return out;
+}
+
+function kbButton(key) {
+  const b = document.createElement('button');
+  b.type = 'button';
+  b.className = 'kbkey' + (key.cls ? ' ' + key.cls : '');
+  b.dataset.k = key.id;
+  b.textContent = key.label;
+  if (key.span) b.style.gridColumn = 'span ' + key.span;
+  b.setAttribute('aria-label', key.title || key.label || key.id);
+  if (key.title) b.title = key.title;
+  bindKey(b, key);
+  return b;
+}
+
+function kbChip(key, cls) {
+  const b = document.createElement('button');
+  b.type = 'button';
+  b.className = cls;
+  b.dataset.k = key.id;
+  b.dataset.name = key.ins || '';
+  b.textContent = key.label;
+  b.setAttribute('aria-label', key.title || key.label);
+  if (key.title) b.title = key.title;
+  bindKey(b, key);
+  return b;
+}
+
+/** The name row: the document's own vocabulary, plus x y t and the constants. */
+function renderKeyboardVars() {
+  if (!el.kbVars) return;
+  const names = keyboardNames();
+  const sig = names.map((n) => n.kind + ':' + n.name).join(',');
+  if (el.kbVars.dataset.sig === sig) return;
+  el.kbVars.dataset.sig = sig;
+  el.kbVars.innerHTML = '';
+  for (const n of names) {
+    el.kbVars.appendChild(kbChip(
+      K('var-' + n.name, n.name, { ins: n.name, title: n.name }),
+      'kbvar kbvar--' + n.kind
+    ));
+  }
+  // π and e ride the same row: this is where a symbol you want by NAME lives.
+  // `e` is written exp(1), because the engine has exp and no `e` constant
+  // (docs/wasm-api.md) - so the key produces the number rather than a variable
+  // called e that nothing defines.
+  el.kbVars.appendChild(kbChip(
+    K('pi', 'π', { ins: 'pi', title: 'pi' }), 'kbvar kbvar--const'
+  ));
+  el.kbVars.appendChild(kbChip(
+    K('euler', 'e', { ins: 'exp1)', title: "Euler's number — exp(1)" }), 'kbvar kbvar--const'
+  ));
+}
+
+function renderKeyboardGrid() {
+  if (!el.kbGrid) return;
+  const grid = kbPage === 'abc' ? KB_ALPHA : kbPage === 'fn' ? KB_FUNCS : KB_MAIN;
+  el.kbGrid.innerHTML = '';
+  el.kbGrid.dataset.page = kbPage;
+  el.kbGrid.className = 'mathkb__grid mathkb__grid--' + kbPage;
+  for (const rowKeys of grid) {
+    for (const key of rowKeys) el.kbGrid.appendChild(kbButton(key));
+  }
+  for (const btn of el.kbPages) {
+    if (!btn) continue;
+    const on = btn.dataset.page === kbPage;
+    btn.classList.toggle('is-on', on);
+    btn.setAttribute('aria-selected', on ? 'true' : 'false');
+  }
+}
+
+function setKeyboardPage(page) {
+  const next = page === 'abc' || page === 'fn' ? page : '123';
+  if (next === kbPage) return;
+  kbPage = next;
+  renderKeyboardGrid();
+}
+
+// --- the bridge to the field ----------------------------------------------
+
+/** The row a key acts on: whichever one last had the caret. */
+function targetRow() {
+  if (lastActiveRow && indexOfRow(lastActiveRow) >= 0) return lastActiveRow;
+  ensureTail();
+  return rows[rows.length - 1] || null;
+}
+
+/** A caret fingerprint, for telling "the command moved it" from "it did not". */
+function caretSig(field) {
+  try {
+    const st = field && field.model && field.model.st;
+    if (!st) return null;
+    return JSON.stringify(st.path) + '@' + st.index;
+  } catch (err) {
+    return null;
+  }
+}
+
+/** Render, then fire onChange the way the field does when a key is pressed. */
+function applyFallback(field, changed) {
+  try {
+    if (typeof field.render === 'function') field.render();
+  } catch (err) {
+    console.error('[numpla] field.render threw', err);
+  }
+  if (changed && field.opts && typeof field.opts.onChange === 'function') {
+    try { field.opts.onChange(field); } catch (err) { console.error('[numpla] onChange threw', err); }
+  }
+  return !!changed;
+}
+
+/**
+ * Type text into a row. `field.insert` when the field has it; otherwise the
+ * same operation through the model, which is what `insert` is built on.
+ */
+function fieldInsert(field, text) {
+  if (!field) return false;
+  if (typeof field.insert === 'function') {
+    try {
+      return field.insert(text) !== false;
+    } catch (err) {
+      console.error('[numpla] field.insert threw', err);
+      return false;
+    }
+  }
+  if (!field.model || typeof field.model.type !== 'function') return false;
+  return applyFallback(field, field.model.type(text));
+}
+
+/** The model-level stand-in for each command, for a field with no command(). */
+const KB_FALLBACK = {
+  frac:      (m) => m.type('/'),
+  sup:       (m) => m.type('^'),
+  sub:       (m) => m.type('_'),
+  sqrt:      (m) => m.type('sqrt'),
+  prime:     (m) => m.type("'"),
+  backspace: (m) => m.backspace(),
+  delete:    (m) => m.del(),
+  home:      (m) => { m.home(); return false; },
+  end:       (m) => { m.end(); return false; },
+};
+
+const KB_NAV = ['left', 'right', 'up', 'down'];
+
+/**
+ * One arrow. The caret moves inside the row if it can, and walks into the
+ * neighbouring row if it cannot - which is exactly what the arrow keys do on a
+ * desktop, and it has to be ONE behaviour rather than two.
+ */
+function fieldNavigate(row, dir) {
+  const field = row.field;
+  navHandled = false;
+  let moved = false;
+  if (typeof field.command === 'function') {
+    const before = caretSig(field);
+    try { field.command(dir); } catch (err) { console.error('[numpla] field.command threw', err); }
+    moved = before === null ? true : before !== caretSig(field);
+  } else if (field.model) {
+    const m = field.model;
+    moved = !!(dir === 'left' ? m.left() : dir === 'right' ? m.right()
+      : dir === 'up' ? m.up() : m.down());
+    applyFallback(field, false);
+  }
+  // navHandled: the field may have walked out of its own edge already, by
+  // calling onNavigate - which IS navigate(). Moving again would skip a row.
+  if (!moved && !navHandled) navigate(row, dir);
+  navHandled = false;
+  return true;
+}
+
+function fieldCommand(field, name, row) {
+  if (!field) return false;
+  if (KB_NAV.indexOf(name) >= 0) return fieldNavigate(row, name);
+  if (typeof field.command === 'function') {
+    try { field.command(name); return true; } catch (err) { console.error('[numpla] field.command threw', err); return false; }
+  }
+  const fn = KB_FALLBACK[name];
+  if (!fn || !field.model) return false;
+  return applyFallback(field, fn(field.model));
+}
+
+// --- pressing a key --------------------------------------------------------
+
+function pressKey(key) {
+  if (!key) return false;
+
+  if (key.act === 'page') { setKeyboardPage(key.page); return true; }
+  if (key.act === 'hide') { closeKeyboard(); return true; }
+
+  const row = targetRow();
+  if (!row) return false;
+
+  // The panel never takes the caret (every key preventDefaults its
+  // pointerdown), but a row can lose it some other way - a demo load, say.
+  try {
+    if (row.field && !row.field.focused && typeof row.field.focus === 'function') {
+      row.field.focus();
+    }
+  } catch (err) { /* focus is best effort */ }
+
+  let handled = false;
+  if (key.act === 'newrow') {
+    insertAfter(row);
+    handled = true;
+  } else if (key.cmd) {
+    handled = fieldCommand(row.field, key.cmd, row);
+  } else if (key.ins != null) {
+    handled = fieldInsert(row.field, key.ins);
+    // A function name wants its argument next, and an argument is digits.
+    if (key.act === 'fn') setKeyboardPage('123');
+  }
+
+  keepRowVisible(targetRow());
+  return handled;
+}
+
+function stopRepeat() {
+  if (kbRepeatTimer) clearTimeout(kbRepeatTimer);
+  kbRepeatTimer = 0;
+  kbRepeatKey = null;
+}
+
+/**
+ * Hold-to-repeat, for backspace and the arrows. A pause first, so a deliberate
+ * single tap can never turn into two.
+ */
+function beginRepeat(key) {
+  stopRepeat();
+  if (!key.rep) return;
+  kbRepeatKey = key;
+  const tick = () => {
+    if (!kbRepeatKey) return;
+    pressKey(kbRepeatKey);
+    kbRepeatTimer = setTimeout(tick, KB_REPEAT_MS);
+  };
+  kbRepeatTimer = setTimeout(tick, KB_REPEAT_DELAY);
+}
+
+/**
+ * A key is driven by `pointerdown`, not `click`: it has to fire under the
+ * finger, it must not move focus out of the row, and a held key repeats.
+ * `click` is still wired, for the Tab-and-Enter path, guarded so a real tap -
+ * which produces both events - only ever counts once.
+ */
+/**
+ * Every key that has been bound to a button, by id. The inspection hook presses
+ * keys through this, so the suite drives the same objects the fingers do rather
+ * than a parallel table that could disagree with the panel on screen.
+ */
+const kbRegistry = new Map();
+
+for (const grid of [KB_MAIN, KB_ALPHA, KB_FUNCS]) {
+  for (const rowKeys of grid) for (const key of rowKeys) kbRegistry.set(key.id, key);
+}
+
+/** One key by id, or null. */
+function keyById(id) {
+  return kbRegistry.get(String(id)) || null;
+}
+
+function bindKey(btn, key) {
+  kbRegistry.set(key.id, key);
+  // Per BUTTON, not per panel: a tap on one key must not swallow a click on
+  // another one a moment later.
+  let downAt = -1e9;
+  btn.addEventListener('pointerdown', (e) => {
+    if (e && typeof e.preventDefault === 'function') e.preventDefault();
+    downAt = performance.now();
+    btn.classList.add('is-down');
+    pressKey(key);
+    beginRepeat(key);
+  });
+  const release = () => { btn.classList.remove('is-down'); stopRepeat(); };
+  btn.addEventListener('pointerup', release);
+  btn.addEventListener('pointercancel', release);
+  btn.addEventListener('pointerleave', release);
+  btn.addEventListener('click', (e) => {
+    if (e && typeof e.preventDefault === 'function') e.preventDefault();
+    if (performance.now() - downAt < 700) return;   // this key's tap already ran
+    pressKey(key);
+  });
+  // mousedown too: a preventDefault on pointerdown does not stop the mouse
+  // compatibility event, and that one is what would blur the row.
+  btn.addEventListener('mousedown', (e) => {
+    if (e && typeof e.preventDefault === 'function') e.preventDefault();
+  });
+}
+
+// --- opening, closing, and keeping the row in sight ------------------------
+
+function keyboardHeight() {
+  if (!kbOpen) return 0;
+  const h = el.kb ? el.kb.offsetHeight : 0;
+  return h > 0 ? h : KB_HEIGHT;
+}
+
+/**
+ * THE PANEL MUST NOT COVER THE ROW BEING EDITED.
+ *
+ * The row list is its own scroller and the panel is fixed to the bottom of the
+ * viewport, so this is one subtraction: the visible bottom of the list is the
+ * lower of the list's own bottom and the top of the panel, and the focused row
+ * has to sit above it. Nothing is resized and nothing is reflowed - only
+ * `scrollTop` moves, which is what a scroller is for. The list carries an
+ * extra `--kb-pad` of bottom padding while the panel is up, so the LAST row can
+ * still reach the top of it.
+ */
+function keepRowVisible(row) {
+  if (!kbOpen || !row || !row.el) return null;
+  const scroller = el.rows;
+  if (!scroller || typeof scroller.getBoundingClientRect !== 'function') return null;
+  let r, sr;
+  try {
+    r = row.el.getBoundingClientRect();
+    sr = scroller.getBoundingClientRect();
+  } catch (err) {
+    return null;
+  }
+  const kbTop = viewportHeight() - keyboardHeight();
+  const bottom = Math.min(sr.bottom, kbTop) - 10;
+  const top = sr.top + 6;
+  let dy = 0;
+  if (r.bottom > bottom) dy = r.bottom - bottom;
+  else if (r.top < top) dy = r.top - top;
+  if (dy) scroller.scrollTop = Math.max(0, (scroller.scrollTop || 0) + dy);
+  kbLastKeep = { dy, top, bottom, kbTop, scrollTop: scroller.scrollTop || 0 };
+  return kbLastKeep;
+}
+
+function openKeyboard() {
+  if (!el.kb) return;
+  if (kbOpen) { keepRowVisible(targetRow()); return; }
+  kbOpen = true;
+  el.kb.hidden = false;
+  document.body.classList.add('kb-open');
+  if (el.kbOpen) el.kbOpen.setAttribute('aria-expanded', 'true');
+  renderKeyboardVars();
+  renderKeyboardGrid();
+  syncKeyboardAffordances();
+  keepRowVisible(targetRow());
+}
+
+function closeKeyboard() {
+  stopRepeat();
+  if (!el.kb || !kbOpen) { syncKeyboardAffordances(); return; }
+  kbOpen = false;
+  el.kb.hidden = true;
+  document.body.classList.remove('kb-open');
+  if (el.kbOpen) el.kbOpen.setAttribute('aria-expanded', 'false');
+  syncKeyboardAffordances();
+}
+
+function toggleKeyboard() {
+  if (kbOpen) { closeKeyboard(); return; }
+  // Asking for it by hand is a decision: honour it even on a mouse, and stop
+  // second-guessing the pointer afterwards.
+  touchLocked = true;
+  if (!touchMode) setTouchMode(true, 'the keys button was pressed');
+  const row = targetRow();
+  if (row && row.field && typeof row.field.focus === 'function') {
+    try { row.field.focus(); } catch (err) { /* best effort */ }
+  }
+  openKeyboard();
+}
+
+/** The `keys` button exists only where the panel could be wanted. */
+function syncKeyboardAffordances() {
+  if (el.kbOpen) el.kbOpen.hidden = !(touchMode || narrow) || kbOpen;
+}
+
+/**
+ * A row lost the caret. If it went somewhere that is not another row and not
+ * the panel itself - the demos button, the reference, the plot - then nothing
+ * is being edited any more and the panel has no business covering the screen.
+ * Deferred by a tick, because "lost it" and "the next one gained it" are two
+ * events and only the second one is the truth.
+ */
+function onRowBlurred() {
+  if (!kbOpen) return;
+  setTimeout(() => {
+    if (!kbOpen) return;
+    const a = document.activeElement;
+    if (a && typeof a.closest === 'function' && a.closest('.mathkb')) return;
+    if (rows.some((r) => r.field && r.field.focused)) return;
+    closeKeyboard();
+  }, 0);
+}
+
+/** A row took the caret. */
+function onRowFocused(row) {
+  if (narrow && pane !== 'system') setPane('system', false);
+  if (touchMode) openKeyboard();
+  else keepRowVisible(row);
+}
+
+function wireKeyboard() {
+  if (!el.kb) return;
+  for (const btn of el.kbPages) {
+    if (!btn) continue;
+    bindKey(btn, K('page-' + btn.dataset.page, btn.textContent, {
+      act: 'page', page: btn.dataset.page,
+    }));
+  }
+  if (el.kbHide) bindKey(el.kbHide, K('hide', '', { act: 'hide' }));
+  if (el.kbOpen) {
+    el.kbOpen.addEventListener('click', (e) => { e.preventDefault(); toggleKeyboard(); });
+  }
+
+  // The panel's own background is not a place to lose the caret either.
+  el.kb.addEventListener('mousedown', (e) => {
+    if (e.target === el.kb && typeof e.preventDefault === 'function') e.preventDefault();
+  });
+
+  renderKeyboardVars();
+  renderKeyboardGrid();
+}
+
+function wireNarrow() {
+  for (const btn of [el.tabPlot, el.tabSystem]) {
+    if (!btn) continue;
+    btn.addEventListener('click', (e) => {
+      e.preventDefault();
+      setPane(btn.dataset.pane, true);
+      if (btn.dataset.pane === 'system' && touchMode && lastActiveRow) openKeyboard();
+    });
+  }
+  if (typeof window.matchMedia === 'function') {
+    try {
+      const mq = window.matchMedia('(max-width: ' + NARROW_MAX + 'px)');
+      if (mq && typeof mq.addEventListener === 'function') mq.addEventListener('change', applyLayout);
+    } catch (err) { /* an engine without it falls back on the resize handler */ }
+  }
+  applyLayout();
+}
+
+// ---------------------------------------------------------------------------
 // Wiring
 // ---------------------------------------------------------------------------
 
@@ -3592,6 +4566,9 @@ function wire() {
   wireDivider();
   wireCanvasGestures();
   wireInfo();
+  wireNarrow();               // the breakpoint and the pane switch
+  wireTouchDetection();       // is this a finger? - and only then
+  wireKeyboard();             // the panel that replaces the OS keyboard
 
   el.frameReset.addEventListener('click', resetFrames);
   el.frameFit.addEventListener('click', fitFrames);
@@ -3734,6 +4711,8 @@ function wire() {
     closeViews();
     if (!el.info.hidden) positionInfo();
     setDocWidth(docWidth, false);   // re-clamp; the user's choice is kept
+    applyLayout();                  // side by side, or one pane at a time
+    keepRowVisible(lastActiveRow);  // the keyboard may now cover a different row
     scheduleDraw();
     scheduleField();
   });

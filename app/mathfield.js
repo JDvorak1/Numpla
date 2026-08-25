@@ -1104,6 +1104,21 @@ export function normaliseNames(names) {
   };
 }
 
+/**
+ * The variable names a document has in play, deduped and in a useful order:
+ * states first - they are what the rows are about - then parameters. Functions
+ * are deliberately absent; a keyboard offers those as calls, not as letters.
+ * Takes the same `{ functions, params, states }` a field is given.
+ */
+export function variableNamesIn(names) {
+  const n = normaliseNames(names);
+  const out = [];
+  for (const name of n.states.concat(n.params)) {
+    if (!out.includes(name)) out.push(name);
+  }
+  return out;
+}
+
 /** The run of plain letters ending at the caret - the prefix Tab completes. */
 function prefixAt(st) {
   const L = curList(st);
@@ -1353,6 +1368,12 @@ export class MathModel {
     return given ? this.setFunctions(given) : false;
   }
 
+  /**
+   * The variable names the document has in play - states then parameters,
+   * deduped. What a keyboard offers as variable keys. See variableNamesIn().
+   */
+  variableNames() { return variableNamesIn(this.st.names); }
+
   /** Everything Tab could do at the caret, without doing any of it. */
   completions() { return completionsFor(this.st); }
 
@@ -1553,6 +1574,62 @@ function renderAtom(list, at, path, ctx) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// The command table - the one path
+//
+// A tap on the on-screen keyboard and a keystroke on a desktop keyboard have to
+// do exactly the same thing, so there is exactly one implementation of each.
+// `field.command(name)` is it; `_keydown()` does nothing but translate a key
+// event into a command name (or a character for `field.insert()`) and hand it
+// over. Nothing below the translation layer knows whether a finger or a key
+// started it, which is why the two cannot drift.
+// ---------------------------------------------------------------------------
+
+/**
+ * Editing commands, by stable name. Each takes the field and returns true when
+ * it changed the row. The structural ones are literally the character the
+ * desktop keyboard sends, run through the same typeChar(), so `command('frac')`
+ * grabs the preceding operand exactly as typing `/` does and `insert('sqrt')`
+ * inflates a radical exactly as typing s-q-r-t does.
+ */
+const FIELD_COMMANDS = {
+  // structure - the reason the keyboard exists
+  frac: (f) => f._edit((st) => typeChar(st, '/')),
+  sup: (f) => f._edit((st) => typeChar(st, '^')),
+  sub: (f) => f._edit((st) => typeChar(st, '_')),
+  prime: (f) => f._edit((st) => typeChar(st, "'")),
+  sqrt: (f) => f.insert('sqrt'),
+  // deletion
+  backspace: (f) => f._edit(backspace),
+  delete: (f) => f._edit(deleteForward),
+  // navigation - never a change, but it still repaints and it still reports an
+  // escape past the row's edge to the shell, so the row above takes the caret
+  left: (f) => f._edit((st) => { f._nav(moveLeft(st), 'left'); }),
+  right: (f) => f._edit((st) => { f._nav(moveRight(st), 'right'); }),
+  up: (f) => f._edit((st) => { f._nav(moveVert(st, -1), 'up'); }),
+  down: (f) => f._edit((st) => { f._nav(moveVert(st, 1), 'down'); }),
+  home: (f) => f._edit(moveHome),
+  end: (f) => f._edit(moveEnd),
+  // the rest of what the desktop keyboard can do, for a panel that wants it
+  enter: (f) => { if (f.opts.onEnter) f.opts.onEnter(f); return false; },
+  tab: (f) => f._tab(),
+};
+
+/** Every name `field.command()` answers to. Anything else is ignored. */
+export const COMMAND_NAMES = Object.keys(FIELD_COMMANDS);
+
+/** Key event names that are simply commands under another name. */
+const KEY_COMMAND = {
+  ArrowLeft: 'left',
+  ArrowRight: 'right',
+  ArrowUp: 'up',
+  ArrowDown: 'down',
+  Home: 'home',
+  End: 'end',
+  Backspace: 'backspace',
+  Delete: 'delete',
+};
+
 /**
  * An editable math field.
  *
@@ -1561,6 +1638,8 @@ function renderAtom(list, at, path, ctx) {
  *                        `d(x, y)` reads as a call - see setFunctions()
  * @param opts.documentNames  { functions, params, states } for Tab completion
  *                        - see setDocumentNames()
+ * @param opts.touchDriven  true when an on-screen keyboard drives this field
+ *                        and the OS keyboard must stay down - see touchDriven
  * @param opts  { value?: string, onChange?: (field) => void,
  *                onFocus?: (field) => void, onBlur?: (field) => void,
  *                onEnter?: (field) => void, onNavigate?: (field, dir) => void }
@@ -1576,8 +1655,16 @@ export class MathField {
     this.diagnostic = null;
     this.diagnosticMessage = '';
     this._positions = [];
+    this._touchDriven = false;
+    this._touch = null;      // the start of a touch, while one is in progress
+    this._touchAt = 0;       // when the last tap was handled - see _pointerdown
 
     host.innerHTML = '';
+    // The focusable element is a plain <div tabindex="0">. Not an <input>, not
+    // a contenteditable, and there is no hidden input shadowing it: those are
+    // the three things a mobile browser raises its keyboard for, so a field
+    // built this way has nothing to suppress in the first place. `touchDriven`
+    // then closes the remaining gap - see _applyTouchMode().
     const root = el('div', 'mf');
     root.tabIndex = 0;
     root.setAttribute('role', 'textbox');
@@ -1591,16 +1678,24 @@ export class MathField {
 
     this._onKeyDown = (e) => this._keydown(e);
     this._onPointerDown = (e) => this._pointerdown(e);
+    this._onTouchStart = (e) => this._touchstart(e);
+    this._onTouchEnd = (e) => this._touchend(e);
     this._onFocus = () => { this.focused = true; root.classList.add('is-focused'); this.render(); if (opts.onFocus) opts.onFocus(this); };
     this._onBlur = () => { this.focused = false; this._closeMenu(); root.classList.remove('is-focused'); this.render(); if (opts.onBlur) opts.onBlur(this); };
     this._onPaste = (e) => this._paste(e);
 
     root.addEventListener('keydown', this._onKeyDown);
     root.addEventListener('mousedown', this._onPointerDown);
+    // A tap has to place the caret too, and a phone with no mouse never sends
+    // `mousedown` until the tap is over (if at all). `touchstart` is passive so
+    // a finger can still scroll the pane through a row.
+    root.addEventListener('touchstart', this._onTouchStart, { passive: true });
+    root.addEventListener('touchend', this._onTouchEnd);
     root.addEventListener('focus', this._onFocus);
     root.addEventListener('blur', this._onBlur);
     root.addEventListener('paste', this._onPaste);
 
+    this.touchDriven = opts.touchDriven;
     this.render();
   }
 
@@ -1647,6 +1742,102 @@ export class MathField {
   /** Everything Tab could do at the caret, without doing any of it. */
   completions() { return this.model.completions(); }
 
+  /**
+   * The variable names the document has in play - states then parameters,
+   * deduped, in document order - so an on-screen keyboard can offer the
+   * document's own names as keys instead of keeping its own copy of them.
+   * They arrive through setDocumentNames(); this is the way back out.
+   */
+  variableNames() { return this.model.variableNames(); }
+
+  // --- the command API ----------------------------------------------------
+  // The on-screen keyboard drives the field through these two calls and
+  // nothing else: no synthetic key events, no hidden input. _keydown() is a
+  // translator that ends up here too, so a tap and a keystroke are the same
+  // operation and cannot drift apart.
+
+  /**
+   * Type text as if it were typed on a keyboard: 'x', '2', '+', 'sin', or a
+   * whole expression. Structure inflates exactly as it does under the fingers,
+   * so insert('sqrt') leaves a real radical with the caret inside its radicand
+   * and insert('sin') leaves an open call with the caret in the argument.
+   * Fires onChange when the row changed, exactly as typing does.
+   *
+   * @returns true when the row changed.
+   */
+  insert(text) {
+    if (text == null) return false;
+    return this._edit((st) => typeString(st, text));
+  }
+
+  /**
+   * One editing command, by name. Names are stable and listed in
+   * COMMAND_NAMES:
+   *
+   *   'frac' | 'sup' | 'sub' | 'sqrt' | 'prime'
+   *   'backspace' | 'delete'
+   *   'left' | 'right' | 'up' | 'down' | 'home' | 'end'
+   *   'enter' | 'tab'
+   *
+   * An unknown name is ignored and returns false - never throws. A keyboard is
+   * data, and a typo in a key definition must not take the app down with it.
+   *
+   * @returns true when the field acted on it (for the editing commands, when
+   *   the row changed; navigation returns false because nothing changed).
+   */
+  command(name) {
+    const run = Object.prototype.hasOwnProperty.call(FIELD_COMMANDS, name)
+      ? FIELD_COMMANDS[name]
+      : null;
+    if (!run) return false;
+    return run(this) === true;
+  }
+
+  /**
+   * True when an on-screen keyboard drives this field and the OS keyboard must
+   * stay down. The field still takes focus, still paints its caret and still
+   * places it on a tap - only the phone's own keyboard is kept away, so it
+   * cannot cover the panel that is doing the typing. See _applyTouchMode() for
+   * what it actually changes in the DOM.
+   */
+  get touchDriven() { return this._touchDriven; }
+
+  set touchDriven(on) {
+    this._touchDriven = !!on;
+    this._applyTouchMode();
+  }
+
+  /**
+   * What `touchDriven` costs the DOM, and why each piece is there:
+   *
+   *   inputmode="none"     the documented way to tell a browser that an
+   *                        element takes input from somewhere other than the
+   *                        virtual keyboard. Browsers that would raise one for
+   *                        role="textbox" honour this.
+   *   aria-readonly="true" the field is genuinely not editable by the OS
+   *                        keyboard, and assistive technology that would
+   *                        summon one for an editable textbox reads this.
+   *   .mf--touch           CSS: no long-press selection callout, no magnifier,
+   *                        no double-tap zoom on a caret placement.
+   *
+   * The element stays tabbable and stays role="textbox", so it still focuses,
+   * still shows a caret and still answers a hardware keyboard - a tablet with
+   * one keeps working.
+   */
+  _applyTouchMode() {
+    const root = this.el;
+    if (!root) return;
+    const on = this._touchDriven;
+    root.classList.toggle('mf--touch', on);
+    if (on) {
+      root.setAttribute('inputmode', 'none');
+      root.setAttribute('aria-readonly', 'true');
+    } else {
+      root.removeAttribute('inputmode');
+      root.removeAttribute('aria-readonly');
+    }
+  }
+
   /** True while the completion menu is open. */
   get menuOpen() { return this._menu != null; }
 
@@ -1670,6 +1861,8 @@ export class MathField {
     this._closeMenu();
     this.el.removeEventListener('keydown', this._onKeyDown);
     this.el.removeEventListener('mousedown', this._onPointerDown);
+    this.el.removeEventListener('touchstart', this._onTouchStart);
+    this.el.removeEventListener('touchend', this._onTouchEnd);
     this.el.removeEventListener('focus', this._onFocus);
     this.el.removeEventListener('blur', this._onBlur);
     this.el.removeEventListener('paste', this._onPaste);
@@ -1707,8 +1900,32 @@ export class MathField {
     if (changed) this._changed();
   }
 
+  /**
+   * The bottom of every editing path, whatever started it. Runs one operation
+   * against the model, repaints, and fires onChange if the row changed. The
+   * completion menu is a desktop affordance layered on top of the keys, so any
+   * edit dismisses it - which is what the key handler already did for every
+   * key the menu did not claim.
+   */
+  _edit(op) {
+    this._closeMenu();
+    const changed = op(this.model.st) === true;
+    this._apply(changed);
+    return changed;
+  }
+
+  /** A move that hit the edge of the row belongs to the shell above us. */
+  _nav(moved, dir) {
+    if (!moved && this.opts.onNavigate) this.opts.onNavigate(this, dir);
+  }
+
   // --- input --------------------------------------------------------------
 
+  /**
+   * A key event is translated into a command name or a character and handed to
+   * the public API. This method decides *what* a key means; it never decides
+   * what a command does. That is the whole of the one-path guarantee.
+   */
   _keydown(e) {
     if (e.ctrlKey || e.metaKey || e.altKey) return;
 
@@ -1725,40 +1942,22 @@ export class MathField {
       }
     }
 
-    const st = this.model.st;
-    const nav = (dir) => {
-      if (!moveVert(st, dir) && this.opts.onNavigate) this.opts.onNavigate(this, dir < 0 ? 'up' : 'down');
-      this.render();
-    };
+    const named = KEY_COMMAND[e.key];
+    if (named) { this.command(named); e.preventDefault(); return; }
 
     switch (e.key) {
-      case 'ArrowLeft':
-        if (!moveLeft(st) && this.opts.onNavigate) this.opts.onNavigate(this, 'left');
-        this.render(); e.preventDefault(); return;
-      case 'ArrowRight':
-        if (!moveRight(st) && this.opts.onNavigate) this.opts.onNavigate(this, 'right');
-        this.render(); e.preventDefault(); return;
-      case 'ArrowUp': nav(-1); e.preventDefault(); return;
-      case 'ArrowDown': nav(1); e.preventDefault(); return;
-      case 'Home': moveHome(st); this.render(); e.preventDefault(); return;
-      case 'End': moveEnd(st); this.render(); e.preventDefault(); return;
-      case 'Backspace': this._apply(backspace(st)); e.preventDefault(); return;
-      case 'Delete': this._apply(deleteForward(st)); e.preventDefault(); return;
-      case 'Enter':
-        if (this.opts.onEnter) this.opts.onEnter(this);
-        e.preventDefault(); return;
+      case 'Enter': this.command('enter'); e.preventDefault(); return;
       case 'Escape': this.blur(); e.preventDefault(); return;
       case 'Tab':
         // Shift+Tab never completes, and a Tab that completes nothing is not
         // ours: both fall through to whatever moves focus between rows.
-        if (!e.shiftKey) this._tab(e);
+        if (!e.shiftKey && this.command('tab')) e.preventDefault();
         return;
       default: break;
     }
 
     if (e.key.length === 1) {
-      const changed = typeChar(st, e.key);
-      this._apply(changed);
+      this.insert(e.key);
       e.preventDefault();
     }
   }
@@ -1777,8 +1976,20 @@ export class MathField {
   }
 
   _pointerdown(e) {
+    // A tap already placed the caret; the compatibility mouse events a browser
+    // sends afterwards would place it a second time, from stale coordinates.
+    if (this._touchAt && Date.now() - this._touchAt < 700) {
+      if (e.preventDefault) e.preventDefault();
+      return;
+    }
+    this._place(e.clientX, e.clientY);
+    if (e.preventDefault) e.preventDefault();
+  }
+
+  /** Put the caret at the position nearest to a point, and take focus. */
+  _place(x, y) {
     this._closeMenu();
-    const hit = this._nearest(e.clientX, e.clientY);
+    const hit = this._nearest(x, y);
     if (hit) {
       this.model.st.path = hit._mfPath;
       this.model.st.index = hit._mfIndex;
@@ -1786,17 +1997,39 @@ export class MathField {
     // Focus first (so the caret is visible), then paint the new position.
     if (!this.focused) this.el.focus();
     this.render();
-    e.preventDefault();
+  }
+
+  _touchstart(e) {
+    const t = e.touches && e.touches[0];
+    this._touch = t ? { x: t.clientX, y: t.clientY, at: Date.now() } : null;
   }
 
   /**
-   * Tab. Returns true when the field consumed the key; when it returns false
-   * the event is left alone, so the browser moves focus out of the field.
+   * Caret placement happens on `touchend`, not `touchstart`: a finger that
+   * came down on a row may be starting a scroll of the pane, and only the end
+   * of the gesture says which it was. A short, still touch is a tap.
    */
-  _tab(e) {
+  _touchend(e) {
+    const start = this._touch;
+    this._touch = null;
+    const t = e.changedTouches && e.changedTouches[0];
+    if (!start || !t) return;
+    if (Math.abs(t.clientX - start.x) > 10 || Math.abs(t.clientY - start.y) > 10) return;
+    if (Date.now() - start.at > 700) return;
+    this._touchAt = Date.now();
+    this._place(t.clientX, t.clientY);
+    // Preventing the tap's default is what stops the browser synthesising a
+    // mouse click - and, on a phone, what stops a double tap zooming.
+    if (e.cancelable !== false && e.preventDefault) e.preventDefault();
+  }
+
+  /**
+   * Tab. Returns true when the field consumed it; when it returns false the
+   * key event is left alone, so the browser moves focus out of the field.
+   */
+  _tab() {
     const r = tabComplete(this.model.st);
     if (r.action === 'none') { this._closeMenu(); return false; }
-    e.preventDefault();
     if (r.action === 'menu') {
       this._openMenu(r.candidates);
       return true;

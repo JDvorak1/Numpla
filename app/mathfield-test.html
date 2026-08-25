@@ -64,6 +64,21 @@
   .hint { color: var(--muted); font-size: 13px; margin: 10px 0 20px; }
   .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px 22px; }
   @media (max-width: 760px) { .grid { grid-template-columns: 1fr; } }
+  .keys {
+    display: flex; flex-wrap: wrap; gap: 6px; margin: 10px 0 8px;
+  }
+  .keys button {
+    min-width: 44px; min-height: 44px; padding: 0 10px;
+    background: #fff; border: 1px solid var(--line); border-bottom-width: 2px;
+    border-radius: 7px; cursor: pointer; color: var(--ink);
+    font: 15px/1 "Cambria Math", Cambria, "Times New Roman", serif;
+  }
+  .keys button:active { background: #eef3fc; border-color: var(--accent); }
+  .keys button.cmd { font-size: 12.5px; font-family: inherit; color: var(--accent); }
+  .toggle {
+    display: inline-flex; align-items: center; gap: 7px;
+    font-size: 13px; color: var(--muted);
+  }
   #summary {
     margin-top: 10px; padding: 10px 12px; border: 1px solid var(--line);
     border-radius: 6px; background: #fff;
@@ -110,6 +125,23 @@
 
   <h2>Diagnostics</h2>
   <div class="grid" id="diags"></div>
+
+  <h2>Command API &mdash; the on-screen keyboard's path</h2>
+  <p class="hint">
+    Every key below calls <code>field.insert(text)</code> or
+    <code>field.command(name)</code> &mdash; the same two calls the phone
+    keyboard makes. No synthetic key events. Type with the real keyboard and tap
+    the keys in any order: they are the same path, so the row cannot tell them
+    apart. <b>touch mode</b> is <code>field.touchDriven</code>: on a phone it
+    keeps the OS keyboard down while the field still focuses, still shows its
+    caret and still places it on a tap.
+  </p>
+  <div id="api"></div>
+  <div class="keys" id="keys"></div>
+  <label class="toggle">
+    <input type="checkbox" id="touch"> touch mode (<code>touchDriven</code>)
+    &mdash; <span id="touchattrs">no attributes</span>
+  </label>
 
   <h2>Empty - type here</h2>
   <div class="grid" id="blank"></div>
@@ -254,6 +286,51 @@ mount('diags', 'pending (half typed, muted, never red)', 'b = 1 + ')
   .setDiagnostic('pending', 'incomplete expression');
 mount('diags', 'error (still gray, not red)', 'c = )(')
   .setDiagnostic('error', 'unexpected )');
+
+// --- the command API --------------------------------------------------------
+// A keyboard, built the way the phone panel will build one: nothing but
+// insert() and command(), and the document's own names asked for rather than
+// hard-coded.
+const apiField = mount('api', 'driven by taps and by the keyboard, one path', '',
+  { documentNames: { functions: ['d'], params: ['k_1'], states: ['theta'] } });
+
+const KEYS = [
+  ['7'], ['8'], ['9'], ['+'], ['-'], ['*'], ['='], ['('], [')'], [','],
+  ['x'], ['y'], ['t'], ['pi', 'π'], ['sin'], ['cos'], ['ln'], ['exp'],
+];
+const CMDS = [
+  ['frac', 'a/b'], ['sup', 'x^n'], ['sub', 'x_n'], ['sqrt', '√'],
+  ['prime', "x'"], ['left', '←'], ['right', '→'], ['up', '↑'], ['down', '↓'],
+  ['home', '⇤'], ['end', '⇥'], ['backspace', '⌫'], ['delete', 'del'],
+  ['tab', 'tab'], ['enter', '↵'], ['nonsense', 'unknown (ignored)'],
+];
+const keyBar = document.getElementById('keys');
+const addKey = (label, run, cls) => {
+  const b = document.createElement('button');
+  b.type = 'button';
+  b.textContent = label;
+  if (cls) b.className = cls;
+  // mousedown, not click: the field must not lose focus to the key.
+  b.addEventListener('mousedown', (e) => { e.preventDefault(); run(); apiField.refresh(); });
+  keyBar.appendChild(b);
+};
+for (const [text, label] of KEYS) addKey(label || text, () => apiField.insert(text));
+for (const [name, label] of CMDS) addKey(label, () => apiField.command(name), 'cmd');
+// The document's own names, asked of the field rather than duplicated here.
+for (const name of apiField.variableNames()) addKey(name, () => apiField.insert(name));
+
+const touchBox = document.getElementById('touch');
+const touchAttrs = document.getElementById('touchattrs');
+touchBox.addEventListener('change', () => {
+  apiField.touchDriven = touchBox.checked;
+  const el = apiField.el;
+  touchAttrs.textContent = touchBox.checked
+    ? 'inputmode="' + el.getAttribute('inputmode') + '" aria-readonly="' +
+      el.getAttribute('aria-readonly') + '" class contains mf--touch: ' +
+      el.classList.contains('mf--touch')
+    : 'no attributes';
+  apiField.focus();
+});
 
 // --- blank ------------------------------------------------------------------
 mount('blank', 'empty field', '');

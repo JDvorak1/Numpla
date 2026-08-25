@@ -63,6 +63,24 @@
 .mf.is-error .mf-body { color: #6f757e; }
 .mf.is-pending { border-style: dashed; }
 
+/* Driven by the on-screen keyboard rather than the OS one (see the
+   `touchDriven` property). The JS side sets `inputmode="none"` and
+   `aria-readonly`; what is left is the browser's own touch furniture, all of
+   which fights a caret placed by tapping:
+
+     -webkit-touch-callout  the long-press "Copy / Look Up" bubble
+     touch-action           the 300ms wait for a second tap, and the zoom
+     tap-highlight          the gray flash over the whole row on every tap
+
+   `user-select: none` is already on `.mf` above, which is what keeps the
+   selection magnifier away. Nothing here is a caret or focus change: a touch
+   field still focuses and still paints its caret. */
+.mf--touch {
+  -webkit-touch-callout: none;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
+
 .mf-body {
   display: inline-block;
   min-height: 1.2em;
