@@ -13,27 +13,42 @@
 //
 // A parameter's slider lives ON the row that defines it, and only once it has
 // been asked for: every scalar row offers "add slider" in the line it already
-// reserves for its diagnostic. `t` is the exception - it has no defining row -
-// and lives in the transport bar with play/pause and the readout.
+// reserves for its diagnostic.
 //
-// Three structural rules this file exists to enforce:
+// `t` IS ONE OF THOSE ROWS. It used to be a special widget in a bar of its own,
+// which is exactly why it felt like a dial attached to nothing. It is a
+// variable in the system now: the row `t = [0, 20]` says what the span is - a
+// list literal, which today's parser already reads, and which the solver's own
+// binding of `t` overrides while it integrates, so the row cannot change what
+// the equations mean - and the slider promoted on that row is the playhead
+// inside it. Same offer, same knob, same gear, same x as every other variable.
+//
+// Five structural rules this file exists to enforce:
 //
 //   1. GRAY-NOT-RED. `severity: "pending"` is muted. Only `"error"` is red,
 //      and only an `"error"` pauses the solve - the last good curve stays on
 //      screen while the document is mid-edit.
-//   2. ONE PLOT. A single canvas with view chips on it. A chip is enabled only
-//      when the model can actually support that view; disabled chips stay
-//      visible, because they are how the capability is discovered.
-//   3. NOTHING MOVES WHILE YOU TYPE. Panes have explicit sizes and scroll
-//      internally; diagnostics occupy reserved space; the slider settings are
-//      an overlay. The only thing that may change size is the field under the
-//      caret.
+//   2. ONE PLOT. A single canvas. Each view is an independent switch, and the
+//      canvas is tiled between the ones that are on. A chip the model cannot
+//      support stays visible but inert, because that is how the capability is
+//      discovered - and nothing is ever switched off on the user's behalf.
+//   3. THE FRAME IS THE USER'S. -5..5 on both axes to begin with, then theirs:
+//      drag an axis to scale it, drag the body to pan, wheel to zoom. A
+//      re-solve redraws inside the frame they left.
+//   4. `t` MOVES THE PICTURE. A marker rides the curve and the trajectory is
+//      drawn travelled-vs-ahead, so scrubbing reads as motion. Nothing else
+//      would have justified a control for it.
+//   5. NOTHING MOVES WHILE YOU TYPE. Panes have explicit sizes and scroll
+//      internally; diagnostics occupy reserved space; the slider settings, the
+//      demo gallery and the reference are overlays. The only thing that may
+//      change size is the field under the caret.
 //
 // No bundler, no dependencies, no network. Plain ES modules.
 // ============================================================================
 
-import { Plot, seriesColor, fmtValue } from './plot.js';
+import { Plot, VIEWS, panned, scaled, zoomed, seriesColor, fmtValue } from './plot.js';
 import { DEMOS } from './demos.js';
+import { SoundPlayer, DEFAULTS as AUDIO_DEFAULTS } from './audio.js';
 
 // ---------------------------------------------------------------------------
 // DOM
@@ -54,13 +69,20 @@ const el = {
 
   divider: $('divider'),
 
-  views:  $('views'),
-  legend: $('legend'),
-  canvas: $('canvas'),
+  views:      $('views'),
+  canvas:     $('canvas'),
+  frameFit:   $('frame-fit'),
+  frameReset: $('frame-reset'),
 
-  play:      $('play'),
-  readout:   $('readout'),
-  transport: $('transport'),
+  play:    $('play'),
+  readout: $('readout'),
+
+  infoBtn:    $('info-btn'),
+  info:       $('infopanel'),
+  infoSearch: $('info-search'),
+  infoList:   $('info-list'),
+  infoFoot:   $('info-foot'),
+  infoClose:  $('info-close'),
 
   settings:     $('slider-settings'),
   settingsName: $('settings-name'),
@@ -74,6 +96,16 @@ const el = {
   statRhs:      $('stat-rhs'),
   statSolve:    $('stat-solve'),
 
+  hearBtn:   $('hear-btn'),
+  hearPanel: $('hearpanel'),
+  hearClose: $('hear-close'),
+  hearState: $('hear-state'),
+  hearFrom:  $('hear-from'),
+  hearTo:    $('hear-to'),
+  hearComp:  $('hear-compression'),
+  hearNote:  $('hear-note'),
+  hearPlay:  $('hear-play'),
+
   demosBtn: $('demos-btn'),
   demomenu: $('demomenu'),
 };
@@ -81,6 +113,7 @@ const el = {
 const plot = new Plot(el.canvas);
 
 const DEFAULT_DOC = [
+  't = [0, 20]',
   'k = 0.4',
   "x' = -y - k*x",
   "y' = x",
@@ -398,7 +431,11 @@ function focusTail() {
   placeCaret(rows[rows.length - 1], true);
 }
 
+/** The row the reference inserts into: the last one that had the caret. */
+let lastActiveRow = null;
+
 function setActiveRow(row) {
+  if (row) lastActiveRow = row;
   rows.forEach((r) => r.el.classList.toggle('is-active', r === row));
 }
 
@@ -432,6 +469,29 @@ function navigate(row, dir) {
 // ---------------------------------------------------------------------------
 
 let docFunctions = [];
+
+/**
+ * What the document itself calls things, for Tab completion. `functions` is
+ * NOT included: refreshFunctions() owns that fact and forwarding it from two
+ * places would let the two drift apart.
+ */
+function docNames() {
+  return { functions: docFunctions, params: state.params || [], states: state.names || [] };
+}
+
+/** Push the document's vocabulary to every row. Completion only; never re-reads. */
+function refreshDocumentNames() {
+  const names = docNames();
+  for (const row of rows) {
+    try {
+      if (row.field && typeof row.field.setDocumentNames === 'function') {
+        row.field.setDocumentNames({ params: names.params, states: names.states });
+      }
+    } catch (err) {
+      console.error('[numpla] MathField.setDocumentNames threw', err);
+    }
+  }
+}
 
 const sameNames = (a, b) => a.length === b.length && a.every((x, i) => x === b[i]);
 
@@ -519,6 +579,7 @@ function makeRow(source, at) {
   row.field = new MathField(host, {
     value: source || '',
     functions: docFunctions,
+    documentNames: docNames(),
     onChange: () => {
       // Typing into the blank row is what makes it a row. A fresh blank one
       // takes its place immediately, so the list always ends in one.
@@ -588,6 +649,7 @@ function removeRow(row) {
   const i = indexOfRow(row);
   if (i < 0) return -1;
 
+  if (lastActiveRow === row) lastActiveRow = null;
   if (openSlider && openSlider.el && row.el.contains(openSlider.el)) closeSettings();
 
   try { row.field.destroy(); } catch (err) { console.error('[numpla] destroy threw', err); }
@@ -615,6 +677,7 @@ function buildRows(lines) {
 
 function clearRows() {
   closeSettings();
+  lastActiveRow = null;
   for (const row of rows) {
     try { row.field.destroy(); } catch (err) { console.error('[numpla] destroy threw', err); }
     row.el.remove();
@@ -644,35 +707,131 @@ function loadDemo(demo) {
   pendingKnobs.clear();
   promoted.clear();
   knobRanges.clear();
+  promoted.add('t');           // the playhead is on by default, like a demo knob
   for (const k of demo.knobs || []) {
     pendingKnobs.set(k.name, k);
     promoted.add(k.name);
   }
 
-  // Drop the parameter sliders so they are rebuilt against the demo's ranges.
+  // Drop every slider so they are rebuilt against the demo's ranges.
   for (const [name, s] of Array.from(sliders)) {
-    if (name === 't') continue;
     s.el.remove();
     sliders.delete(name);
   }
-
-  clearRows();
-  buildRows(demo.source.split('\n'));
 
   const [t0, t1] = demo.tSpan;
   state.t0 = t0;
   state.t1 = t1;
   state.t = t0;
-  const ts = sliders.get('t');
-  if (ts) {
-    ts.min = t0;
-    ts.max = t1;
-    ts.step = niceStepFor(t1 - t0);
-    setSliderValue(ts, t0);
+
+  // A demo declares its span in `tSpan` rather than in its source, so the shell
+  // writes the row that says it. It is an ordinary row from that moment on:
+  // editable, sliderable, deletable.
+  const lines = demo.source.split('\n');
+  if (!lines.some((line) => SPAN_RE.test(line.split('#')[0]))) {
+    lines.unshift(spanRow(t0, t1));
   }
+
+  clearRows();
+  buildRows(lines);
 
   el.demosBtn.setAttribute('data-demo', demo.title);
   scheduleRecompute(0);
+}
+
+// ---------------------------------------------------------------------------
+// Hear
+//
+// Sound is another way of looking at a signal, so it lives beside the view
+// switches rather than being a headline control. The window and the speed are
+// exposed because they are the whole interaction: a trajectory over t in [0,20]
+// is not twenty seconds of interesting sound, and mapping simulation time onto
+// audio time is the honest version of a pitch control.
+// ---------------------------------------------------------------------------
+
+const player = new SoundPlayer();
+let hearing = false;
+
+function hearStateNames() {
+  return state.names && state.names.length ? state.names : [];
+}
+
+function openHear() {
+  const names = hearStateNames();
+  el.hearState.textContent = '';
+  names.forEach((n, i) => {
+    const o = document.createElement('option');
+    o.value = String(i);
+    o.textContent = n;
+    el.hearState.append(o);
+  });
+  el.hearState.disabled = names.length === 0;
+
+  if (!el.hearFrom.value) el.hearFrom.value = String(state.t0);
+  if (!el.hearTo.value) el.hearTo.value = String(state.t1);
+  if (!el.hearComp.value) el.hearComp.value = String(AUDIO_DEFAULTS.compression);
+
+  const r = el.hearBtn.getBoundingClientRect();
+  el.hearPanel.hidden = false;
+  el.hearBtn.setAttribute('aria-expanded', 'true');
+  const w = el.hearPanel.offsetWidth;
+  el.hearPanel.style.left = clamp(r.left, 8, Math.max(8, window.innerWidth - w - 8)) + 'px';
+  el.hearPanel.style.top = (r.bottom + 8) + 'px';
+
+  if (names.length === 0) note('nothing to listen to yet — solve a system first');
+}
+
+function closeHear() {
+  if (el.hearPanel.hidden) return;
+  el.hearPanel.hidden = true;
+  el.hearBtn.setAttribute('aria-expanded', 'false');
+}
+
+function note(text) {
+  el.hearNote.textContent = text;
+}
+
+function setHearing(on) {
+  hearing = on;
+  el.hearPlay.textContent = on ? 'stop' : 'listen';
+  el.hearBtn.classList.toggle('is-on', on);
+}
+
+async function toggleHear() {
+  if (hearing) {
+    player.stop();
+    setHearing(false);
+    return;
+  }
+  if (!M) return;
+  const idx = Number(el.hearState.value);
+  const from = Number(el.hearFrom.value);
+  const to = Number(el.hearTo.value);
+  const compression = Number(el.hearComp.value);
+  if (!isFinite(from) || !isFinite(to) || to <= from) {
+    note('the window needs to run forwards');
+    return;
+  }
+  try {
+    setHearing(true);
+    note('rendering…');
+    // renderModel only needs an eval(t); M.eval is the bound wasm method.
+    const rendered = await player.playModel({ eval: M.eval }, {
+      state: Number.isFinite(idx) ? idx : 0,
+      window: [from, to],
+      compression: isFinite(compression) && compression > 0 ? compression : undefined,
+      onended: () => setHearing(false),
+    });
+    const secs = rendered && rendered.duration ? rendered.duration.toFixed(1) : '?';
+    note(rendered && rendered.silent
+      ? 'that state never moves — nothing to hear'
+      : `${secs}s of sound${rendered && rendered.clipped ? ' (window shortened)' : ''}`);
+    if (rendered && rendered.silent) setHearing(false);
+  } catch (err) {
+    setHearing(false);
+    note(String((err && err.message) || err));
+    console.error('[numpla] hear failed', err);
+  }
 }
 
 function buildDemoMenu() {
@@ -1038,72 +1197,98 @@ const CHIP_TITLE = {
 
 const chips = new Map();          // view id -> button
 const caps = { time: true, phase: false, polar: false };
-let activeView = 'time';
+
+/**
+ * The views that are ON. A set, not a choice: `t–y`, `phase` and `polar` are
+ * three independent switches and any number of them may be on at once. The
+ * canvas is tiled between them (see plot.js, "HOW SEVERAL VIEWS SHARE THE
+ * CANVAS"). Nothing but a click on its own chip ever takes a view out of here.
+ */
+const viewsOn = new Set(['time']);
 
 function collectChips() {
   el.views.querySelectorAll('.viewchip').forEach((btn) => {
     const view = btn.dataset.view;
     if (!view) return;
     chips.set(view, btn);
-    btn.addEventListener('click', () => setView(view));
+    btn.addEventListener('click', () => toggleView(view));
   });
 }
 
 function renderChips() {
   chips.forEach((btn, view) => {
     const ok = !!caps[view];
+    const on = viewsOn.has(view);
+    btn.classList.toggle('is-on', on);
     btn.classList.toggle('is-off', !ok);
-    btn.classList.toggle('is-active', ok && view === activeView);
-    btn.setAttribute('aria-disabled', ok ? 'false' : 'true');
-    btn.setAttribute('aria-pressed', ok && view === activeView ? 'true' : 'false');
+    // Inert only while it is off AND unsupported: a view that is already on
+    // can always be turned off, whatever the document has become.
+    btn.setAttribute('aria-disabled', ok || on ? 'false' : 'true');
+    btn.setAttribute('aria-pressed', on ? 'true' : 'false');
     const t = CHIP_TITLE[view];
     if (t) btn.title = ok ? t[0] : t[1];
   });
 }
 
-function setView(view) {
-  if (!caps[view]) return;          // muted chips are inert, not hidden
-  activeView = view;
-  plot.setView(view);
+/** Push the on-set and the capability set at the plot, then repaint. */
+function applyViews() {
+  plot.setViews(VIEWS.filter((v) => viewsOn.has(v)));
+  plot.setSupport(caps);
   renderChips();
+  syncFrameButtons();
   scheduleDraw();
 }
 
+function toggleView(view) {
+  if (!chips.has(view)) return;
+  if (viewsOn.has(view)) viewsOn.delete(view);
+  else if (caps[view]) viewsOn.add(view);
+  else return;                      // muted chips are inert, not hidden
+  applyViews();
+}
+
+/**
+ * What the document can currently show. This NEVER changes what is on: a view
+ * that loses its support stays where the user put it and says why on its own
+ * tile, because switching something off on someone's behalf is how a UI
+ * teaches them not to trust it.
+ */
 function updateCapabilities(names) {
   caps.time = true;
   caps.phase = Array.isArray(names) && names.length === 2;
   caps.polar = polarMapFor(names) !== null;
-  if (!caps[activeView]) {
-    activeView = 'time';
-    plot.setView('time');
-  }
+  plot.setSupport(caps);
   renderChips();
 }
 
 // ---------------------------------------------------------------------------
-// Legend + readout
+// The readout - which is also the legend
+//
+// Colour, name, and the value at the playhead: a separate legend would repeat
+// two thirds of that, so there is only one of them and it sits on the plot's
+// control strip.
 // ---------------------------------------------------------------------------
-
-function renderLegend(names) {
-  el.legend.innerHTML = '';
-  names.forEach((name, i) => {
-    const item = document.createElement('span');
-    item.className = 'legend__item';
-    const sw = document.createElement('span');
-    sw.className = 'legend__swatch';
-    sw.style.background = seriesColor(i);
-    const label = document.createElement('span');
-    label.textContent = name;
-    item.append(sw, label);
-    el.legend.appendChild(item);
-  });
-}
 
 function renderReadout(names, values) {
   el.readout.innerHTML = '';
-  if (!values || !values.length) return;
+  if (!Array.isArray(names) || !names.length) return;
+
+  // `t` first, because with no widget of its own this is where it is read.
+  const tc = document.createElement('span');
+  tc.className = 'chip chip--t';
+  const td = document.createElement('span');
+  td.className = 'chip__dot';
+  const tn = document.createElement('span');
+  tn.className = 'chip__name';
+  tn.textContent = 't';
+  const tv = document.createElement('span');
+  tv.className = 'chip__val';
+  tv.textContent = fmtValue(state.t);
+  tc.append(td, tn, tv);
+  el.readout.appendChild(tc);
+
+  const have = values && values.length;
   names.forEach((name, i) => {
-    if (i >= values.length) return;
     const chip = document.createElement('span');
     chip.className = 'chip';
     const dot = document.createElement('span');
@@ -1114,7 +1299,7 @@ function renderReadout(names, values) {
     n.textContent = name;
     const v = document.createElement('span');
     v.className = 'chip__val';
-    v.textContent = fmtValue(values[i]);
+    v.textContent = have && i < values.length ? fmtValue(values[i]) : '—';
     chip.append(dot, n, v);
     el.readout.appendChild(chip);
   });
@@ -1136,6 +1321,158 @@ function scheduleDraw() {
 }
 
 // ---------------------------------------------------------------------------
+// The frame - -5..5 by default, and the user's from then on
+//
+// Desmos' bargain: a fixed, predictable window is what makes two runs
+// comparable, so the plot does not fit itself around the data. What it does
+// instead is put the frame entirely in the user's hands:
+//
+//   drag the plot body      pan both axes
+//   drag along the x labels scale x about the value you grabbed
+//   drag along the y labels scale y about the value you grabbed
+//   wheel                   zoom about the cursor (over an axis: that axis)
+//   double click            that tile back to -5..5
+//   the -5..5 button        every tile back to -5..5
+//   the fit button          every tile around its own curve, when asked
+//
+// A re-solve never touches any of it.
+// ---------------------------------------------------------------------------
+
+function syncFrameButtons() {
+  const dirty = !plot.isDefaultFrame();
+  el.frameReset.classList.toggle('is-live', dirty);
+  el.frameReset.setAttribute('aria-disabled', dirty ? 'false' : 'true');
+  el.frameFit.disabled = !state.frame;
+}
+
+function resetFrames() {
+  plot.resetAllWindows();
+  syncFrameButtons();
+  scheduleDraw();
+}
+
+function fitFrames() {
+  if (!state.frame) return;
+  for (const view of VIEWS) {
+    if (!viewsOn.has(view)) continue;
+    const win = plot.fitWindow(view, state.frame);
+    if (win) plot.setWindow(view, win);
+  }
+  syncFrameButtons();
+  scheduleDraw();
+}
+
+/** Where the pointer is, in the canvas' own CSS pixels. */
+function canvasPoint(e) {
+  const r = el.canvas.getBoundingClientRect();
+  return { x: e.clientX - r.left, y: e.clientY - r.top };
+}
+
+const CURSOR = { body: 'grab', x: 'ew-resize', y: 'ns-resize' };
+
+function wireCanvasGestures() {
+  const cv = el.canvas;
+  let drag = null;
+
+  cv.addEventListener('pointermove', (e) => {
+    if (drag) return;
+    const p = canvasPoint(e);
+    const hit = plot.hit(p.x, p.y);
+    cv.style.cursor = hit ? CURSOR[hit.region] : 'default';
+  });
+
+  cv.addEventListener('pointerdown', (e) => {
+    if (e.button != null && e.button !== 0) return;
+    const p = canvasPoint(e);
+    const hit = plot.hit(p.x, p.y);
+    if (!hit) return;
+    e.preventDefault();
+    closeSettings();
+
+    drag = {
+      id: e.pointerId,
+      view: hit.view,
+      box: hit.box,
+      region: hit.region,
+      x: p.x,
+      y: p.y,
+      // The window as it was when the gesture began. Every move recomputes
+      // from this rather than accumulating, so a drag cannot drift.
+      win: plot.getWindow(hit.view),
+      anchor: plot.dataAt(hit.view, hit.box, p.x, p.y),
+      moved: false,
+    };
+    try { cv.setPointerCapture(e.pointerId); } catch (err) { /* older engines */ }
+    if (hit.region === 'body') cv.style.cursor = 'grabbing';
+
+    const move = (ev) => {
+      if (!drag || ev.pointerId !== drag.id) return;
+      const q = canvasPoint(ev);
+      const dx = q.x - drag.x;
+      const dy = q.y - drag.y;
+      if (Math.abs(dx) > 2 || Math.abs(dy) > 2) drag.moved = true;
+
+      if (drag.region === 'body') {
+        plot.setWindow(drag.view, panned(drag.win, drag.box, dx, dy));
+      } else if (drag.region === 'x') {
+        // Drag right and the axis stretches: the span shrinks, the value you
+        // grabbed stays under the pointer.
+        const w = Math.max(1, drag.box.R - drag.box.L);
+        plot.setWindow(drag.view, scaled(drag.win, 'x', Math.exp(-dx / (w * 0.5)), drag.anchor.x));
+      } else {
+        const h = Math.max(1, drag.box.B - drag.box.T);
+        plot.setWindow(drag.view, scaled(drag.win, 'y', Math.exp(dy / (h * 0.5)), drag.anchor.y));
+      }
+      syncFrameButtons();
+      scheduleDraw();
+    };
+
+    const up = (ev) => {
+      if (drag && ev.pointerId !== drag.id) return;
+      cv.removeEventListener('pointermove', move);
+      cv.removeEventListener('pointerup', up);
+      cv.removeEventListener('pointercancel', up);
+      drag = null;
+      const q = canvasPoint(ev);
+      const h = plot.hit(q.x, q.y);
+      cv.style.cursor = h ? CURSOR[h.region] : 'default';
+    };
+
+    cv.addEventListener('pointermove', move);
+    cv.addEventListener('pointerup', up);
+    cv.addEventListener('pointercancel', up);
+  });
+
+  cv.addEventListener('dblclick', (e) => {
+    const p = canvasPoint(e);
+    const hit = plot.hit(p.x, p.y);
+    if (!hit) return;
+    e.preventDefault();
+    plot.resetWindow(hit.view);
+    syncFrameButtons();
+    scheduleDraw();
+  });
+
+  // Wheel zooms about the cursor. Over an axis strip it zooms that axis only,
+  // which is the same gesture as dragging it, without the drag.
+  cv.addEventListener('wheel', (e) => {
+    const p = canvasPoint(e);
+    const hit = plot.hit(p.x, p.y);
+    if (!hit) return;
+    e.preventDefault();
+    const step = e.deltaMode === 1 ? e.deltaY * 16 : e.deltaMode === 2 ? e.deltaY * 400 : e.deltaY;
+    const f = Math.exp(clamp(step, -260, 260) / 420);
+    const at = plot.dataAt(hit.view, hit.box, p.x, p.y);
+    const win = plot.getWindow(hit.view);
+    if (hit.region === 'x') plot.setWindow(hit.view, scaled(win, 'x', f, at.x));
+    else if (hit.region === 'y') plot.setWindow(hit.view, scaled(win, 'y', f, at.y));
+    else plot.setWindow(hit.view, zoomed(win, f, at.x, at.y));
+    syncFrameButtons();
+    scheduleDraw();
+  }, { passive: false });
+}
+
+// ---------------------------------------------------------------------------
 // Sliders
 //
 // A slider is a statement that THIS number is worth playing with, and only the
@@ -1144,8 +1481,11 @@ function scheduleDraw() {
 // - and one click promotes it into a real slider, sitting on the row that
 // defines the number it drives. The × on it goes back to the offer.
 //
-// `t` is the exception twice over: it always has a slider, and it has no row to
-// sit on, so it lives in the transport bar.
+// `t` is no longer an exception to any of that. Its row says `t = [0, 20]`, it
+// is offered a slider like every other variable, and it arrives promoted the
+// way a demo's knobs do - because the playhead is what the plot is for. What
+// dragging it means is the only difference: a parameter slider rewrites its row
+// and re-solves, `t`'s moves the playhead through a solution already computed.
 //
 // Range and step live in an overlay that opens on demand - they are set once,
 // while the value is watched constantly, so giving them permanent screen space
@@ -1158,7 +1498,7 @@ const GEAR_SVG =
   '<circle cx="3" cy="8" r="1.5"/><circle cx="8" cy="8" r="1.5"/>' +
   '<circle cx="13" cy="8" r="1.5"/></svg>';
 
-/** name -> slider record. `t` is always in here; parameters only once asked for. */
+/** name -> slider record. Every variable that has been asked for, `t` included. */
 const sliders = new Map();
 let openSlider = null;
 
@@ -1184,73 +1524,18 @@ function wireRange(s) {
   });
 }
 
-/** The transport slider: name, value, track, and the settings affordance. */
-function makeTimeSlider(init) {
-  const wrap = document.createElement('div');
-  wrap.className = 'slider';
-  wrap.dataset.name = 't';
-
-  const top = document.createElement('div');
-  top.className = 'slider__top';
-
-  const nameBtn = document.createElement('button');
-  nameBtn.type = 'button';
-  nameBtn.className = 'slider__name';
-  nameBtn.textContent = 't';
-  nameBtn.title = 'Range and step for t';
-  nameBtn.setAttribute('aria-expanded', 'false');
-
-  const valueEl = document.createElement('span');
-  valueEl.className = 'slider__value';
-
-  const gear = document.createElement('button');
-  gear.type = 'button';
-  gear.className = 'slider__gear';
-  gear.innerHTML = GEAR_SVG;
-  gear.title = 'Range and step for t';
-  gear.setAttribute('aria-label', 'Range and step for t');
-
-  top.append(nameBtn, valueEl, gear);
-
-  const range = document.createElement('input');
-  range.type = 'range';
-  range.className = 'range';
-  range.setAttribute('aria-label', 't');
-
-  wrap.append(top, range);
-  el.transport.appendChild(wrap);
-
-  const s = {
-    name: 't',
-    kind: 'time',
-    label: '',
-    el: wrap,
-    nameBtn,
-    valueEl,
-    range,
-    min: init.min,
-    max: init.max,
-    step: init.step,
-    value: init.value,
-    dragging: false,
-  };
-
-  const toggle = (e) => { e.preventDefault(); openSettingsFor(s); };
-  nameBtn.addEventListener('click', toggle);
-  gear.addEventListener('click', toggle);
-
-  wireRange(s);
-  applyRange(s);
-  sliders.set('t', s);
-  return s;
-}
-
 /**
- * A parameter slider. It carries no name and no value readout, because it sits
- * directly under the row that says both - `k = 60` is the readout, and dragging
- * rewrites it live.
+ * A slider, on the row that defines the thing it drives. It carries no name and
+ * no value readout, because the row above it says both - `k = 60` is the
+ * readout, and dragging rewrites it live.
+ *
+ * `t` gets exactly this, from exactly this function. The only difference is
+ * what dragging it means: a parameter slider rewrites its row and re-solves,
+ * while `t`'s moves the playhead through a solution that is already there.
+ *
+ * @param {'param'|'time'} kind
  */
-function makeParamSlider(name, init) {
+function makeSlider(name, init, kind) {
   const wrap = document.createElement('div');
   wrap.className = 'knob';
   wrap.dataset.name = name;
@@ -1264,7 +1549,9 @@ function makeParamSlider(name, init) {
   gear.type = 'button';
   gear.className = 'knob__btn knob__gear';
   gear.innerHTML = GEAR_SVG;
-  gear.title = 'Range and step for ' + name;
+  gear.title = kind === 'time'
+    ? 'The span t is integrated over'
+    : 'Range and step for ' + name;
   gear.setAttribute('aria-label', 'Range and step for ' + name);
   gear.setAttribute('aria-expanded', 'false');
 
@@ -1280,8 +1567,10 @@ function makeParamSlider(name, init) {
   const knob = pendingKnobs.get(name);
   const s = {
     name,
-    kind: 'param',
-    label: knob && knob.label ? String(knob.label) : '',
+    kind: kind === 'time' ? 'time' : 'param',
+    label: kind === 'time'
+      ? 'the playhead'
+      : (knob && knob.label ? String(knob.label) : ''),
     el: wrap,
     nameBtn: gear,          // what the settings overlay hangs off and returns to
     valueEl: null,
@@ -1313,14 +1602,9 @@ function applyRange(s) {
 }
 
 function paintSlider(s) {
-  if (s.valueEl) {
-    s.valueEl.textContent = s.kind === 'time'
-      ? s.value.toFixed(3)
-      : fmtStepped(s.value, s.step);
-    return;
-  }
-  // No readout of its own: the row above it is the readout. The hover text is
-  // where a demo's description of the knob goes.
+  // No readout of its own: the row above it is the readout, and for `t` the
+  // readout on the plot is. The hover text is where a demo's description of the
+  // knob goes.
   s.range.title = s.name + ' = ' + fmtStepped(s.value, s.step) +
     (s.label ? ' · ' + s.label : '');
 }
@@ -1347,7 +1631,7 @@ function openSettingsFor(s) {
   el.settingsMax.value = String(s.max);
   el.settingsStep.value = String(s.step);
   el.settingsFoot.textContent = s.kind === 'time'
-    ? 'min and max are the integration span · Esc to close'
+    ? 'min and max are the span; they rewrite the row · Esc to close'
     : 'Esc to close';
 
   el.settings.hidden = false;
@@ -1399,18 +1683,42 @@ function readSettings() {
     knobRanges.set(s.name, { min: s.min, max: s.max, step: s.step });
   }
 
-  if (s.kind === 'time' && spanChanged) {
-    state.t0 = s.min;
-    state.t1 = s.max;
-    setTime(state.t);          // the readout must not lag the new span
-    scheduleRecompute(220);
-  }
+  // The span is written down in the document, so changing it here changes the
+  // row that says it - the same bargain a parameter slider makes.
+  if (s.kind === 'time' && spanChanged) writeSpan(s);
 }
 
 // -- parameter sliders write back into their own row ------------------------
 
-const ASSIGN_RE =
-  /^\s*([A-Za-z_][A-Za-z_0-9]*)\s*=\s*([-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)\s*$/;
+const NUM = String.raw`[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?`;
+
+const ASSIGN_RE = new RegExp(String.raw`^\s*([A-Za-z_][A-Za-z_0-9]*)\s*=\s*(${NUM})\s*$`);
+
+/**
+ * The row that says how far time runs: `t = [0, 20]`.
+ *
+ * A list literal, because that is a row the parser already reads and the math
+ * field already draws - no new row kind was invented to get `t` onto the page.
+ * The solver rebinds `t` at every right-hand-side evaluation, so the row cannot
+ * change what the equations mean; it is read by the shell and inert to the
+ * engine, which is exactly what "the span" is.
+ */
+const SPAN_RE = new RegExp(String.raw`^\s*t\s*=\s*\[\s*(${NUM})\s*,\s*(${NUM})\s*\]\s*$`);
+
+/** The first well-formed span row, or null when the document has none. */
+function scanSpan() {
+  for (const row of realRows()) {
+    const m = SPAN_RE.exec(rowSource(row).split('#')[0]);
+    if (!m) continue;
+    const t0 = Number(m[1]);
+    const t1 = Number(m[2]);
+    if (isFinite(t0) && isFinite(t1) && t1 > t0) return { row, t0, t1 };
+  }
+  return null;
+}
+
+/** The text of a span row, for writing one. */
+const spanRow = (t0, t1) => 't = [' + numText(t0, 0.001) + ', ' + numText(t1, 0.001) + ']';
 
 /** Every `name = <number>` row in the document, mapped to its row. */
 function scanAssignments() {
@@ -1421,6 +1729,25 @@ function scanAssignments() {
     if (m && !map.has(m[1])) map.set(m[1], { value: Number(m[2]), row });
   }
   return map;
+}
+
+/** Push a new span back into the row that states it, then re-solve. */
+function writeSpan(s) {
+  const hit = scanSpan();
+  if (!hit) return;
+  const raw = rowSource(hit.row);
+  const hash = raw.indexOf('#');
+  const note = hash >= 0 ? '  ' + raw.slice(hash) : '';
+  try {
+    hit.row.field.source = spanRow(s.min, s.max) + note;
+  } catch (err) {
+    console.error('[numpla] MathField.source= threw', err);
+    return;
+  }
+  state.t0 = s.min;
+  state.t1 = s.max;
+  setTime(state.t);              // the readout must not lag the new span
+  scheduleRecompute(220);
 }
 
 function writeParam(s) {
@@ -1494,12 +1821,12 @@ function demoteParam(name) {
 function syncKnobs(params) {
   const drivable = new Set();
   for (const name of params) {
-    if (name === 't') continue;
+    if (name === 't') continue;       // its row is a span, not a plain number
     if (state.names.indexOf(name) >= 0) continue;   // it is a state, not a knob
     drivable.add(name);
   }
 
-  const wanted = new Map();     // row -> { name, value }
+  const wanted = new Map();     // row -> { name, value, kind, min?, max? }
   const seen = new Set();
   for (const row of realRows()) {
     const m = ASSIGN_RE.exec(rowSource(row).split('#')[0]);
@@ -1507,7 +1834,18 @@ function syncKnobs(params) {
     const name = m[1];
     if (!drivable.has(name) || seen.has(name)) continue;
     seen.add(name);
-    wanted.set(row, { name, value: Number(m[2]) });
+    wanted.set(row, { name, value: Number(m[2]), kind: 'param' });
+  }
+
+  // `t` earns its knob the same way every other variable does - by having a
+  // row that says numbers a slider could drive. Its row says two, which is the
+  // span; the slider inside that span is the playhead.
+  const span = scanSpan();
+  if (span && !wanted.has(span.row)) {
+    seen.add('t');
+    wanted.set(span.row, {
+      name: 't', kind: 'time', value: state.t, min: span.t0, max: span.t1,
+    });
   }
 
   const keyFor = (w) => (w ? (promoted.has(w.name) ? 'slider:' : 'offer:') + w.name : '');
@@ -1527,7 +1865,13 @@ function syncKnobs(params) {
     const key = keyFor(w);
     if (row.knobKey === key) continue;
     if (promoted.has(w.name)) {
-      const s = sliders.get(w.name) || makeParamSlider(w.name, initialRangeFor(w.name, w.value));
+      const s = sliders.get(w.name) || (w.kind === 'time'
+        ? makeSlider('t', {
+            min: w.min, max: w.max,
+            step: niceStepFor(w.max - w.min),
+            value: clamp(state.t, w.min, w.max),
+          }, 'time')
+        : makeSlider(w.name, initialRangeFor(w.name, w.value), 'param'));
       if (s.el.parentNode !== row.knobEl) row.knobEl.appendChild(s.el);
     } else {
       row.offerName = w.name;
@@ -1538,9 +1882,10 @@ function syncKnobs(params) {
     row.knobKey = key;
   }
 
-  // 3. drop the sliders whose parameter left the document
+  // 3. drop the sliders whose variable left the document - `t` included, since
+  //    deleting its row is a perfectly good way to say you are done scrubbing
   for (const [name, s] of Array.from(sliders)) {
-    if (name === 't' || seen.has(name)) continue;
+    if (seen.has(name)) continue;
     if (openSlider === s) closeSettings();
     s.el.remove();
     sliders.delete(name);
@@ -1549,12 +1894,28 @@ function syncKnobs(params) {
   // 4. keep the document's value and the slider's value in step
   for (const w of wanted.values()) {
     const s = sliders.get(w.name);
-    if (s && s.kind === 'param' && !s.dragging) setSliderValue(s, w.value);
+    if (!s) continue;
+    if (w.kind === 'time') {
+      // The row is the authority on the range; the playhead is the value.
+      if (s.min !== w.min || s.max !== w.max) {
+        s.min = w.min;
+        s.max = w.max;
+        s.step = niceStepFor(w.max - w.min);
+        applyRange(s);
+      }
+      if (!s.dragging) setSliderValue(s, clamp(state.t, w.min, w.max));
+    } else if (s.kind === 'param' && !s.dragging) {
+      setSliderValue(s, w.value);
+    }
   }
 }
 
 // ---------------------------------------------------------------------------
-// Playhead + transport
+// The playhead
+//
+// `t` has no widget of its own any more. It moves from three places - its
+// slider on its own row, play/pause on the plot, and the space bar - and what
+// it does is move a marker along the curve.
 // ---------------------------------------------------------------------------
 
 function updatePlayhead(redraw = true) {
@@ -1647,6 +2008,7 @@ function recompute() {
 
   state.names = names;
   state.params = params;
+  refreshDocumentNames();   // Tab now completes the document's own vocabulary
 
   const hasError = issues.some((i) => i.severity === 'error');
   if (hasError) {
@@ -1656,10 +2018,19 @@ function recompute() {
     return;
   }
 
+  // The document says how far time runs. A `t = [0, 20]` row is the authority
+  // whenever there is one; delete it and the last span simply stands, which is
+  // the same courtesy every other deleted row gets.
+  const span = scanSpan();
+  if (span) {
+    state.t0 = span.t0;
+    state.t1 = span.t1;
+    state.t = clamp(state.t, span.t0, span.t1);
+  }
+
   // `pending` is not an error, so the chips still track the document live:
   // `phase` lights up the moment a system gains its second state.
   updateCapabilities(names);
-  renderLegend(names);
   syncKnobs(params);
 
   if (!names.length) {
@@ -1680,8 +2051,8 @@ function recompute() {
     return;
   }
 
-  // 2. solve
-  const report = parseJson(M.solve(t0, t1), 'SolveReport');
+  // 2. solve, with whichever integrator the reference has selected
+  const report = parseJson(solveNow(t0, t1), 'SolveReport');
   if (!report || report.ok !== true) {
     setSolveBadge(report && report.error ? String(report.error) : 'solve failed', 'bad');
     if (report) {
@@ -1695,7 +2066,9 @@ function recompute() {
   el.statAccepted.textContent = report.accepted ?? '—';
   el.statRejected.textContent = report.rejected ?? '—';
   el.statRhs.textContent = report.rhsEvals ?? '—';
-  setSolveBadge('solved', 'ok');
+  // The report echoes the method it actually used, so the badge can never name
+  // one that did not run.
+  setSolveBadge(report.method ? 'solved · ' + report.method : 'solved', 'ok');
 
   const dim = Number.isInteger(report.dim) ? report.dim : names.length;
   const reportNames = Array.isArray(report.states) && report.states.length
@@ -1712,24 +2085,13 @@ function recompute() {
   state.t1 = isFinite(report.t1) ? report.t1 : t1;
   state.t = clamp(state.t, state.t0, state.t1);
 
-  const ts = sliders.get('t');
-  if (ts && (ts.min !== state.t0 || ts.max !== state.t1)) {
-    ts.min = state.t0;
-    ts.max = state.t1;
-    if (!(ts.step > 0)) ts.step = niceStepFor(state.t1 - state.t0);
-    applyRange(ts);
-  }
-
   if (!got) {
     state.frame = null;
     scheduleDraw();
     return;
   }
 
-  if (String(reportNames) !== String(names)) {
-    updateCapabilities(reportNames);
-    renderLegend(reportNames);
-  }
+  if (String(reportNames) !== String(names)) updateCapabilities(reportNames);
 
   state.frame = {
     names: reportNames,
@@ -1743,6 +2105,8 @@ function recompute() {
     polar: polarMapFor(reportNames),
   };
 
+  // A re-solve draws inside the frame the user left. It is never moved here.
+  syncFrameButtons();
   updatePlayhead();
 }
 
@@ -1758,6 +2122,454 @@ function scheduleRecompute(delay = 160) {
       setSolveBadge('internal error', 'bad');
     }
   }, delay);
+}
+
+// ===========================================================================
+// The reference - what can I type here?
+//
+// Until now that question was answerable only by reading Rust. Everything
+// below is taken from the source it documents:
+//
+//   builtins + arities   crates/numpla-expr/src/{lexer.rs,eval.rs}
+//   noise                docs/noise.md, crates/numpla-noise/src/lib.rs
+//   rows, calls, rand()  docs/wasm-api.md
+//   integrators          docs/solvers.md, crates/numpla-ode/src/method.rs
+//
+// Every entry can be written into the document, because a reference you can
+// only read leaves you to retype what it just told you.
+// ===========================================================================
+
+// -- the integrator ---------------------------------------------------------
+//
+// `Model.solve_with(t0, t1, name)` and the static `Model.methods()` are the
+// boundary for this (crates/numpla-wasm/src/lib.rs). Both are probed rather
+// than assumed, because `app/pkg/` is a build artefact that can be older than
+// the crate: a shell that calls a method the loaded module does not have is a
+// blank screen, and a shell that probes is a shell that keeps working while
+// someone rebuilds. Without them the entries below still document the choice.
+//
+// The names come from the module when it can supply them, so a method added to
+// numpla-ode reaches this list without an edit here.
+
+const FALLBACK_METHODS = ['Tsit5', 'Verlet', 'Yoshida4'];
+let methodApi = null;                 // { call(t0,t1,name), list } once present
+let methodNames = FALLBACK_METHODS.slice();
+let currentMethod = FALLBACK_METHODS[0];
+
+function probeMethodApi(model, ctor) {
+  const fn = typeof model.solve_with === 'function' ? 'solve_with'
+           : typeof model.solveWith === 'function' ? 'solveWith'
+           : null;
+  if (!fn) return null;
+
+  let list = null;
+  try {
+    const raw = ctor && typeof ctor.methods === 'function' ? ctor.methods() : null;
+    const parsed = raw ? parseJson(raw, 'MethodsJson') : null;
+    if (parsed && Array.isArray(parsed.methods) && parsed.methods.length) {
+      list = parsed.methods.filter((m) => m && typeof m.name === 'string');
+    }
+  } catch (err) {
+    console.warn('[numpla] Model.methods() failed', err);
+  }
+
+  if (list && list.length) {
+    methodNames = list.map((m) => m.name);
+    currentMethod = methodNames[0];
+  }
+  return { call: (t0, t1, name) => model[fn](t0, t1, name), list };
+}
+
+/** Integrate with whatever the reference has selected, or plainly. */
+function solveNow(t0, t1) {
+  if (methodApi) {
+    try {
+      return methodApi.call(t0, t1, currentMethod);
+    } catch (err) {
+      console.error('[numpla] solve_with threw', err);
+    }
+  }
+  return M.solve(t0, t1);
+}
+
+function chooseMethod(name) {
+  if (!methodApi || methodNames.indexOf(name) < 0) return false;
+  currentMethod = name;
+  renderReference();
+  scheduleRecompute(0);
+  return true;
+}
+
+const REFERENCE = [
+  {
+    group: 'Row kinds',
+    note: 'One row per line. Each of these writes a new row into the document.',
+    rows: true,
+    entries: [
+      { sig: "x' = -y", desc: 'An ODE row. `x` becomes a state variable, and `t` is bound to the current time on the right-hand side.', keys: 'ode derivative state' },
+      { sig: "x'' = -x", desc: 'Second order. Lowered to two states automatically; the hidden velocity state sits immediately after its position.', keys: 'second order acceleration' },
+      { sig: "x'(0) = 0", desc: 'The starting velocity of a second-order row.', keys: 'initial velocity' },
+      { sig: 'x(0) = 1', desc: 'An initial condition. Leave it out and it is 0 — reported, not assumed in silence.', keys: 'initial condition start' },
+      { sig: 'k = 0.4', desc: 'A parameter, visible to every row. A plain numeric one can be given a slider on its own row.', keys: 'parameter constant knob' },
+      { sig: 't = [0, 20]', desc: 'How far time runs. `t` is a variable in the system like any other — this row says its span, and the slider you can put on it is the playhead inside that span. The solver rebinds `t` while it integrates, so the row cannot change what the equations mean.', keys: 'time span playhead integration range scrub transport' },
+      { sig: 'f(u) = u^2', desc: 'A function definition — and what makes `f(u)` a call rather than a coefficient anywhere else in the document.', keys: 'function definition' },
+      { sig: '# a note', desc: 'A comment row: prose for the reader, skipped by the parser, never numbered and never diagnosed.', keys: 'comment prose' },
+    ],
+  },
+  {
+    group: 'Functions',
+    note: 'Every builtin, with its exact arity. Parentheses are optional for the one-argument ones: `sin x` is `sin(x)`, and it binds tighter than × .',
+    entries: [
+      { sig: 'sin(x)', desc: 'Sine. Radians, like every trigonometric function here.', insert: 'sin(' , keys: 'trig' },
+      { sig: 'cos(x)', desc: 'Cosine, radians.', insert: 'cos(', keys: 'trig' },
+      { sig: 'tan(x)', desc: 'Tangent, radians.', insert: 'tan(', keys: 'trig' },
+      { sig: 'arcsin(x)', desc: 'Inverse sine, radians.', insert: 'arcsin(', keys: 'trig inverse asin' },
+      { sig: 'arccos(x)', desc: 'Inverse cosine, radians.', insert: 'arccos(', keys: 'trig inverse acos' },
+      { sig: 'arctan(x)', desc: 'Inverse tangent, radians. One argument only — there is no two-argument atan2.', insert: 'arctan(', keys: 'trig inverse atan atan2' },
+      { sig: 'sinh(x)', desc: 'Hyperbolic sine.', insert: 'sinh(', keys: 'hyperbolic' },
+      { sig: 'cosh(x)', desc: 'Hyperbolic cosine.', insert: 'cosh(', keys: 'hyperbolic' },
+      { sig: 'tanh(x)', desc: 'Hyperbolic tangent. The usual soft saturation.', insert: 'tanh(', keys: 'hyperbolic saturate limit' },
+      { sig: 'sqrt(x)', desc: 'Square root.', insert: 'sqrt(', keys: 'root radical' },
+      { sig: 'exp(x)', desc: 'e to the power x.', insert: 'exp(', keys: 'exponential' },
+      { sig: 'ln(x)', desc: 'Natural logarithm, base e.', insert: 'ln(', keys: 'logarithm' },
+      { sig: 'log(x)', desc: 'Logarithm base 10.', insert: 'log(', keys: 'logarithm base ten' },
+      { sig: 'log(b, x)', desc: 'Logarithm of x in base b — the base comes FIRST: log(2, 8) is 3.', insert: 'log(2, ', keys: 'logarithm base two arity' },
+      { sig: 'abs(x)', desc: 'Absolute value.', insert: 'abs(', keys: 'magnitude modulus' },
+      { sig: 'floor(x)', desc: 'Round down to an integer.', insert: 'floor(', keys: 'integer' },
+      { sig: 'ceil(x)', desc: 'Round up to an integer.', insert: 'ceil(', keys: 'integer' },
+      { sig: 'round(x)', desc: 'Round to the nearest integer, halves away from zero: round(2.5) is 3, round(−2.5) is −3.', insert: 'round(', keys: 'integer nearest' },
+      { sig: 'sign(x)', desc: '−1, 0 or 1. sign(0) is 0, not ±1 — which is what makes it usable in a friction term.', insert: 'sign(', keys: 'signum friction' },
+      { sig: 'min(a, b)', desc: 'The smaller of two. Exactly two arguments.', insert: 'min(', keys: 'clamp' },
+      { sig: 'max(a, b)', desc: 'The larger of two. `max(0, overlap)` is how a one-sided contact force is written while there is no event detection.', insert: 'max(0, ', keys: 'clamp contact collision penalty' },
+      { sig: 'mod(a, b)', desc: 'Euclidean remainder — never negative for a positive b: mod(−1, 3) is 2. A function, not an operator.', insert: 'mod(', keys: 'remainder modulo wrap' },
+    ],
+  },
+  {
+    group: 'Constants',
+    entries: [
+      { sig: 'pi', desc: '3.14159…', insert: 'pi', keys: 'circle' },
+      { sig: 'tau', desc: '2π — one whole turn.', insert: 'tau', keys: 'circle turn' },
+      { sig: 'e', desc: "Euler's number, 2.71828…", insert: 'e', keys: 'euler exponential' },
+      { sig: 'inf', desc: 'Positive infinity.', insert: 'inf', keys: 'infinity' },
+    ],
+  },
+  {
+    group: 'Noise',
+    note: 'Noise is a deterministic function of time: same t, same seed, same value, always — randomness enters through the seed, not through the call, which is what lets an adaptive solver step a noisy model at all. Each takes n(t), n(t, rate) or n(t, rate, seed): rate is lattice points per unit time (default 1, and doubling it doubles both the roughness and the work), seed names an independent stream (default 0). All six are zero-mean and unit-RMS, so swapping one for another does not rescale the forcing.',
+    entries: [
+      { sig: 'white(t, rate, seed)', desc: 'Flat spectrum: harsh, every frequency equally. Forcing and dither.', insert: 'white(t)', keys: 'noise random stochastic' },
+      { sig: 'pink(t, rate, seed)', desc: '1/f: natural and balanced — what most physical noise looks like.', insert: 'pink(t)', keys: 'noise random flicker' },
+      { sig: 'brown(t, rate, seed)', desc: '1/f²: drifting, wandering. Slow drift, not a Wiener process.', insert: 'brown(t)', keys: 'noise random drift brownian' },
+      { sig: 'blue(t, rate, seed)', desc: 'f: thin and hissy, the complement of pink.', insert: 'blue(t)', keys: 'noise random' },
+      { sig: 'smooth(t, rate, seed)', desc: 'One band-limited lattice, C² everywhere. The safest thing to drive a physical model with.', insert: 'smooth(t)', keys: 'noise random perlin gentle' },
+      { sig: 'telegraph(t, rate, seed)', desc: 'Switches between ±1, with the edges ramped so it stays integrable.', insert: 'telegraph(t)', keys: 'noise random switch square binary' },
+      { sig: 'rand()', desc: 'A number, not a draw: uniform on [0, 1), fixed when the document is compiled, so the same document reopened gives the same number. Each call site has its own stream — two rand()s are two different numbers, and a site keeps its stream when unrelated rows are edited.', insert: 'rand()', keys: 'random uniform reproducible' },
+      { sig: 'randn()', desc: 'The same, drawn from a standard normal instead of a uniform.', insert: 'randn()', keys: 'random gaussian normal' },
+      { sig: 'rand(s)', desc: 'Names a stream explicitly, and is left exactly as written — the same s is the same number everywhere.', insert: 'rand(', keys: 'random seed stream' },
+    ],
+  },
+  {
+    group: 'Notation',
+    note: 'A name is ONE letter plus an optional subscript, the Desmos convention — so `xy` is x times y, never a variable called xy.',
+    entries: [
+      { sig: '2(x + 1)', desc: 'Implicit multiplication: juxtaposition binds exactly as tightly as ×.', insert: '2(', keys: 'implicit multiplication juxtaposition' },
+      { sig: 'k_1', desc: 'A subscript. `k_{max}` works too, and means the same as `k_max`.', insert: 'k_1', keys: 'subscript index' },
+      { sig: "x'", desc: "A prime: the derivative of x. On a right-hand side it is the velocity state a second-order row introduced.", insert: "x'", keys: 'prime derivative velocity' },
+      { sig: 'x^2', desc: 'Powers, right-associative: 2^3^2 is 512. Unary minus binds looser, so −2^2 is −4.', insert: 'x^2', keys: 'power exponent caret' },
+      { sig: 'f(u) versus g (u)', desc: '`f(u)` is a call only when the document has an `f(u) = …` row; every other name followed by ( is a coefficient. So `f(y − x)^3` cubes the result of a call while `g (y − x)^3` cubes the difference and then scales it — the same tokens, two different systems.', insert: 'f(u) = u^2', asRow: true, keys: 'call coefficient ambiguity parser' },
+      { sig: 't', desc: 'Bound to the current time inside any right-hand side. Its span is a row of its own — see `t = [0, 20]`.', insert: 't', keys: 'time' },
+      { sig: '[a, b, c]', desc: 'A list. Arithmetic broadcasts a scalar across a list and zips two lists of equal length; the builtin functions take scalars only.', insert: '[', keys: 'list vector array' },
+      { sig: '+ − * / ^', desc: 'The whole operator set. No comparisons, no factorial, no % — `mod` is a function, and `=` splits a row into a statement rather than comparing.', keys: 'operators precedence comparison factorial' },
+    ],
+  },
+  {
+    group: 'The integrator',
+    note: 'Accuracy or structure — no fixed-step method preserves the symplectic form, momentum and energy at once, and that is a theorem rather than a gap (docs/solvers.md). This is the discrete-versus-continuous switch. The symplectic two need second-order rows to work on: they integrate positions and velocities separately, so a document of plain x’ = rows is refused by name rather than quietly solved with something else.',
+    methods: true,
+    entries: [
+      { sig: 'Tsit5 — adaptive, order 5', method: 'Tsit5', desc: 'Tsitouras 5(4). Chooses its own step from a local error estimate, so a narrow feature costs steps only where it is: the most accuracy per unit work over a short run. It preserves nothing — over a long one the energy drifts away.', keys: 'runge kutta adaptive accurate dense output' },
+      { sig: 'Verlet — fixed step, order 2', method: 'Verlet', desc: 'Velocity Verlet: symplectic, so the energy oscillates in a bounded band instead of drifting, however long the run. The cheapest step there is, but it is a fixed one — you pay for the narrowest feature everywhere. Needs x’’ rows.', keys: 'symplectic leapfrog energy conserving structure second order' },
+      { sig: 'Yoshida4 — fixed step, order 4', method: 'Yoshida4', desc: "Yoshida's composition of three Verlet substeps: fourth-order accuracy with the same bounded energy. What a long run should be integrated with when second order is too coarse. Needs x’’ rows.", keys: 'symplectic composition energy conserving structure second order' },
+    ],
+  },
+  {
+    group: 'Features',
+    entries: [
+      { sig: 't is a variable, not a widget', desc: 'The row `t = [0, 20]` says the span; the slider you promote on that row is the playhead. Dragging it moves a marker along the curve and redraws the trajectory travelled-versus-ahead — it does not re-solve, because the solution does not depend on where you are looking. Widening the span in the gear rewrites the row, and that does.', keys: 'time transport play scrub span playhead slider' },
+      { sig: 'add slider', desc: 'Every plain `k = number` row offers one, in the line it already reserves for its diagnostic. It sits on the row that defines the number, and dragging it rewrites that row.', keys: 'slider knob parameter drag' },
+      { sig: 'three views, any number on', desc: 't–y, phase and polar are independent switches; the canvas is tiled between whichever are on. A view the document cannot support stays visible but inert — that is how you find out it exists.', keys: 'view phase polar toggle tile' },
+      { sig: 'the frame is yours', desc: '−5 to 5 on both axes to begin with, so two runs are comparable. Drag an axis to scale it, drag the body to pan, wheel to zoom about the cursor, double-click a tile to put it back. A re-solve never moves it.', keys: 'axes zoom pan scale window frame reset' },
+      { sig: 'gray, not red', desc: 'An incomplete document is muted, never an error, and only a real error pauses the solve — the last good curve stays on screen while you type.', keys: 'pending error diagnostic' },
+      { sig: 'the issue bar', desc: 'What the document still needs, as a sentence, with the row the compiler would have written one click away.', keys: 'fix missing initial condition' },
+    ],
+  },
+];
+
+/** Everything flattened once, with the text the search matches against. */
+const REF_ENTRIES = [];
+for (const g of REFERENCE) {
+  for (const e of g.entries) {
+    REF_ENTRIES.push({
+      ...e,
+      group: g.group,
+      asRow: e.asRow || !!g.rows,
+      insert: e.insert != null ? e.insert : (g.rows ? e.sig : ''),
+      hay: [g.group, e.sig, e.desc, e.keys || ''].join(' ').toLowerCase(),
+    });
+  }
+}
+
+let refSelection = -1;      // index into the entries currently rendered
+let refRendered = [];       // { entry, el } in display order
+
+function refFoot(msg) {
+  el.infoFoot.textContent = msg;
+}
+
+/** Write an entry into the document. Rows become rows; the rest is typed. */
+function insertEntry(entry) {
+  if (!entry || !entry.insert) return;
+
+  if (entry.asRow) {
+    const row = makeRow(entry.insert, realRowCount());   // before the blank one
+    ensureTail();
+    renumber();
+    scheduleRecompute(0);
+    closeInfo();
+    placeCaret(row, true);
+    return;
+  }
+
+  let row = lastActiveRow && indexOfRow(lastActiveRow) >= 0 ? lastActiveRow : null;
+  if (!row) {
+    ensureTail();
+    row = rows[rows.length - 1];
+  }
+  if (!row) return;
+
+  try {
+    const m = row.field.model;
+    if (m && typeof m.type === 'function') {
+      m.type(entry.insert);
+      row.field.render();
+    } else {
+      row.field.source = rowSource(row) + entry.insert;
+    }
+  } catch (err) {
+    console.error('[numpla] inserting from the reference threw', err);
+    return;
+  }
+
+  ensureTail();
+  renumber();
+  scheduleRecompute(0);
+  closeInfo();
+  // Not placeCaret: the caret is already sitting after what was just typed,
+  // which is where the next character belongs.
+  try { row.field.focus(); } catch (err) { /* the row may be gone */ }
+  setActiveRow(row);
+}
+
+function copyText(text) {
+  const done = () => refFoot('copied  ' + text);
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(done, () => refFoot('could not copy'));
+      return;
+    }
+  } catch (err) { /* fall through to the textarea */ }
+  try {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.setAttribute('readonly', '');
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand('copy');
+    ta.remove();
+    done();
+  } catch (err) {
+    refFoot('could not copy');
+  }
+}
+
+function refPrimary(entry) {
+  if (entry.method) {
+    if (chooseMethod(entry.method)) refFoot(entry.method + ' is now integrating');
+    else refFoot('not switchable yet — ' + currentMethod + ' is what runs');
+    return;
+  }
+  if (entry.insert) insertEntry(entry);
+  else copyText(entry.sig);
+}
+
+function selectRef(i) {
+  refSelection = i;
+  refRendered.forEach((r, j) => {
+    const on = j === i;
+    r.el.classList.toggle('is-sel', on);
+    if (on && typeof r.el.scrollIntoView === 'function') {
+      r.el.scrollIntoView({ block: 'nearest' });
+    }
+  });
+}
+
+function renderReference() {
+  const q = (el.infoSearch.value || '').trim().toLowerCase();
+  const terms = q ? q.split(/\s+/) : [];
+  const match = (e) => terms.every((t) => e.hay.indexOf(t) >= 0);
+
+  el.infoList.textContent = '';
+  refRendered = [];
+
+  let shown = 0;
+  for (const g of REFERENCE) {
+    const hits = REF_ENTRIES.filter((e) => e.group === g.group && match(e));
+    if (!hits.length) continue;
+
+    const head = document.createElement('div');
+    head.className = 'info__group';
+    head.textContent = g.group;
+    el.infoList.appendChild(head);
+
+    // The note is the part of the group that is not any one entry. It shows
+    // whole, so a search that hits a group still explains it.
+    let note = g.note || '';
+    if (g.methods) {
+      note += methodApi
+        ? ' Click one to switch; the live one is marked, and the report names the method that actually ran.'
+        : ' The loaded app/pkg/ build has no solve_with, so these entries document the choice and copy their names — rebuild the WASM and they become buttons.';
+    }
+    if (note) {
+      const p = document.createElement('p');
+      p.className = 'info__note';
+      p.textContent = note;
+      el.infoList.appendChild(p);
+    }
+
+    for (const entry of hits) {
+      const item = document.createElement('div');
+      item.className = 'entry';
+      item.setAttribute('role', 'listitem');
+      if (entry.method && entry.method === currentMethod) item.classList.add('is-live');
+
+      const sig = document.createElement('span');
+      sig.className = 'entry__sig';
+      sig.textContent = entry.method && entry.method === currentMethod
+        ? entry.sig + '  ·  live'
+        : entry.sig;
+
+      const desc = document.createElement('span');
+      desc.className = 'entry__desc';
+      desc.textContent = entry.desc || '';
+
+      item.append(sig, desc);
+
+      if (entry.method) {
+        if (methodApi) {
+          const use = document.createElement('button');
+          use.type = 'button';
+          use.className = 'entry__act';
+          use.textContent = entry.method === currentMethod ? 'in use' : 'use';
+          use.title = 'Integrate with ' + entry.method;
+          use.addEventListener('click', (ev) => { ev.stopPropagation(); refPrimary(entry); });
+          item.appendChild(use);
+        }
+      } else if (entry.insert) {
+        const ins = document.createElement('button');
+        ins.type = 'button';
+        ins.className = 'entry__act';
+        ins.textContent = entry.asRow ? 'add row' : 'insert';
+        ins.title = entry.asRow
+          ? 'Write this row into the document'
+          : 'Type this into the row you were last in';
+        ins.addEventListener('click', (ev) => { ev.stopPropagation(); insertEntry(entry); });
+        item.appendChild(ins);
+      }
+
+      const copy = document.createElement('button');
+      copy.type = 'button';
+      copy.className = 'entry__act';
+      copy.textContent = 'copy';
+      copy.title = 'Copy to the clipboard';
+      copy.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        copyText(entry.insert || entry.sig);
+      });
+      item.appendChild(copy);
+
+      const index = refRendered.length;
+      item.addEventListener('click', () => refPrimary(entry));
+      item.addEventListener('pointerenter', () => selectRef(index));
+      refRendered.push({ entry, el: item });
+      el.infoList.appendChild(item);
+      shown++;
+    }
+  }
+
+  if (!shown) {
+    const none = document.createElement('p');
+    none.className = 'info__empty';
+    none.textContent = 'nothing matches “' + q + '”';
+    el.infoList.appendChild(none);
+  }
+
+  selectRef(shown ? 0 : -1);
+  refFoot(shown
+    ? shown + (shown === 1 ? ' entry' : ' entries') + '  ·  ↑ ↓ to move  ·  Enter inserts  ·  Esc closes'
+    : 'no match  ·  Esc closes');
+}
+
+function positionInfo() {
+  const r = el.infoBtn.getBoundingClientRect();
+  const w = el.info.offsetWidth || 440;
+  const left = clamp(r.right - w, 10, Math.max(10, window.innerWidth - w - 10));
+  el.info.style.left = left + 'px';
+  el.info.style.top = (r.bottom + 8) + 'px';
+}
+
+function openInfo() {
+  if (!el.info.hidden) return;
+  closeDemos();
+  closeSettings();
+  el.info.hidden = false;
+  el.infoBtn.setAttribute('aria-expanded', 'true');
+  renderReference();
+  positionInfo();
+  el.infoSearch.focus();
+  if (typeof el.infoSearch.select === 'function') el.infoSearch.select();
+}
+
+function closeInfo() {
+  if (el.info.hidden) return;
+  el.info.hidden = true;
+  el.infoBtn.setAttribute('aria-expanded', 'false');
+}
+
+function toggleInfo() {
+  if (el.info.hidden) openInfo(); else { closeInfo(); el.infoBtn.focus(); }
+}
+
+function wireInfo() {
+  el.infoBtn.addEventListener('click', toggleInfo);
+  el.infoClose.addEventListener('click', () => { closeInfo(); el.infoBtn.focus(); });
+  el.infoSearch.addEventListener('input', renderReference);
+
+  el.infoSearch.addEventListener('keydown', (e) => {
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      if (!refRendered.length) return;
+      const next = refSelection + (e.key === 'ArrowDown' ? 1 : -1);
+      selectRef((next + refRendered.length) % refRendered.length);
+      return;
+    }
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      const hit = refRendered[refSelection];
+      if (hit) refPrimary(hit.entry);
+    }
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -1836,8 +2648,8 @@ function wireDivider() {
 
 /**
  * Would this key belong to the thing that has focus? A field, an input - and a
- * button, because space is how a focused button is pressed and the transport
- * has no business stealing it.
+ * button, because space is how a focused button is pressed and play/pause has
+ * no business stealing it.
  */
 function isTypingTarget(node) {
   if (!node || node.nodeType !== 1) return false;
@@ -1849,8 +2661,13 @@ function isTypingTarget(node) {
 
 function wire() {
   collectChips();
-  renderChips();
+  applyViews();               // pushes the on-set at the plot for the first draw
   wireDivider();
+  wireCanvasGestures();
+  wireInfo();
+
+  el.frameReset.addEventListener('click', resetFrames);
+  el.frameFit.addEventListener('click', fitFrames);
 
   // Clicking the empty space below the list lands in the trailing blank row;
   // clicking a row's own margins lands at the end of that row. mousedown, not
@@ -1893,6 +2710,12 @@ function wire() {
 
   el.demosBtn.addEventListener('click', toggleDemos);
 
+  el.hearBtn.addEventListener('click', () => {
+    if (el.hearPanel.hidden) openHear(); else closeHear();
+  });
+  el.hearClose.addEventListener('click', () => { closeHear(); el.hearBtn.focus(); });
+  el.hearPlay.addEventListener('click', toggleHear);
+
   el.demomenu.addEventListener('keydown', (e) => {
     const items = Array.from(el.demomenu.querySelectorAll('.demoitem'));
     const i = items.indexOf(document.activeElement);
@@ -1905,10 +2728,27 @@ function wire() {
   });
 
   document.addEventListener('keydown', (e) => {
+    if (e.key === 'F1') {
+      e.preventDefault();
+      toggleInfo();
+      return;
+    }
+    if (e.key === 'Escape' && !el.hearPanel.hidden) {
+      e.preventDefault();
+      closeHear();
+      el.hearBtn.focus();
+      return;
+    }
     if (e.key === 'Escape' && !el.demomenu.hidden) {
       e.preventDefault();
       closeDemos();
       el.demosBtn.focus();
+      return;
+    }
+    if (e.key === 'Escape' && !el.info.hidden) {
+      e.preventDefault();
+      closeInfo();
+      el.infoBtn.focus();
       return;
     }
     if (e.key === 'Escape' && openSlider) {
@@ -1931,11 +2771,14 @@ function wire() {
         !dt.closest('.demomenu') && !dt.closest('#demos-btn')) {
       closeDemos();
     }
+    if (!el.info.hidden && dt && typeof dt.closest === 'function' &&
+        !dt.closest('.info') && !dt.closest('#info-btn')) {
+      closeInfo();
+    }
     if (!openSlider) return;
     const t = e.target;
     if (t && typeof t.closest === 'function' &&
-        (t.closest('.settings') || t.closest('.slider.is-open') ||
-         t.closest('.knob.is-open'))) return;
+        (t.closest('.settings') || t.closest('.knob.is-open'))) return;
     closeSettings();
   }, true);
 
@@ -1947,6 +2790,7 @@ function wire() {
 
   window.addEventListener('resize', () => {
     closeSettings();
+    if (!el.info.hidden) positionInfo();
     setDocWidth(docWidth, false);   // re-clamp; the user's choice is kept
     scheduleDraw();
   });
@@ -1983,6 +2827,11 @@ async function boot() {
     return;
   }
 
+  // `t` arrives with its slider already on, the way a demo's knobs do: the
+  // playhead is what the plot is for. It is an ordinary promotion, so the x on
+  // it puts `t` back to an offer like any other variable.
+  promoted.add('t');
+
   try {
     buildDemoMenu();
     buildRows(DEFAULT_DOC);
@@ -1990,14 +2839,6 @@ async function boot() {
     fail('The math field would not mount.', err);
     return;
   }
-
-  // the time slider exists from the first frame: `t` is a slider like any other
-  makeTimeSlider({
-    min: state.t0,
-    max: state.t1,
-    step: niceStepFor(state.t1 - state.t0),
-    value: state.t,
-  });
 
   // 2. the compute core
   let mod;
@@ -2039,6 +2880,8 @@ async function boot() {
       sample:    bindMethod(model, 'sample'),
       eval:      bindMethod(model, 'eval'),
     };
+    // Probed, never assumed: app/pkg/ can be older than the crate.
+    methodApi = probeMethodApi(model, mod.Model);
   } catch (err) {
     fail('The WASM module does not match docs/wasm-api.md.', err);
     return;

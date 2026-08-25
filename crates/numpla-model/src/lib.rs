@@ -12,16 +12,28 @@
 //!    muted; only genuinely broken rows go red.
 //! 3. **A solution is a function of `t`.** Sampling and scrubbing both read the
 //!    dense output rather than a stored point list.
+//! 4. **The method is the user's choice, and the report says which one ran.**
+//!    No fixed-step integrator preserves the symplectic form, momentum and
+//!    energy at once (Ge–Marsden, `docs/solvers.md`); which one a method gives
+//!    up is the most useful thing a long run can teach, so swapping integrators
+//!    is one argument and the answer never claims to be something it is not.
 
+pub mod conserve;
 pub mod document;
 pub mod report;
 pub mod system;
 
-pub use document::{Document, StateRhs};
-pub use report::{Diagnostics, Fix, Issue, Severity, SolveReport, StepJson, TelemetryJson};
+pub use document::{Derived, Document, StateRhs};
+pub use report::{
+    ConservationReport, Diagnostics, Drift, Fix, Issue, MethodJson, MethodsJson, Severity,
+    SolveReport, StepJson, TelemetryJson,
+};
 pub use system::ModelSystem;
 
-use numpla_ode::{solve, Opts, SolveError, Solution};
+/// Re-exported so that choosing a method costs a caller nothing but this crate.
+pub use numpla_ode::Method;
+
+use numpla_ode::{solve, solve_with as solve_second_order, Opts, Paired, SolveError, Solution};
 
 /// How many steps the solver is forced to take, at minimum, across the
 /// requested span.
@@ -34,11 +46,42 @@ use numpla_ode::{solve, Opts, SolveError, Solution};
 /// the requested window means the guarantee scales with what is being drawn.
 const MIN_STEPS_ACROSS_SPAN: f64 = 100.0;
 
+/// How many steps a fixed-step method takes across the requested span when
+/// nobody has said otherwise.
+///
+/// Verlet and Yoshida4 have no error estimate to size their own step with, so
+/// this number *is* their accuracy and it has to be chosen rather than
+/// defaulted to something round.
+///
+/// It was picked against the one thing the slider must not do: change the frame
+/// time. Tsit5 at its default tolerance settles near thirty accepted steps per
+/// oscillation for a smooth system, at six right-hand-side evaluations each —
+/// so roughly 170 evaluations per oscillation. Five thousand fixed steps across
+/// the visible window costs Verlet one evaluation per step and Yoshida4 three,
+/// which lands in the same range for a window with tens of oscillations in it.
+/// Dragging from one method to the next then changes the *shape* of the error
+/// and not the cost of getting it, which is the comparison the slider exists to
+/// make.
+///
+/// It is tied to the span for the same reason `dt_max` is: the visible window
+/// is the only scale available before the system has been integrated once. The
+/// consequence is honest and worth stating — a wider window is a coarser step,
+/// so a symplectic energy band *widens* as you zoom out. That is a true fact
+/// about fixed-step integration rather than an artefact, and the band stays
+/// flat across the run either way, which is the property being shown.
+const FIXED_STEPS_ACROSS_SPAN: f64 = 5000.0;
+
 /// A document plus its most recent solution.
 #[derive(Debug, Clone, Default)]
 pub struct Model {
     doc: Document,
     solution: Option<Solution>,
+    /// The method that produced [`Model::solution`]. Kept so nothing downstream
+    /// has to be told twice.
+    method: Option<Method>,
+    /// The most recent conservation measurement, so its series can cross the
+    /// boundary as a `Float64Array` rather than as JSON.
+    conservation: Option<(ConservationReport, Vec<f64>)>,
 }
 
 impl Model {
@@ -53,7 +96,7 @@ impl Model {
     /// shape, and stale samples drawn against a new model would be a lie.
     pub fn set_source(&mut self, src: &str) -> Diagnostics {
         self.doc = document::compile(src);
-        self.solution = None;
+        self.forget_solution();
         self.doc.diagnostics()
     }
 
@@ -61,12 +104,48 @@ impl Model {
         to_json(&self.set_source(src))
     }
 
-    /// Integrate over `[t0, t1]`. Safe to call on a document that cannot be
-    /// integrated — that comes back as `ok: false` with a sentence saying why.
+    /// Integrate over `[t0, t1]` with the default method. Safe to call on a
+    /// document that cannot be integrated — that comes back as `ok: false` with
+    /// a sentence saying why.
     pub fn solve(&mut self, t0: f64, t1: f64) -> SolveReport {
-        self.solution = None;
+        self.solve_with(t0, t1, Method::Tsit5)
+    }
+
+    pub fn solve_json(&mut self, t0: f64, t1: f64) -> String {
+        to_json(&self.solve(t0, t1))
+    }
+
+    /// Integrate over `[t0, t1]` with a chosen integrator.
+    ///
+    /// # Why the method is an argument and not a setting
+    ///
+    /// The mode slider's whole purpose is to put two answers to the same
+    /// question side by side, so the call that produces an answer is the right
+    /// place to say which method produced it. A setter would let the stored
+    /// choice and the drawn curve disagree for as long as it took someone to
+    /// call `solve` again — which is precisely the lie
+    /// [`SolveReport::method`] exists to make impossible. An options object
+    /// would cost a JSON parse on the hottest path in the product and could not
+    /// be checked by the type system on the Rust side. One argument, one
+    /// answer, and the report echoes what ran.
+    ///
+    /// # When the document has no second-order structure
+    ///
+    /// A symplectic method needs to know which states are positions and which
+    /// are their velocities; a document of plain `x' = ...` rows does not say.
+    /// That is reported as a failed solve rather than quietly satisfied by
+    /// running Tsit5 instead. Falling back would draw a Tsit5 curve under a
+    /// label reading "Verlet" — and since the two curves for a well-behaved
+    /// system look identical for the first few periods, the person would learn
+    /// the opposite of what the slider is there to teach. `ok: false` with a
+    /// sentence naming the missing structure costs a blank plot and teaches
+    /// the actual lesson: symplectic integration is a property of how the model
+    /// is *written*, not a setting to be turned on.
+    pub fn solve_with(&mut self, t0: f64, t1: f64, method: Method) -> SolveReport {
+        self.forget_solution();
         let states = self.doc.states.clone();
         let dim = self.doc.dim();
+        let name = method.name().to_string();
         let fail = |error: String| SolveReport {
             ok: false,
             t0,
@@ -76,6 +155,11 @@ impl Model {
             accepted: 0,
             rejected: 0,
             rhs_evals: 0,
+            method: name.clone(),
+            // Nothing ran, so nothing was preserved. Saying `true` here because
+            // the method is nominally symplectic would be the report's one
+            // chance to lie.
+            symplectic: false,
             error: Some(error),
         };
 
@@ -97,10 +181,50 @@ impl Model {
         let sys = ModelSystem::new(&self.doc);
         let opts = Opts {
             dt_max: step_cap(t0, t1),
+            // Fixed-step methods take their step from here and have nothing
+            // else to go on; the adaptive one picks its own first step.
+            dt0: (!method.is_adaptive()).then(|| fixed_step(t0, t1)),
             ..Default::default()
         };
 
-        match solve(&sys, (t0, t1), &self.doc.y0, &opts) {
+        // `reads_velocity` is answered from the document, exactly, before the
+        // solver is built: a damped row costs an extra acceleration evaluation
+        // per step to stay second order, and there is nothing symplectic left
+        // to preserve. Guessing `true` would tax every undamped oscillator;
+        // guessing `false` would silently drop a damped one to first order.
+        let velocity_dependent = self.doc.reads_velocity();
+        let outcome = if method.is_adaptive() {
+            solve(&sys, (t0, t1), &self.doc.y0, &opts)
+        } else {
+            match self.doc.pairs() {
+                Err(why) => {
+                    return fail(format!(
+                        "{} needs second-order rows — {}. Write it as `x'' = ...`, or choose {}",
+                        name,
+                        why,
+                        Method::Tsit5.name()
+                    ))
+                }
+                Ok(pairs) => {
+                    // `Paired` re-checks the pairing against the interleaved
+                    // layout the whole product speaks. It cannot fail for a
+                    // pairing this crate produced — which is the point of
+                    // stating it rather than letting the solver infer one.
+                    let paired = match Paired::new(&sys, &pairs) {
+                        Ok(p) => p,
+                        Err(e) => return fail(format!("internal error: {}", e)),
+                    };
+                    let paired = if velocity_dependent {
+                        paired.reading_velocity()
+                    } else {
+                        paired
+                    };
+                    solve_second_order(method, &paired, (t0, t1), &self.doc.y0, &opts)
+                }
+            }
+        };
+
+        match outcome {
             Ok(solution) => {
                 // A right-hand side cannot fail outward, so a failure recorded
                 // during the run outranks an integration that merely finished.
@@ -109,6 +233,7 @@ impl Model {
                 }
                 let telemetry = solution.telemetry.clone();
                 self.solution = Some(solution);
+                self.method = Some(method);
                 SolveReport {
                     ok: true,
                     t0,
@@ -118,6 +243,8 @@ impl Model {
                     accepted: telemetry.accepted,
                     rejected: telemetry.rejected,
                     rhs_evals: telemetry.rhs_evals,
+                    method: name,
+                    symplectic: method.is_symplectic() && !velocity_dependent,
                     error: None,
                 }
             }
@@ -125,8 +252,50 @@ impl Model {
         }
     }
 
-    pub fn solve_json(&mut self, t0: f64, t1: f64) -> String {
-        to_json(&self.solve(t0, t1))
+    pub fn solve_with_json(&mut self, t0: f64, t1: f64, method: Method) -> String {
+        to_json(&self.solve_with(t0, t1, method))
+    }
+
+    /// Integrate with a method named by string — the shape the slider sends.
+    ///
+    /// An unknown name is a report, not a panic and not a silent default: a
+    /// shell that sends "verlet5" gets told so, rather than watching Tsit5 draw
+    /// under the wrong label.
+    pub fn solve_named(&mut self, t0: f64, t1: f64, method: &str) -> SolveReport {
+        match method_named(method) {
+            Some(m) => self.solve_with(t0, t1, m),
+            None => SolveReport {
+                ok: false,
+                t0,
+                t1,
+                dim: self.doc.dim(),
+                states: self.doc.states.clone(),
+                accepted: 0,
+                rejected: 0,
+                rhs_evals: 0,
+                // Echoed verbatim, because the name is the thing that was wrong.
+                method: method.to_string(),
+                symplectic: false,
+                error: Some(format!(
+                    "there is no method called {} — try {}",
+                    method,
+                    Method::ALL
+                        .iter()
+                        .map(|m| m.name())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )),
+            },
+        }
+    }
+
+    pub fn solve_named_json(&mut self, t0: f64, t1: f64, method: &str) -> String {
+        to_json(&self.solve_named(t0, t1, method))
+    }
+
+    /// Which method produced the current solution, if there is one.
+    pub fn method(&self) -> Option<Method> {
+        self.method
     }
 
     /// Uniformly sample the last solution: `n` points, flattened row-major as
@@ -190,11 +359,117 @@ impl Model {
         to_json(&self.telemetry())
     }
 
+    /// Track a named row along the current solution and report its drift.
+    ///
+    /// This is the conservation monitor's whole input surface. The quantity is
+    /// a row the person wrote — `E = 0.5(x'^2 + x^2)` — because the invariant
+    /// worth watching is a property of the model, not of the software: energy,
+    /// momentum, a Casimir and the Lotka–Volterra `V` are all the same shape of
+    /// row, and building one of them in would have been picking a favourite.
+    /// A state name or a constant is accepted too; asking whether a state is
+    /// constant is the same question asked about a simpler expression.
+    ///
+    /// `samples` is a **floor, not a quota**. Ask for a monitor's pixel width
+    /// and you may get considerably more, because a pixel count is a fact about
+    /// a screen and aliasing is a fact about the system: sampling a conserved
+    /// quantity a few times per oscillation reports a drift that is not there
+    /// (`numpla-ode`'s `conserve` measured a nineteenfold phantom growth at two
+    /// samples per period). Pass 0 to leave the choice entirely to the model.
+    /// [`ConservationReport::samples`] says what was actually taken.
+    pub fn conservation(&mut self, name: &str, samples: usize) -> ConservationReport {
+        self.conservation = None;
+        let Some(sol) = &self.solution else {
+            return ConservationReport {
+                ok: false,
+                name: name.to_string(),
+                samples: 0,
+                initial: f64::NAN,
+                drift: Drift::default(),
+                at_steps: Drift::default(),
+                error: Some("nothing has been integrated yet".to_string()),
+            };
+        };
+        let (report, series) = conserve::measure_named(&self.doc, sol, name, samples);
+        self.conservation = Some((report.clone(), series));
+        report
+    }
+
+    pub fn conservation_json(&mut self, name: &str, samples: usize) -> String {
+        to_json(&self.conservation(name, samples))
+    }
+
+    /// The series behind the last [`Model::conservation`] call, flattened as
+    /// `[t, value]` pairs. Empty if the last measurement failed or none has
+    /// been made.
+    ///
+    /// Separate from the report for the reason every bulk array is: it crosses
+    /// into JS as one `Float64Array`, and a few thousand numbers spelled out in
+    /// a JSON string would be parsed on every drag of the slider.
+    pub fn conservation_series(&self) -> Vec<f64> {
+        match &self.conservation {
+            Some((_, series)) => series.clone(),
+            None => Vec::new(),
+        }
+    }
+
+    /// The methods a document can be solved with, in slider order.
+    ///
+    /// Answered by the model rather than hard-coded in the shell so that a
+    /// method added to `numpla-ode` reaches the slider without a second edit —
+    /// and so the UI's labels for "adaptive" and "symplectic" come from the
+    /// implementation instead of from someone's memory of it.
+    pub fn methods() -> MethodsJson {
+        MethodsJson {
+            methods: Method::ALL
+                .iter()
+                .map(|m| MethodJson {
+                    name: m.name().to_string(),
+                    adaptive: m.is_adaptive(),
+                    symplectic: m.is_symplectic(),
+                    order: m.order(),
+                })
+                .collect(),
+        }
+    }
+
+    pub fn methods_json() -> String {
+        to_json(&Model::methods())
+    }
+
     /// The compiled document, for callers that want the typed form rather than
     /// the wire form.
     pub fn document(&self) -> &Document {
         &self.doc
     }
+
+    /// Everything downstream of a solution, dropped together.
+    ///
+    /// A conservation series outliving the solution it was measured on is the
+    /// same class of bug as a stale sample: a plot of numbers that no longer
+    /// describe anything on screen.
+    fn forget_solution(&mut self) {
+        self.solution = None;
+        self.method = None;
+        self.conservation = None;
+    }
+}
+
+/// A method by the name the wire uses. Case-insensitive, because a slider label
+/// and an enum spelling are not the same kind of thing and only one of them is
+/// anybody's business.
+pub fn method_named(name: &str) -> Option<Method> {
+    Method::ALL
+        .iter()
+        .copied()
+        .find(|m| m.name().eq_ignore_ascii_case(name.trim()))
+}
+
+/// The step a fixed-step method takes across `[t0, t1]`.
+///
+/// Zero-width spans are left to the solver, which returns an empty solution at
+/// `t0` before it ever looks at the step.
+fn fixed_step(t0: f64, t1: f64) -> f64 {
+    (t1 - t0).abs() / FIXED_STEPS_ACROSS_SPAN
 }
 
 fn step_cap(t0: f64, t1: f64) -> f64 {
@@ -238,6 +513,14 @@ fn to_json<T: serde::Serialize>(value: &T) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The exact damped oscillator `x'' = -x - 2 zeta x'` with `x(0) = 1`,
+    /// `x'(0) = 0`, written once because two tests want it.
+    fn damped(t: f64) -> f64 {
+        let (zeta, w0) = (0.2f64, 1.0f64);
+        let wd = w0 * (1.0 - zeta * zeta).sqrt();
+        (-zeta * w0 * t).exp() * ((wd * t).cos() + (zeta * w0 / wd) * (wd * t).sin())
+    }
 
     fn solved(src: &str, t0: f64, t1: f64) -> Model {
         let mut m = Model::new();
@@ -326,16 +609,16 @@ mod tests {
         // bound under the key `x'` resolves to.
         let src = "x'' = -x - 0.4x'\nx(0) = 1";
         let m = solved(src, 0.0, 12.0);
-        let exact = |t: f64| {
-            let (zeta, w0) = (0.2f64, 1.0f64);
-            let wd = w0 * (1.0 - zeta * zeta).sqrt();
-            (-zeta * w0 * t).exp() * (wd * t).cos()
-                + (zeta * w0 / wd) * (-zeta * w0 * t).exp() * (wd * t).sin()
-        };
         for i in 0..=60 {
             let t = 12.0 * (i as f64) / 60.0;
             let got = m.eval(t)[0];
-            assert!((got - exact(t)).abs() < 1e-5, "at t={}: {} vs {}", t, got, exact(t));
+            assert!(
+                (got - damped(t)).abs() < 1e-5,
+                "at t={}: {} vs {}",
+                t,
+                got,
+                damped(t)
+            );
         }
         // Damped: the amplitude at the end is a fraction of the start.
         assert!(m.eval(12.0)[0].abs() < 0.2);
@@ -558,11 +841,13 @@ mod tests {
     }
 
     /// Nothing is proposed for a name the document already gives a meaning to
-    /// — a constant called `x` would be a second thing under the state's name.
+    /// — a constant called `f` would be a second thing under the function's
+    /// name, which is worse than the red row it replaced.
     #[test]
     fn no_definition_is_proposed_for_a_name_the_document_already_uses() {
-        let issues = issues_on("x' = 1\nk = x\nx(0) = 0");
+        let issues = issues_on("f(u) = 2u\nx' = f(x)\nk = f\nx(0) = 0");
         assert_eq!(issues.len(), 1, "{:?}", issues);
+        assert_eq!(issues[0].line, 2);
         assert_eq!(issues[0].severity, Severity::Error);
         assert!(issues[0].fix.is_none(), "{:?}", issues[0]);
     }
@@ -780,6 +1065,353 @@ mod tests {
         assert!(m.sample(4).is_empty(), "stale samples survived an edit");
     }
 
+    // --- choosing a method -------------------------------------------------
+
+    /// The property the mode slider rests on: the choice of integrator changes
+    /// the error, not the answer. Same document, same state layout, same dense
+    /// output, three trajectories that agree to well under a pixel.
+    #[test]
+    fn every_method_integrates_the_same_second_order_document() {
+        for method in Method::ALL {
+            let mut m = Model::new();
+            m.set_source("x'' = -x\nx(0) = 1");
+            let r = m.solve_with(0.0, 20.0, method);
+            assert!(r.ok, "{}: {:?}", method, r.error);
+            assert_eq!(r.dim, 2);
+            assert_eq!(r.method, method.name());
+            for i in 0..=40 {
+                let t = 20.0 * (i as f64) / 40.0;
+                let y = m.eval(t);
+                assert!(
+                    (y[0] - t.cos()).abs() < 1e-3 && (y[1] + t.sin()).abs() < 1e-3,
+                    "{} at t={}: {:?}",
+                    method,
+                    t,
+                    y
+                );
+            }
+        }
+    }
+
+    /// `symplectic` answers "did this run preserve the form", which is not the
+    /// same question as "is this method symplectic". Damping is the case where
+    /// they part company, and the report must not round it off.
+    #[test]
+    fn the_report_says_what_the_run_preserved_not_what_the_method_usually_does() {
+        let mut m = Model::new();
+        m.set_source("x'' = -x\nx(0) = 1");
+        assert!(m.solve_with(0.0, 10.0, Method::Verlet).symplectic);
+        assert!(!m.solve_with(0.0, 10.0, Method::Tsit5).symplectic);
+
+        // The same method, a system with nothing left to preserve.
+        m.set_source("x'' = -x - 0.4x'\nx(0) = 1");
+        let r = m.solve_with(0.0, 10.0, Method::Verlet);
+        assert!(r.ok, "{:?}", r.error);
+        assert_eq!(r.method, "Verlet");
+        assert!(!r.symplectic, "damping has no symplectic structure to keep");
+    }
+
+    /// The honest failure. A document of first-order rows never said which
+    /// states are positions, so there is no structure to preserve — and that is
+    /// reported rather than quietly answered by running Tsit5 under a label
+    /// reading "Verlet".
+    #[test]
+    fn a_first_order_document_cannot_be_integrated_symplectically() {
+        let mut m = Model::new();
+        m.set_source("x' = -y\ny' = x\nx(0) = 1\ny(0) = 0");
+        for method in [Method::Verlet, Method::Yoshida4] {
+            let r = m.solve_with(0.0, 10.0, method);
+            assert!(!r.ok, "{} should refuse a first-order document", method);
+            assert_eq!(r.method, method.name());
+            assert!(!r.symplectic);
+            let e = r.error.unwrap();
+            assert!(e.contains("second-order"), "{}", e);
+            assert!(e.contains("x''"), "{}", e);
+            assert!(e.contains("Tsit5"), "{}", e);
+            // and nothing is left behind for the plot to draw
+            assert!(m.sample(10).is_empty());
+            assert!(m.method().is_none());
+        }
+        // The same document integrates perfectly well with the adaptive method.
+        assert!(m.solve_with(0.0, 10.0, Method::Tsit5).ok);
+    }
+
+    /// One first-order row among second-order ones is enough: the state vector
+    /// is then not a sequence of position/velocity pairs, and pairing what is
+    /// left would integrate a system nobody wrote.
+    #[test]
+    fn a_document_that_mixes_orders_is_refused_by_name() {
+        let mut m = Model::new();
+        m.set_source("y'' = -y\nx' = 1\ny(0) = 1");
+        let r = m.solve_with(0.0, 10.0, Method::Verlet);
+        assert!(!r.ok);
+        let e = r.error.unwrap();
+        assert!(e.contains('x'), "{}", e);
+    }
+
+    /// Answered from the row, exactly. The velocity is a named state, so this
+    /// is a question about a dependency set and not a guess — and the answer
+    /// costs an extra acceleration evaluation per step, which is why guessing
+    /// `true` would be a tax on every undamped oscillator there is.
+    #[test]
+    fn velocity_dependence_is_read_off_the_row_rather_than_assumed() {
+        let reads = |src: &str| {
+            let mut m = Model::new();
+            m.set_source(src);
+            m.document().reads_velocity()
+        };
+        assert!(!reads("x'' = -x"), "a force law in x alone reads no velocity");
+        assert!(reads("x'' = -x - 0.4x'"), "damping reads the velocity");
+        // Through a user function, whose body is where the velocity is read.
+        assert!(reads("f(u) = -u - 0.4x'\nx'' = f(x)"));
+        // ...and as an argument to one.
+        assert!(reads("f(u) = -0.4u\nx'' = -x + f(x')"));
+        // A parameter shadows the state it is spelled like: this is `-u`, not
+        // a reference to anything of the model's.
+        assert!(!reads("f(u) = -u\nx'' = f(x)"));
+        // Any acceleration row counts, not just the first.
+        assert!(reads("x'' = -x\ny'' = -y - 0.3y'"));
+        // The position row of a lowered pair is `x' = v` by construction. If
+        // that counted, every second-order document would answer yes.
+        assert!(!reads("x'' = -x\ny'' = -y"));
+        // A document with no second-order structure has no velocity to read.
+        assert!(!reads("x' = -y\ny' = x"));
+    }
+
+    /// The cost side of the same answer, visible in the telemetry: a
+    /// conservative row is one acceleration evaluation per step, a damped one
+    /// pays for the extra fixed-point iteration that keeps it second order.
+    /// This is the only place the answer's *effect* can be observed from
+    /// outside, which is why it is asserted rather than trusted.
+    #[test]
+    fn a_velocity_dependent_row_costs_extra_evaluations_and_stays_second_order() {
+        let mut m = Model::new();
+        m.set_source("x'' = -x\nx(0) = 1");
+        let plain = m.solve_with(0.0, 12.0, Method::Verlet);
+        assert!(plain.rhs_evals <= plain.accepted + 1, "{:?}", plain);
+
+        m.set_source("x'' = -x - 0.4x'\nx(0) = 1");
+        let damp = m.solve_with(0.0, 12.0, Method::Verlet);
+        assert!(damp.ok, "{:?}", damp.error);
+        assert!(
+            damp.rhs_evals > 2 * damp.accepted,
+            "the iterated kick should cost more: {:?}",
+            damp
+        );
+        // And second order is genuinely retained — half a step's worth of
+        // error, not a whole one.
+        for i in 0..=60 {
+            let t = 12.0 * (i as f64) / 60.0;
+            let got = m.eval(t)[0];
+            assert!(
+                (got - damped(t)).abs() < 1e-4,
+                "at t={}: {} vs {}",
+                t,
+                got,
+                damped(t)
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_method_name_is_reported_rather_than_defaulted() {
+        let mut m = Model::new();
+        m.set_source("x'' = -x\nx(0) = 1");
+        let r = m.solve_named(0.0, 10.0, "verlet5");
+        assert!(!r.ok);
+        // Echoed verbatim: the name is the thing that was wrong.
+        assert_eq!(r.method, "verlet5");
+        let e = r.error.unwrap();
+        assert!(e.contains("Verlet") && e.contains("Tsit5"), "{}", e);
+        // The spelling a slider label would send is accepted.
+        assert!(m.solve_named(0.0, 10.0, "verlet").ok);
+        assert!(m.solve_named(0.0, 10.0, " Yoshida4 ").ok);
+    }
+
+    #[test]
+    fn the_method_list_describes_the_implementation_not_a_copy_of_it() {
+        let list = Model::methods();
+        assert_eq!(list.methods.len(), Method::ALL.len());
+        assert_eq!(list.methods[0].name, "Tsit5");
+        assert!(list.methods[0].adaptive && !list.methods[0].symplectic);
+        assert!(list.methods.iter().skip(1).all(|m| m.symplectic));
+        assert!(list.methods.iter().all(|m| m.order >= 2));
+    }
+
+    // --- conservation ------------------------------------------------------
+
+    /// An energy row is a row like any other. Before the monitor existed this
+    /// went red — a name used with nothing behind it — and that was the wrong
+    /// answer: it has a value everywhere along the solution, just not before
+    /// there is one.
+    #[test]
+    fn an_energy_row_is_a_function_of_the_solution_not_a_mistake() {
+        let mut m = Model::new();
+        let d = m.set_source("x'' = -x\nx(0) = 1\nx'(0) = 0\nE = 0.5(x'^2 + x^2)");
+        assert!(d.issues.is_empty(), "{:?}", d.issues);
+        assert_eq!(d.derived, vec!["E".to_string()]);
+        // Not a constant, so not offered as one.
+        assert!(d.params.is_empty(), "{:?}", d.params);
+        assert!(m.solve(0.0, 10.0).ok);
+    }
+
+    /// Nobody writes an energy in one line. `E = K + U` has to work, which
+    /// means the derived rows relax against each other at every sample.
+    #[test]
+    fn a_derived_quantity_can_be_written_in_named_pieces() {
+        let mut m = Model::new();
+        let d = m.set_source("x'' = -x\nx(0) = 1\nx'(0) = 0\nK = 0.5x'^2\nU = 0.5x^2\nE = K + U");
+        assert!(d.issues.is_empty(), "{:?}", d.issues);
+        assert_eq!(d.derived, vec!["K".to_string(), "U".to_string(), "E".to_string()]);
+        assert!(m.solve_with(0.0, 20.0, Method::Yoshida4).ok);
+        let c = m.conservation("E", 0);
+        assert!(c.ok, "{:?}", c.error);
+        assert!((c.initial - 0.5).abs() < 1e-12, "{:?}", c);
+        assert!(c.drift.relative_drift < 1e-5, "{:?}", c.drift);
+    }
+
+    /// The whole point of the slider, in one document: the same typed energy,
+    /// three integrators, and only the symplectic ones keep it in a band that
+    /// is no wider at the end of the run than at the start.
+    #[test]
+    fn only_the_symplectic_methods_keep_a_typed_energy_bounded() {
+        for method in Method::ALL {
+            let mut m = Model::new();
+            m.set_source("x'' = -x\nx(0) = 1\nE = 0.5(x'^2 + x^2)");
+            let r = m.solve_with(0.0, 200.0, method);
+            assert!(r.ok, "{}: {:?}", method, r.error);
+            let c = m.conservation("E", 0);
+            assert!(c.ok, "{}: {:?}", method, c.error);
+            assert_eq!(c.name, "E");
+            assert!((c.initial - 0.5).abs() < 1e-12, "{}: {:?}", method, c);
+            if method.is_symplectic() {
+                assert!(
+                    c.drift.secular_ratio < 2.0,
+                    "{} should stay in a band, ratio {}",
+                    method,
+                    c.drift.secular_ratio
+                );
+            } else {
+                assert!(
+                    c.drift.secular_ratio > 3.0,
+                    "{} should drift, ratio {}",
+                    method,
+                    c.drift.secular_ratio
+                );
+            }
+        }
+    }
+
+    /// A first-order document has its invariants too — this one is exactly the
+    /// unit circle — and the monitor does not care how the rows were written.
+    #[test]
+    fn an_invariant_of_a_first_order_document_measures_just_as_well() {
+        let mut m = Model::new();
+        m.set_source("x' = -y\ny' = x\nx(0) = 1\ny(0) = 0\nR = x^2 + y^2");
+        assert!(m.solve(0.0, 50.0).ok);
+        let c = m.conservation("R", 0);
+        assert!(c.ok, "{:?}", c.error);
+        assert_eq!(c.initial, 1.0);
+        assert!(c.drift.relative_drift < 1e-4, "{:?}", c.drift);
+        // A state and a constant are measurable too — "is my momentum actually
+        // constant" is the same question about a simpler expression.
+        assert!(m.conservation("x", 0).ok);
+        m.set_source("k = 2\nx' = -k x\nx(0) = 1");
+        assert!(m.solve(0.0, 1.0).ok);
+        let c = m.conservation("k", 0);
+        assert!(c.ok, "{:?}", c.error);
+        assert_eq!(c.drift.max_abs_deviation, 0.0);
+    }
+
+    /// Both summaries are reported because they answer different questions.
+    /// Lotka–Volterra's `V` is conserved by the true flow and not by Tsit5, and
+    /// the gap between the two figures is the cubic Hermite between step
+    /// points — interpolation, not the method losing the invariant.
+    #[test]
+    fn the_step_point_summary_is_separate_from_the_curve_that_is_drawn() {
+        let mut m = Model::new();
+        m.set_source(
+            "x' = x - x y\ny' = x y - y\nx(0) = 1.2\ny(0) = 0.8\nV = x - ln(x) + y - ln(y)",
+        );
+        assert!(m.solve(0.0, 200.0).ok);
+        let c = m.conservation("V", 0);
+        assert!(c.ok, "{:?}", c.error);
+        assert!(
+            c.at_steps.max_abs_deviation < c.drift.max_abs_deviation,
+            "the interpolant should account for the difference: {:?}",
+            c
+        );
+        // ...and they tell the same story about the method, which is what makes
+        // the difference safe to report rather than alarming.
+        assert!(c.drift.secular_ratio > 2.0 && c.at_steps.secular_ratio > 2.0, "{:?}", c);
+    }
+
+    /// The sample count is a floor to be raised, never an instruction to be
+    /// obeyed downwards. A monitor asking for its pixel width is asking a
+    /// question about a screen; aliasing is a question about the system.
+    #[test]
+    fn a_request_for_too_few_samples_is_raised_rather_than_honoured() {
+        let mut m = Model::new();
+        m.set_source("x'' = -x\nx(0) = 1\nE = 0.5(x'^2 + x^2)");
+        assert!(m.solve_with(0.0, 200.0, Method::Verlet).ok);
+        let coarse = m.conservation("E", 10);
+        assert!(coarse.samples > 1000, "{:?}", coarse);
+        assert_eq!(coarse.samples, m.conservation_series().len() / 2);
+        // Undersampled deliberately, this same run reports a band that grows
+        // out of nothing — which is exactly what the floor prevents.
+        let asked = m.conservation("E", 0).samples;
+        assert!(asked >= 1000);
+        // A caller that genuinely wants more still gets more.
+        assert_eq!(m.conservation("E", 30_000).samples, 30_000);
+    }
+
+    #[test]
+    fn the_series_is_flat_time_stamped_pairs_and_dies_with_its_solution() {
+        let mut m = Model::new();
+        m.set_source("x'' = -x\nx(0) = 1\nE = 0.5(x'^2 + x^2)");
+        assert!(m.conservation_series().is_empty());
+        assert!(m.solve(0.0, 10.0).ok);
+        let c = m.conservation("E", 0);
+        let s = m.conservation_series();
+        assert_eq!(s.len(), 2 * c.samples);
+        assert_eq!(s[0], 0.0);
+        assert!((s[1] - c.initial).abs() < 1e-12);
+        assert!((s[s.len() - 2] - 10.0).abs() < 1e-9);
+        // Re-solving invalidates it: a drift curve outliving the trajectory it
+        // was measured on is the same bug as a stale sample.
+        assert!(m.solve(0.0, 20.0).ok);
+        assert!(m.conservation_series().is_empty());
+        m.set_source("x'' = -x\nx(0) = 1");
+        assert!(m.conservation_series().is_empty());
+    }
+
+    #[test]
+    fn measuring_something_that_is_not_there_reports_rather_than_failing() {
+        let mut m = Model::new();
+        m.set_source("x'' = -x\nx(0) = 1\nE = 0.5(x'^2 + x^2)");
+        // Nothing integrated yet.
+        let c = m.conservation("E", 0);
+        assert!(!c.ok);
+        assert!(c.error.unwrap().contains("integrated"));
+
+        assert!(m.solve(0.0, 10.0).ok);
+        let c = m.conservation("Q", 0);
+        assert!(!c.ok);
+        let e = c.error.unwrap();
+        assert!(e.contains('Q'), "{}", e);
+        assert!(m.conservation_series().is_empty());
+    }
+
+    /// A typo inside an energy row is found when it is typed, not when the
+    /// monitor is opened — the probe pass evaluates derived rows too.
+    #[test]
+    fn a_broken_derived_row_is_reported_like_any_other() {
+        let issues = issues_on("x'' = -x\nx(0) = 1\nx'(0) = 0\nE = 0.5(x'^2 + q)");
+        assert_eq!(issues.len(), 1, "{:?}", issues);
+        assert_eq!(issues[0].line, 3);
+        assert!(issues[0].message.contains('q'), "{:?}", issues[0]);
+    }
+
     // --- the wire shapes --------------------------------------------------
 
     #[test]
@@ -871,5 +1503,77 @@ mod tests {
         let json = m.telemetry_json();
         assert!(json.starts_with("{\"steps\":[{\"t\":0.0,\"dt\":"), "{}", json);
         assert!(json.contains("\"accepted\":true"), "{}", json);
+    }
+
+    /// The two fields the shell needs in order never to label a curve with a
+    /// method that did not draw it.
+    #[test]
+    fn the_solve_report_carries_the_method_on_the_wire() {
+        let mut m = Model::new();
+        m.set_source("x'' = -x\nx(0) = 1\nx'(0) = 0");
+        let json = m.solve_with_json(0.0, 20.0, Method::Yoshida4);
+        assert!(json.contains(r#""method":"Yoshida4""#), "{}", json);
+        assert!(json.contains(r#""symplectic":true"#), "{}", json);
+
+        let json = m.solve_named_json(0.0, 20.0, "Tsit5");
+        assert!(json.contains(r#""method":"Tsit5""#), "{}", json);
+        assert!(json.contains(r#""symplectic":false"#), "{}", json);
+
+        // A refusal is still a report, and still names what was asked for.
+        m.set_source("x' = 1");
+        let json = m.solve_with_json(0.0, 20.0, Method::Verlet);
+        assert!(json.contains(r#""ok":false"#), "{}", json);
+        assert!(json.contains(r#""method":"Verlet""#), "{}", json);
+    }
+
+    #[test]
+    fn the_conservation_report_matches_the_contract() {
+        let mut m = Model::new();
+        m.set_source("x'' = -x\nx(0) = 1\nx'(0) = 0\nE = 0.5(x'^2 + x^2)");
+        assert!(m.solve_with(0.0, 20.0, Method::Verlet).ok);
+        let json = m.conservation_json("E", 0);
+        assert!(json.starts_with(r#"{"ok":true,"name":"E","samples":"#), "{}", json);
+        assert!(json.contains(r#""initial":0.5"#), "{}", json);
+        for key in [
+            "\"drift\":{",
+            "\"atSteps\":{",
+            "\"maxAbsDeviation\":",
+            "\"relativeDrift\":",
+            "\"netDrift\":",
+            "\"secularRatio\":",
+            "\"error\":null",
+        ] {
+            assert!(json.contains(key), "{} missing from {}", key, json);
+        }
+        // The series is deliberately not in the JSON — bulk numbers cross as a
+        // Float64Array, and a few thousand of them spelled out here would be
+        // parsed on every drag of the slider.
+        assert!(!json.contains("\"values\""), "{}", json);
+
+        let json = m.conservation_json("nope", 0);
+        assert!(json.contains(r#""ok":false"#), "{}", json);
+        assert!(json.contains("\"error\":\"there is no row called nope"), "{}", json);
+    }
+
+    #[test]
+    fn the_method_list_reaches_the_wire() {
+        let json = Model::methods_json();
+        assert!(
+            json.starts_with(r#"{"methods":[{"name":"Tsit5","adaptive":true,"symplectic":false,"order":5}"#),
+            "{}",
+            json
+        );
+        assert!(json.contains(r#"{"name":"Verlet","adaptive":false,"symplectic":true,"order":2}"#), "{}", json);
+    }
+
+    /// `derived` is an addition to v1 and behaves like `params`: always
+    /// present, empty when there is nothing to say.
+    #[test]
+    fn derived_rows_reach_the_wire_beside_the_parameters() {
+        let json = Model::new().set_source_json("k = 2\nx'' = -k x\nx(0) = 1\nE = 0.5x'^2");
+        assert!(json.contains(r#""params":["k"]"#), "{}", json);
+        assert!(json.contains(r#""derived":["E"]"#), "{}", json);
+        let json = Model::new().set_source_json("x' = 1");
+        assert!(json.contains(r#""derived":[]"#), "{}", json);
     }
 }

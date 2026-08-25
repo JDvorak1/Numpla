@@ -29,15 +29,15 @@ of hanging. Same for a missing `mathfield.js`.
 
 | file | role |
 |---|---|
-| `index.html` | markup: loading screen, expression rows, the plot, the controls |
+| `index.html` | markup: loading screen, expression rows, the plot and its control strip, the overlays |
 | `styles.css` | the light theme, the fixed layout, the eased loader → app hand-off |
-| `main.js` | boot, WASM binding, the row list, diagnostics, sliders, transport |
-| `plot.js` | `Plot` — one HiDPI canvas, three views (`time`, `phase`, `polar`) |
+| `main.js` | boot, WASM binding, the row list, diagnostics, sliders, the frame gestures, the reference |
+| `plot.js` | `Plot` — one HiDPI canvas, tiled between whichever of `time` / `phase` / `polar` are on, each with its own window |
 | `demos.js` | the gallery: source, `tSpan`, and the knobs each demo declares |
 | `mathfield.js` / `mathfield.css` | the math field itself (see `docs/ui-v2.md` Part A) |
 | `serve.mjs` | the dependency-free dev server |
 
-## The five things this shell is built around
+## The six things this shell is built around
 
 ### 1. Light
 
@@ -87,20 +87,62 @@ is muted and the message is grey. Only `"error"` gets error styling, and only
 an `"error"` pauses the solve — the last good curve, chips, legend and sliders
 all stay exactly as they were while you finish typing.
 
-### 3. One plot, view chips on it
+### 3. One plot, and the views are switches
 
-One canvas. Three chips sit on the plot itself and switch what it shows:
+One canvas, and a control strip on it carrying everything that acts on the
+picture: play/pause, the view switches, the frame, and the readout.
+**There is no bottom bar** — the plot has that height instead.
 
-| chip | enabled when |
+Three chips, and each one is **on or off independently**. Any number may be on
+at once:
+
+| chip | supported when |
 |---|---|
 | `t–y` | always |
 | `phase` | the document has **exactly 2 states** |
 | `polar` | a **state named `r`** exists (the angle is a state named `theta`/`phi` if there is one, otherwise `t`) |
 
-A chip that is not available stays **visible but muted**, never hidden — seeing
-`phase` light up the moment a system gains its second state is how you find out
-the software can do it. If the active view stops being supported, the plot falls
-back to `t–y`.
+**Several views share the canvas by tiling it.** The canvas is split by
+recursive bisection along its longer side: one view fills it, two split it in
+half, three give the first view half and the other two a quarter each. The cut
+always crosses the longer side, so no tile is ever a sliver, and the order is
+fixed (`t–y`, `phase`, `polar`) so turning one on never reshuffles the tiles
+already there. Overlaying was the alternative and it is not legible — these
+views do not share an x axis, and stacking them would put two unrelated
+coordinate systems under one set of gridlines.
+
+A chip the document cannot support stays **visible but muted**, never hidden —
+seeing `phase` light up the moment a system gains its second state is how you
+find out the software can do it. And **nothing is ever switched off on your
+behalf**: a view that was on when its support went away keeps its tile and says
+why on it, and its chip stays clickable so you can still put it away yourself.
+
+#### The frame is yours
+
+Every view starts at **−5 to 5 on both axes** — a fixed, predictable frame,
+because that is what makes two runs comparable, and it is what Desmos does. It
+is not fitted to the data, and **a re-solve never moves it**.
+
+| gesture | effect |
+|---|---|
+| drag the plot body | pan both axes |
+| drag along the x labels | scale x, about the value you grabbed |
+| drag along the y labels | scale y, about the value you grabbed |
+| wheel | zoom about the cursor — over an axis strip, that axis only |
+| double-click a tile | that tile back to −5…5 |
+| `−5…5` | every tile back to the default frame; it lights up while any tile has moved |
+| `fit` | every visible tile around its own curve, once, because you asked |
+
+Each tile carries its own window, so scaling the phase plane does not touch the
+`t–y` one.
+
+#### The playhead is visible on the curve
+
+`t` used to change a number and nothing else, which is exactly why it felt
+useless. Now the trajectory is drawn **travelled-versus-ahead** — what has
+happened at full strength, what has not ghosted behind it — with a marker riding
+the curve at `t` (one per series in `t–y`, plus a dashed rule). Scrubbing reads
+as motion.
 
 ### 4. A slider lives on the variable it drives — and only if asked for
 
@@ -123,10 +165,32 @@ those are.
   which they are actually interesting; its author has already answered the
   question the offer asks.
 
-**`t` is the exception** and lives in the transport bar along the bottom with
-play/pause and the readout: it has no defining row to sit on, and it is the
-playhead rather than a parameter. **Its min and max *are* the integration
-span**, so editing them re-solves.
+**`t` is not an exception any more.** It used to be a widget in a bar of its
+own, which is what made it feel like a dial attached to nothing. It is a
+variable in the system now, with a row like any other:
+
+```
+t = [0, 20]
+```
+
+That row says **how far time runs**, and it gets the same offer, the same knob,
+the same gear and the same `×` as `k` does. The slider promoted on it is the
+**playhead** inside that span: dragging it moves the marker along the curve and
+does *not* re-solve, because the solution does not depend on where you are
+looking. Widening the span in the gear rewrites the row, and *that* does.
+
+The row is a **list literal**, which today's parser already reads and the math
+field already draws — no new row kind was invented to get `t` onto the page. The
+solver rebinds `t` at every right-hand-side evaluation
+(`crates/numpla-model/src/system.rs`), so the row is inert to the engine and
+cannot change what the equations mean; it is read by the shell, which is exactly
+what "the span" is. Delete the row and the last span simply stands, the same
+courtesy every other deleted row gets.
+
+A demo declares its span in `tSpan` rather than in its source, so loading one
+writes the row that says it. It is an ordinary row from that moment on.
+
+`t` is read on the plot's readout, at the front, alongside the state values.
 
 A slider's **min / max / step** open in a small overlay when you click the `⋯`
 affordance (or, for `t`, its name). Opening one closes any other; `Esc` closes
@@ -152,6 +216,45 @@ each row still carries its own message, so batching hides nothing. `fix` is
 optional in the contract: without it there is simply no button, and a genuine
 error outranks a missing default, because there is no point completing a
 document that cannot be read yet.
+
+### 6. The reference answers "what can I type here?"
+
+Next to the solve status is a `?`. It opens a **searchable reference** of what
+the engine actually supports — until now, a question answerable only by reading
+Rust. It is searchable by name *and* by description ("noise", "symplectic",
+"contact", "logarithm"), and it covers:
+
+| group | what is in it |
+|---|---|
+| Row kinds | `x' =`, `x'' =`, `x'(0) =`, `x(0) =`, `k =`, `f(u) =`, `t = [0, 20]`, `#` |
+| Functions | every builtin with its **exact arity** — the trigonometric set, `sqrt` `exp` `ln`, `log(x)` base 10 *and* `log(b, x)` base-first, `abs` `floor` `ceil` `round` `sign`, `min` `max`, `mod` |
+| Constants | `pi` `tau` `e` `inf` |
+| Noise | `white` `pink` `brown` `blue` `smooth` `telegraph`, their `(t, rate, seed)` arguments, and `rand()` / `randn()` / `rand(s)` with their "a number, not a draw" semantics |
+| Notation | implicit multiplication, one-letter names, subscripts, primes, `^`, lists, the whole operator set, and the **call-versus-coefficient rule** |
+| The integrator | Tsit5 versus Verlet versus Yoshida4 — what each costs and buys |
+| Features | the playhead, sliders, the view switches, the frame, gray-not-red, the issue bar |
+
+**Every entry is insertable**, because a reference you can only read leaves you
+to retype what it just told you. A row kind writes a new row; anything else is
+typed into the row you were last in, at the caret; and everything can be copied.
+`↑` `↓` move, `Enter` takes the selected entry, `Esc` closes.
+
+The facts come from the source they document — `crates/numpla-expr/src/lexer.rs`
+and `eval.rs` for the builtins and their arities, `docs/noise.md` and
+`crates/numpla-noise` for the noise family, `docs/wasm-api.md` for the row kinds
+and `rand()`, `docs/solvers.md` and `crates/numpla-ode/src/method.rs` for the
+integrators.
+
+**Switching the integrator is live when the module offers it.** `Model` exposes
+`solve_with(t0, t1, name)` and a static `methods()`; both are *probed*, never
+assumed, because `app/pkg/` is a build artefact that can be older than the
+crate — a shell that calls a method the loaded module does not have is a blank
+screen, and a shell that probes keeps working while someone rebuilds. When they
+are there the method names come **from the module**, so a method added to
+`numpla-ode` reaches the list without an edit here; the entries become buttons,
+the live one is marked, and the solve badge shows the method the report says
+actually ran. When they are not, the entries still document the choice and copy
+their names.
 
 ## Demos
 
@@ -195,7 +298,11 @@ The panes have explicit sizes and content scrolls *inside* them.
 - The issue bar is a fixed-height strip: what it says never changes the height
   of the workspace. When it has a fix to offer, the keyboard hint yields the
   space rather than the bar growing.
-- The slider settings are a `position: fixed` overlay, not an expanding panel.
+- The slider settings, the demo gallery and the reference are all
+  `position: fixed` overlays, not expanding panels.
+- The plot's control strip is a fixed-height row: play/pause, the view switches,
+  the frame controls and the readout all live in it, and nothing in it can
+  change the size of the canvas below.
 - The canvas is absolutely positioned inside its box, so its size can never feed
   back into the grid that sizes it.
 
@@ -214,5 +321,17 @@ settings overlay opening.
 | key | action |
 |---|---|
 | `space` | play / pause — unless you are typing in a field or on a button |
-| `Esc` | close the slider settings overlay or the demo gallery |
+| `F1` | open (or close) the reference |
+| `Esc` | close the reference, the demo gallery, or the slider settings overlay |
+| `↑` `↓` | in the reference: move between entries |
+| `Enter` | in the reference: insert the selected entry |
 | `tab` | move focus; every focusable control has a visible ring |
+
+## Pointer, on the plot
+
+| gesture | action |
+|---|---|
+| drag the body of a tile | pan it |
+| drag along its x or y labels | scale that axis, about the value under the pointer |
+| wheel | zoom about the cursor; over an axis strip, that axis alone |
+| double-click | that tile back to −5…5 |

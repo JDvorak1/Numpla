@@ -6,7 +6,7 @@
 //! distinction is the reason this pass evaluates as much as it can up front
 //! instead of waiting for the solver to fall over.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use numpla_expr::{
     deriv_key, eval, parse, parse_with, Env, EvalError, Expr, FuncNames, ParseError, Stmt, Value,
@@ -25,12 +25,29 @@ pub enum StateRhs {
     Velocity(usize),
 }
 
+/// A row that is a *function of the solution* rather than a constant.
+///
+/// `E = 0.5(x'^2 + x^2)` is the shape: an ordinary `name = expr` row whose
+/// expression reads states, so it has no value until there is a trajectory to
+/// read it along. Before the conservation monitor existed such a row could only
+/// be a mistake — a name used with nothing behind it — and it went red. It is
+/// now the *intended* way to ask "is this quantity conserved?", so the compiler
+/// recognises it, keeps it out of `params` (it is not a constant), and hands it
+/// to [`crate::Model::conservation`] to be evaluated sample by sample.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Derived {
+    pub name: String,
+    pub expr: Expr,
+}
+
 /// A compiled document: the state vector, its initial values, and the
 /// environment every right-hand side is evaluated against.
 #[derive(Debug, Clone, Default)]
 pub struct Document {
     pub states: Vec<String>,
     pub params: Vec<String>,
+    /// Rows that are functions of the solution — see [`Derived`].
+    pub derived: Vec<Derived>,
     pub issues: Vec<Issue>,
     pub y0: Vec<f64>,
     pub rhs: Vec<StateRhs>,
@@ -79,9 +96,116 @@ impl Document {
         Diagnostics {
             states: self.states.clone(),
             params: self.params.clone(),
+            derived: self.derived.iter().map(|d| d.name.clone()).collect(),
             issues: self.issues.clone(),
         }
     }
+
+    /// The `(position, velocity)` pairing this document's lowering produced, or
+    /// a sentence naming the first state that is not half of a pair.
+    ///
+    /// This is the bridge to the symplectic integrators: `numpla-ode` refuses
+    /// to guess a pairing from an even state count, and it is right to — three
+    /// first-order rows plus one second-order row is also even. The pairing is
+    /// not inferred here either, it is *read back* from what
+    /// [`declare_states`] wrote: a lowered `x'' = ...` row is exactly a
+    /// [`StateRhs::Velocity`] pointing at the state immediately after it, and
+    /// nothing else in the format produces that.
+    ///
+    /// The error is a sentence rather than a flag because it is the thing the
+    /// person needs told: a document of plain `x' = ...` rows has no
+    /// position/velocity structure, so there is nothing for a symplectic
+    /// method to preserve, and no amount of retrying will change that.
+    pub fn pairs(&self) -> Result<Vec<(usize, usize)>, String> {
+        let mut pairs = Vec::new();
+        let mut i = 0;
+        while i < self.rhs.len() {
+            match self.rhs[i] {
+                StateRhs::Velocity(j) if j == i + 1 => {
+                    pairs.push((i, i + 1));
+                    i += 2;
+                }
+                _ => {
+                    return Err(format!(
+                        "{} is a first-order row, so the document has no position/velocity structure",
+                        self.states[i]
+                    ))
+                }
+            }
+        }
+        Ok(pairs)
+    }
+
+    /// Does any acceleration row read a velocity?
+    ///
+    /// Answered exactly rather than assumed, which is what `numpla-ode` asks of
+    /// callers that lower text (see `SecondOrderSystem::reads_velocity`). The
+    /// velocity of `x` is a *named* state here — `x'` — so the question is
+    /// whether an acceleration row's dependency set contains one of those
+    /// names, and a dependency set is something the compiler already has. The
+    /// answer costs Verlet an extra acceleration evaluation per step and costs
+    /// the run its symplecticity, so guessing `true` would quietly make every
+    /// undamped oscillator both slower and structurally worse.
+    ///
+    /// Only the *acceleration* rows are asked. The position row of a lowered
+    /// pair is `x' = v` by construction and reads a velocity by definition;
+    /// counting it would make the answer `true` for every second-order
+    /// document there is.
+    pub fn reads_velocity(&self) -> bool {
+        let Ok(pairs) = self.pairs() else {
+            return false;
+        };
+        let velocities: BTreeSet<String> =
+            pairs.iter().map(|&(_, v)| self.states[v].clone()).collect();
+        pairs.iter().any(|&(_, v)| match &self.rhs[v] {
+            StateRhs::Expr(e) => reads_any(e, &velocities, &self.env),
+            StateRhs::Velocity(_) => false,
+        })
+    }
+}
+
+/// Does `e` read any of `names`, following user functions into their bodies?
+///
+/// Three details make this exact rather than approximate, and all three matter
+/// for the two questions it answers — whether an acceleration row reads a
+/// velocity, and whether a `name = ...` row is a function of the solution:
+///
+/// - `Expr::deps` reports a `Deriv` under its *base* name, so it cannot tell
+///   `x` from `x'`. Here the derivative key is rebuilt, because the whole point
+///   is telling those two apart.
+/// - A call to a user function reads whatever that function's body reads. A row
+///   written as `x'' = drag(x')` and one written as `x'' = -0.4x'` are the same
+///   physics and must get the same answer.
+/// - Parameters shadow globals inside a body, so a function whose parameter
+///   happens to be called `x` does not make its caller read the state `x`.
+fn reads_any(e: &Expr, names: &BTreeSet<String>, env: &Env) -> bool {
+    fn walk(e: &Expr, names: &BTreeSet<String>, env: &Env, seen: &mut BTreeSet<String>) -> bool {
+        match e {
+            Expr::Num(_) | Expr::Hole => false,
+            Expr::Var(n) => names.contains(n),
+            Expr::Deriv { name, order } => names.contains(&deriv_key(name, *order)),
+            Expr::Call { name, args } => {
+                if args.iter().any(|a| walk(a, names, env, seen)) {
+                    return true;
+                }
+                match env.funcs.get(name) {
+                    // `seen` stops a recursive definition from recursing here.
+                    Some((params, body)) if seen.insert(name.clone()) => {
+                        let shadowed: BTreeSet<String> =
+                            names.difference(&params.iter().cloned().collect()).cloned().collect();
+                        walk(body, &shadowed, env, seen)
+                    }
+                    _ => false,
+                }
+            }
+            Expr::Neg(a) => walk(a, names, env, seen),
+            Expr::Bin { lhs, rhs, .. } => {
+                walk(lhs, names, env, seen) || walk(rhs, names, env, seen)
+            }
+            Expr::List(items) => items.iter().any(|i| walk(i, names, env, seen)),
+        }
+    }
+    walk(e, names, env, &mut BTreeSet::new())
 }
 
 /// One non-blank row, with everything needed to point back at its text.
@@ -106,10 +230,10 @@ pub fn compile(src: &str) -> Document {
     resolve_random_sites(&mut rows, doc.env.noise_seed);
 
     let states = declare_states(&rows, &mut doc);
-    bind_assignments(&rows, &mut doc);
+    let derived_rows = bind_assignments(&rows, &mut doc);
     let stated = apply_initial_conditions(&rows, &mut doc);
     report_missing_initial_conditions(&rows, &states, &stated, &mut doc);
-    probe_right_hand_sides(&rows, &states.ode_rows, &mut doc);
+    probe_right_hand_sides(&rows, &states.ode_rows, &derived_rows, &mut doc);
     reject_unsupported_rows(&rows, &mut doc);
 
     doc.issues.sort_by_key(|i| (i.line, i.start));
@@ -276,13 +400,17 @@ fn declare_states(rows: &[Row], doc: &mut Document) -> States {
     States { row_of, ode_rows }
 }
 
-/// Pass 2: constants and user functions.
+/// Pass 2: constants, user functions, and rows that are functions of the
+/// solution.
 ///
 /// Rows may be written in any order, so constants are relaxed to a fixed point
 /// rather than evaluated top to bottom — a slider defined below the row that
 /// uses it is ordinary in a Desmos-shaped editor, not an error.
-fn bind_assignments(rows: &[Row], doc: &mut Document) {
-    let mut constants: Vec<(usize, &String, &Expr)> = Vec::new();
+///
+/// Returns the rows classified as [`Derived`], so the probe pass can check them
+/// with the states bound.
+fn bind_assignments(rows: &[Row], doc: &mut Document) -> Vec<usize> {
+    let mut assignments: Vec<(usize, &String, &Expr)> = Vec::new();
 
     for (idx, row) in rows.iter().enumerate() {
         let Stmt::Assign { name, params, rhs } = &row.stmt else {
@@ -302,15 +430,62 @@ fn bind_assignments(rows: &[Row], doc: &mut Document) {
             continue;
         }
         if params.is_empty() {
-            if !doc.params.contains(name) {
-                doc.params.push(name.clone());
-            }
-            constants.push((idx, name, rhs));
+            assignments.push((idx, name, rhs));
         } else {
             doc.env
                 .funcs
                 .insert(name.clone(), (params.clone(), rhs.clone()));
         }
+    }
+
+    // Split constants from rows that read the solution. Done after the loop
+    // above rather than inside it because a derived row may call a function
+    // defined further down the document, and the classification has to see
+    // every definition before it can follow one.
+    //
+    // `t` counts as a solution name: `drive = sin(t)` has no value until there
+    // is a time to evaluate it at, exactly like a row reading a state.
+    let mut solution_names: BTreeSet<String> = doc.states.iter().cloned().collect();
+    solution_names.insert("t".to_string());
+
+    // Relaxed to a fixed point, because reading a derived row makes a row
+    // derived in turn: `K = 0.5x'^2`, `U = 0.5x^2`, `E = K + U` is how anyone
+    // actually writes an energy, and only the first two mention a state.
+    let mut derived = vec![false; assignments.len()];
+    loop {
+        let mut changed = false;
+        for (i, (_, name, rhs)) in assignments.iter().enumerate() {
+            if derived[i] || !reads_any(rhs, &solution_names, &doc.env) {
+                continue;
+            }
+            derived[i] = true;
+            solution_names.insert((*name).clone());
+            changed = true;
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    let mut derived_rows = Vec::new();
+    let mut constants: Vec<(usize, &String, &Expr)> = Vec::new();
+    for (i, (idx, name, rhs)) in assignments.into_iter().enumerate() {
+        if derived[i] {
+            doc.derived.push(Derived {
+                name: name.clone(),
+                expr: rhs.clone(),
+            });
+            // Bound as pending rather than left undefined: a row using `E`
+            // should go gray with "waiting", not red with an offer to define a
+            // second thing called `E`.
+            doc.env.set_value(name, Value::Unevaluated);
+            derived_rows.push(idx);
+            continue;
+        }
+        if !doc.params.contains(name) {
+            doc.params.push(name.clone());
+        }
+        constants.push((idx, name, rhs));
     }
 
     let mut unresolved: Vec<usize> = (0..constants.len()).collect();
@@ -353,6 +528,8 @@ fn bind_assignments(rows: &[Row], doc: &mut Document) {
                 .push(rows[idx].issue(Severity::Pending, waiting()));
         }
     }
+
+    derived_rows
 }
 
 /// Pass 3: initial conditions. Absent means zero, per the contract.
@@ -449,13 +626,53 @@ fn report_missing_initial_conditions(
     doc.issues.extend(notes);
 }
 
+/// Bind every derived row that can be evaluated in `env`, relaxed to a fixed
+/// point.
+///
+/// The relaxation is what lets `K = 0.5x'^2`, `U = 0.5x^2`, `E = K + U` work,
+/// which is how anyone actually writes an energy: in named pieces. It is the
+/// same fixed point `bind_assignments` runs over constants, for the same
+/// reason — rows are a set, not a sequence — but it happens once per *sample*
+/// rather than once per compile, because these rows only have values where
+/// there is a state vector.
+///
+/// Rows that stay unevaluable keep whatever they had, which is
+/// [`Value::Unevaluated`]: pending propagates, so a quantity written in terms
+/// of a broken one is reported as waiting rather than as wrong.
+pub fn bind_derived(derived: &[Derived], env: &mut Env) {
+    let mut unresolved: Vec<usize> = (0..derived.len()).collect();
+    loop {
+        let before = unresolved.len();
+        unresolved.retain(|&i| match eval(&derived[i].expr, env) {
+            Ok(v @ Value::Scalar(_)) => {
+                env.set_value(&derived[i].name, v);
+                false
+            }
+            _ => true,
+        });
+        if unresolved.len() == before {
+            break;
+        }
+    }
+}
+
 /// Pass 4: evaluate every right-hand side once, at `t = 0` with the states at
 /// their initial values.
 ///
 /// Nothing needs the answer. The point is that a typo like `x' = q` goes red
 /// the moment it is typed rather than when someone presses solve.
-fn probe_right_hand_sides(rows: &[Row], ode_rows: &[usize], doc: &mut Document) {
-    if doc.states.is_empty() {
+///
+/// Derived rows are probed here too, and this is the only pass that can: they
+/// were set aside in pass 2 *because* they cannot be evaluated without a state
+/// vector, so `E = 0.5(x^2 + x'^2) + q` would otherwise carry its typo silently
+/// until someone opened the conservation monitor.
+fn probe_right_hand_sides(
+    rows: &[Row],
+    ode_rows: &[usize],
+    derived_rows: &[usize],
+    doc: &mut Document,
+) {
+    if doc.states.is_empty() && doc.derived.is_empty() {
         return;
     }
     let mut env = doc.env.clone();
@@ -463,11 +680,13 @@ fn probe_right_hand_sides(rows: &[Row], ode_rows: &[usize], doc: &mut Document) 
     for (name, v) in doc.states.iter().zip(&doc.y0) {
         env.set(name, *v);
     }
+    bind_derived(&doc.derived, &mut env);
 
-    for &idx in ode_rows {
+    for &idx in ode_rows.iter().chain(derived_rows) {
         let row = &rows[idx];
-        let Stmt::Ode { rhs, .. } = &row.stmt else {
-            continue;
+        let rhs = match &row.stmt {
+            Stmt::Ode { rhs, .. } | Stmt::Assign { rhs, .. } => rhs,
+            _ => continue,
         };
         match eval(rhs, &env) {
             Ok(Value::Scalar(_)) => {}

@@ -80,6 +80,7 @@
     <kbd>/</kbd> fraction &middot; <kbd>^</kbd> superscript &middot;
     <kbd>_</kbd> subscript &middot; <kbd>sqrt</kbd> radical &middot;
     <kbd>(</kbd> matched pair &middot; <kbd>'</kbd> prime &middot;
+    <kbd>Tab</kbd> completion &middot;
     arrows walk the structure &middot; <kbd>Backspace</kbd> at a slot's left edge
     collapses it.
   </p>
@@ -97,6 +98,9 @@
 
   <h2>Tall and nested</h2>
   <div class="grid" id="tall"></div>
+
+  <h2>Tab completion &mdash; type a prefix and press <kbd>Tab</kbd></h2>
+  <div class="grid" id="complete"></div>
 
   <h2>Calls and coefficients (the same row, read two ways)</h2>
   <div class="grid" id="calls"></div>
@@ -202,6 +206,20 @@ mount('tall', 'a tower', 'h = 2^(3^(2)) + ((x)/(y))^(2)');
 mount('tall', 'continued fraction', 'c = 1 + (1)/(1 + (1)/(1 + (1)/(2)))');
 mount('tall', 'everything at once',
   "w'' = -(k)/(m)*w - sqrt((c)/(m))*w' + f_0*cos(2pi*t)");
+
+// --- tab completion ---------------------------------------------------------
+// One match completes; several fill in the shared prefix first and then offer a
+// menu. Try: sq, wh, mi, ar (twice), si, x, com. Nothing that the engine does
+// not have will complete - diff, solve and integrate are not there to offer.
+mount('complete', 'sq, sqr -> a real radical, caret inside it', '');
+mount('complete', 'wh, sm, te, pin, bl, br -> the noise family', '');
+mount('complete', 'mi, ma, mo -> two arguments, caret in the first', '');
+mount('complete', 'ar then Tab again -> fills in "arc", then offers the three', '');
+mount('complete', 'si, ta, co, ra -> a menu, because the shared prefix is a name too', '');
+mount('complete', 'x then Tab -> the row kinds for x', '');
+mount('complete', 'com then Tab -> a comment row', '');
+mount('complete', "document names: try d, k or q (d is a function here)", '',
+  { documentNames: { functions: ['d'], params: ['k_1', 'q_max'], states: ['theta'] } });
 
 // --- calls and coefficients -------------------------------------------------
 // `f(u)` is a call, `g (u)` is `g` times `u`, and only the whole document knows

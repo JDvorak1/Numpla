@@ -27,6 +27,9 @@ export const FUNCS = [
   'arcsin', 'arccos', 'arctan', 'sinh', 'cosh', 'tanh', 'sin', 'cos', 'tan',
   'sqrt', 'exp', 'ln', 'log', 'abs', 'min', 'max', 'floor', 'ceil', 'round',
   'sign', 'mod',
+  // The noise family is reserved in the lexer for the same reason `sin` is: a
+  // multi-letter run is a known function or it is several variables.
+  'white', 'pink', 'brown', 'blue', 'smooth', 'telegraph', 'randn', 'rand',
 ];
 
 export const CONSTS = ['pi', 'tau', 'inf'];
@@ -190,6 +193,8 @@ export function newState(root = [], funcs = null) {
     path: [],
     index: 0,
     funcs: funcs instanceof Set ? funcs : normaliseFunctions(funcs),
+    // Names the document defines, for completion only - see setDocumentNames().
+    names: normaliseNames(null),
     // The text this row was last *given*, or null once the user has edited it.
     // Emission parenthesises, so `(1)/(d)(x, y)` cannot be told apart from a
     // row the user typed that way: the only faithful thing to re-read when the
@@ -383,6 +388,54 @@ function inSubscript(st) {
 }
 
 /**
+ * The name that has just been built, if the caret is still sitting on it:
+ * after `pi`, inside the parentheses of `sin(`, or after `rand()`.
+ */
+function wordStructureAt(st) {
+  const L = curList(st);
+  const prev = L[st.index - 1];
+  if (prev && (prev.type === 'const' || prev.type === 'func')) {
+    return { name: prev.name, list: L, path: st.path.slice(), from: st.index - 1, count: 1 };
+  }
+  if (prev && prev.type === 'group' && prev.body.length === 0) {
+    const fn = L[st.index - 2];
+    if (fn && fn.type === 'func') {
+      return { name: fn.name, list: L, path: st.path.slice(), from: st.index - 2, count: 2 };
+    }
+  }
+  if (st.path.length) {
+    const [i, k] = st.path[st.path.length - 1];
+    const outer = listAt(st.root, st.path.slice(0, -1));
+    const owner = outer && outer[i];
+    if (k === 'body' && owner && owner.type === 'group' && owner.body.length === 0) {
+      const fn = outer[i - 1];
+      if (fn && fn.type === 'func') {
+        return { name: fn.name, list: outer, path: st.path.slice(0, -1), from: i - 1, count: 2 };
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * `sin` is a name, and so is `sinh`; `pi` is a name, and so is `pink`. Since
+ * the shorter one inflates the moment it is typed, the longer one would be
+ * unreachable from the keyboard. So when the next letter could still be going
+ * somewhere longer, the structure dissolves back into its letters and carries
+ * on - `sin(` + `h` is `sinh(`, not `sin(h)`.
+ */
+function growWord(st, ch) {
+  const w = wordStructureAt(st);
+  if (!w) return false;
+  const grown = w.name + ch;
+  if (!WORDS.some((x) => x.length > w.name.length && x.startsWith(grown))) return false;
+  w.list.splice(w.from, w.count, ...Array.from(w.name).map((c) => A.var(c)));
+  st.path = w.path;
+  st.index = w.from + w.name.length;
+  return true;
+}
+
+/**
  * A letter was just typed. If the run of plain letters ending at the caret has
  * a known function name or constant as its suffix, inflate it: `sqrt` becomes a
  * radical, `sin` becomes an upright name with its parentheses already open,
@@ -399,14 +452,10 @@ function inflateWord(st) {
     const w = letters.slice(letters.length - len);
     if (!WORDS.includes(w)) continue;
     const from = st.index - len;
-    if (w === 'sqrt') {
-      L.splice(from, len, A.sqrt([]));
-      st.path.push([from, 'body']);
-      st.index = 0;
-    } else if (FUNCS.includes(w)) {
-      L.splice(from, len, A.func(w), A.group('(', []));
-      st.path.push([from + 1, 'body']);
-      st.index = 0;
+    if (FUNCS.includes(w)) {
+      // The same insertion Tab performs, so a name typed out in full and a name
+      // completed land the caret in the same place.
+      insertCall(st, w, from, len);
     } else {
       L.splice(from, len, A.konst(w));
       st.index = from + 1;
@@ -500,6 +549,7 @@ export function typeChar(st, ch) {
   if (/\s/.test(ch)) return false;                    // spaces carry no meaning
   if (/[0-9.]/.test(ch)) { insert(st, [A.digit(ch)]); return true; }
   if (/[A-Za-z]/.test(ch)) {
+    growWord(st, ch);
     insert(st, [A.var(ch)]);
     inflateWord(st);
     return true;
@@ -513,7 +563,17 @@ export function typeChar(st, ch) {
     case ')':
     case ']': return closeGroup(st, ch);
     case "'": insert(st, [A.prime()]); return true;
-    case '+': case '-': case '*': case '=': case ',':
+    case ',': {
+      // `min(a, b)` arrives with its comma already in place, so typing one at
+      // the comma steps over it instead of doubling it - the same type-through
+      // rule as `)`.
+      const L = curList(st);
+      const next = L[st.index];
+      if (next && next.type === 'op' && next.ch === ',') { st.index += 1; return true; }
+      insert(st, [A.op(ch)]);
+      return true;
+    }
+    case '+': case '-': case '*': case '=':
       insert(st, [A.op(ch)]); return true;
     default:
       return false;
@@ -935,6 +995,318 @@ export function parseSource(text, funcs = null) {
 }
 
 // ---------------------------------------------------------------------------
+// Completion
+//
+// Type a prefix, press Tab, get the completion - the shell habit, in a math
+// field. Everything here is a pure function of the model, so the whole feature
+// is testable without a DOM; the field only draws the menu and forwards keys.
+//
+// What completes:
+//   - every builtin the engine has (FUNCS/CONSTS above, taken from the lexer),
+//     inserted as real structure: `sq` becomes a radical, not four letters
+//   - the names the document itself defines - functions, parameters, states -
+//     which the shell feeds in through setDocumentNames()
+//   - row kinds, offered when the row is just an identifier: `x` then Tab
+//     offers `x' =`, `x'' =`, `x(0) =`, `x(u) =`
+//   - `comment`, which turns the row into a `#` comment
+//
+// Nothing completes to something the engine does not have. There is no `diff`:
+// symbolic differentiation is a later milestone, and offering it would only
+// produce a row that cannot parse.
+// ---------------------------------------------------------------------------
+
+/** Argument counts, mirroring `arity()` in crates/numpla-expr/src/eval.rs. */
+const ARITY = {
+  min: [2, 2], max: [2, 2], mod: [2, 2],
+  log: [1, 2],
+  rand: [0, 1], randn: [0, 1],
+  white: [1, 3], pink: [1, 3], brown: [1, 3],
+  blue: [1, 3], smooth: [1, 3], telegraph: [1, 3],
+};
+
+export function arityOf(name) {
+  return ARITY[name] || [1, 1];
+}
+
+/** What the menu shows: the call as it will be inserted. */
+export function signatureOf(name) {
+  const [least, most] = arityOf(name);
+  if (least === 0) return name + '()';
+  if (least === 2) return name + '(a, b)';
+  if (most === 3) return name + '(t)';
+  return name + '(x)';
+}
+
+const NOTES = {
+  sqrt: 'square root', exp: 'e to the x', ln: 'natural log',
+  log: 'base 10 - log(x, b) for another base', abs: 'absolute value',
+  min: 'smaller of two', max: 'larger of two', mod: 'remainder',
+  floor: 'round down', ceil: 'round up', round: 'nearest', sign: '-1, 0 or 1',
+  sin: 'sine', cos: 'cosine', tan: 'tangent',
+  arcsin: 'inverse sine', arccos: 'inverse cosine', arctan: 'inverse tangent',
+  sinh: 'hyperbolic sine', cosh: 'hyperbolic cosine', tanh: 'hyperbolic tangent',
+  white: 'flat-spectrum noise - (t, rate, seed)',
+  pink: '1/f noise - (t, rate, seed)',
+  brown: '1/f^2 noise, wandering - (t, rate, seed)',
+  blue: 'f noise, thin and hissy - (t, rate, seed)',
+  smooth: 'band-limited noise, safest to integrate - (t, rate, seed)',
+  telegraph: 'switches between +1 and -1 - (t, rate, seed)',
+  rand: 'uniform on [0, 1), a pure function of its seed',
+  randn: 'standard normal, a pure function of its seed',
+  pi: '3.14159...', tau: '2 pi', inf: 'infinity',
+};
+
+/**
+ * Insert a call to `name`, replacing `len` atoms ending at `from + len`.
+ * The caret lands where the first argument goes - inside the radical for
+ * `sqrt`, before the comma for the two-argument builtins - except for the
+ * builtins whose argument is optional, where it lands after the call, because
+ * `rand()` is the form people actually want.
+ */
+function insertCall(st, name, from, len) {
+  const L = curList(st);
+  if (name === 'sqrt') {
+    L.splice(from, len, A.sqrt([]));
+    st.path.push([from, 'body']);
+    st.index = 0;
+    return;
+  }
+  const [least] = arityOf(name);
+  const body = least >= 2 ? [A.op(',')] : [];
+  L.splice(from, len, A.func(name), A.group('(', body));
+  if (least === 0) {
+    st.index = from + 2;
+    return;
+  }
+  st.path.push([from + 1, 'body']);
+  st.index = 0;
+}
+
+/** Insert a plain name (a constant, parameter or state) over the prefix. */
+function insertName(st, name, from, len) {
+  const L = curList(st);
+  const atoms = parseSource(name, st.funcs);
+  L.splice(from, len, ...atoms);
+  st.index = from + atoms.length;
+}
+
+/**
+ * The names a document defines, for completion. Same shape as setFunctions():
+ * `{ functions, params, states }`, each a list of names.
+ */
+export function normaliseNames(names) {
+  const src = names || {};
+  const pick = (v) => Array.from(normaliseFunctions(v));
+  return {
+    functions: pick(src.functions),
+    params: pick(src.params),
+    states: pick(src.states),
+  };
+}
+
+/** The run of plain letters ending at the caret - the prefix Tab completes. */
+function prefixAt(st) {
+  const L = curList(st);
+  let start = st.index;
+  while (start > 0 && L[start - 1].type === 'var' && !L[start - 1].sub) start--;
+  return { start, text: L.slice(start, st.index).map((a) => a.name).join('') };
+}
+
+/**
+ * Is this row just an identifier, with the caret after it? That is the moment
+ * row kinds are worth offering, and the only moment they are not noise.
+ */
+function rowIdentity(st) {
+  if (st.path.length) return null;
+  const R = st.root;
+  if (!R.length || R[0].type !== 'var') return null;
+  let primes = 0;
+  for (let i = 1; i < R.length; i++) {
+    if (R[i].type !== 'prime') return null;
+    primes += 1;
+  }
+  if (st.index !== R.length) return null;
+  return { name: toSource([R[0]]), primes };
+}
+
+function rowKinds(row) {
+  const base = row.name + "'".repeat(row.primes);
+  const out = [];
+  const add = (label, hint, build, caret) => out.push({
+    word: null,
+    kind: 'row',
+    label,
+    hint,
+    apply: (st) => {
+      const at = st.root.length;
+      const atoms = build();
+      st.root.push(...atoms);
+      st.path = [];
+      if (caret === 'group') {
+        const i = atoms.findIndex((a) => a.type === 'group');
+        st.path = [[at + i, 'body']];
+        st.index = 0;
+      } else {
+        st.index = st.root.length;
+      }
+    },
+  });
+
+  if (row.primes === 0) {
+    add(base + "' =", 'first-order ODE row',
+      () => [A.prime(), A.op('=')], 'end');
+    add(base + "'' =", 'second-order ODE row',
+      () => [A.prime(), A.prime(), A.op('=')], 'end');
+    add(base + '(0) =', 'initial condition',
+      () => [A.group('(', [A.digit('0')]), A.op('=')], 'end');
+    add(base + '(u) =', 'function definition',
+      () => [A.group('(', []), A.op('=')], 'group');
+  } else {
+    add(base + ' =', 'ODE row', () => [A.op('=')], 'end');
+    add(base + '(0) =', 'initial condition',
+      () => [A.group('(', [A.digit('0')]), A.op('=')], 'end');
+  }
+  return out;
+}
+
+/**
+ * Everything Tab could do at the caret, in menu order: builtins, then the
+ * document's own names, then constants, then row kinds.
+ *
+ * A function name matches even when the prefix is the whole name, because the
+ * completion still adds its parentheses; a plain name has to be strictly longer
+ * than the prefix, or completing it would do nothing at all.
+ */
+export function completionsFor(st) {
+  // A subscript is a label, not mathematics - the same reason function names do
+  // not inflate there. Nothing to complete.
+  if (inSubscript(st)) return { prefix: '', start: st.index, candidates: [] };
+  const { start, text: prefix } = prefixAt(st);
+  const names = st.names || normaliseNames(null);
+  const out = [];
+  const seen = new Set();
+
+  const addCall = (name, kind) => {
+    if (seen.has(name) || !name.startsWith(prefix)) return;
+    seen.add(name);
+    out.push({
+      word: name,
+      kind,
+      label: signatureOf(name),
+      hint: NOTES[name] || (kind === 'function' ? 'defined in this document' : ''),
+      apply: (s) => insertCall(s, name, start, prefix.length),
+    });
+  };
+
+  const addName = (name, kind, hint) => {
+    if (seen.has(name) || name.length <= prefix.length) return;
+    if (!name.startsWith(prefix)) return;
+    seen.add(name);
+    out.push({
+      word: name,
+      kind,
+      label: name,
+      hint: NOTES[name] || hint || '',
+      apply: (s) => insertName(s, name, start, prefix.length),
+    });
+  };
+
+  if (prefix) {
+    for (const n of FUNCS) addCall(n, 'builtin');
+    for (const n of names.functions) addCall(n, 'function');
+    for (const n of CONSTS) addName(n, 'constant');
+    for (const n of names.params) addName(n, 'parameter', 'parameter in this document');
+    for (const n of names.states) addName(n, 'state', 'state in this document');
+
+    // `com` -> a comment row. Only when the prefix is the whole row: turning
+    // something half-written into prose would throw the mathematics away.
+    if (prefix.length >= 2 && 'comment'.startsWith(prefix)
+        && !st.path.length && start === 0 && st.index === st.root.length) {
+      out.push({
+        word: null,
+        kind: 'row',
+        label: '# comment',
+        hint: 'a comment row, kept verbatim',
+        apply: (s) => {
+          s.root.splice(0, s.root.length, A.text('#'), A.text(' '));
+          s.path = [];
+          s.index = 2;
+        },
+      });
+    }
+  }
+
+  // Shortest first, then alphabetical: `sin` before `sign` before `sinh`, and
+  // the name someone is most likely to have meant at the top.
+  out.sort((a, b) => {
+    if (!a.word || !b.word) return (a.word ? 0 : 1) - (b.word ? 0 : 1);
+    return (a.word.length - b.word.length) || (a.word < b.word ? -1 : 1);
+  });
+
+  const row = rowIdentity(st);
+  if (row) out.push(...rowKinds(row));
+
+  return { prefix, start, candidates: out };
+}
+
+/** The longest prefix every one of these words starts with. */
+export function commonPrefix(words) {
+  if (!words.length) return '';
+  let p = words[0];
+  for (const w of words) {
+    let i = 0;
+    while (i < p.length && i < w.length && p[i] === w[i]) i += 1;
+    p = p.slice(0, i);
+  }
+  return p;
+}
+
+function extendPrefix(st, extra) {
+  const L = curList(st);
+  const atoms = Array.from(extra).map((c) => A.var(c));
+  L.splice(st.index, 0, ...atoms);
+  st.index += atoms.length;
+}
+
+/**
+ * Tab.
+ *
+ * One match completes. Several match the way a shell does: fill in as much as
+ * every candidate agrees on, and only when that adds nothing, show the menu.
+ * That is the behaviour the request asked for by name ("like diff then tab"),
+ * it never picks for the user, and it means the common case - `ar` for the
+ * three arc functions - needs no menu at all.
+ *
+ * The one exception: when the shared prefix is *itself* a name (`sin` shared by
+ * sin and sinh), filling it in would look like the completion had finished, so
+ * the menu opens instead.
+ *
+ * Returns { action: 'none' | 'applied' | 'extended' | 'menu', candidates }.
+ * 'none' means Tab did nothing and the caller must let the key through - a Tab
+ * that completes nothing belongs to whatever moves focus.
+ */
+export function tabComplete(st) {
+  const { prefix, candidates } = completionsFor(st);
+  if (!candidates.length) return { action: 'none', candidates: [] };
+
+  st.pristine = null;
+  if (candidates.length === 1) {
+    candidates[0].apply(st);
+    return { action: 'applied', candidates };
+  }
+
+  const words = candidates.filter((c) => c.word).map((c) => c.word);
+  if (words.length === candidates.length) {
+    const common = commonPrefix(words);
+    if (common.length > prefix.length && !WORDS.includes(common)) {
+      extendPrefix(st, common.slice(prefix.length));
+      return { action: 'extended', candidates };
+    }
+  }
+  return { action: 'menu', candidates };
+}
+
+// ---------------------------------------------------------------------------
 // MathModel - the headless half of a field
 // ---------------------------------------------------------------------------
 
@@ -957,6 +1329,35 @@ export class MathModel {
 
   /** The document's function names, as last given. Builtins are not listed. */
   get functions() { return Array.from(this.st.funcs); }
+
+  /** The document's names, as last given: { functions, params, states }. */
+  get documentNames() {
+    return {
+      functions: this.st.names.functions.slice(),
+      params: this.st.names.params.slice(),
+      states: this.st.names.states.slice(),
+    };
+  }
+
+  /**
+   * Tell the row what the document defines, for completion. `functions` also
+   * goes to setFunctions(), since it is the same fact - a name with an
+   * `f(u) = ...` row - and two sources of truth for it would drift. Omit the
+   * key to leave the parser's function set alone.
+   *
+   * @returns true when the row had to be re-read, as setFunctions() does.
+   */
+  setDocumentNames(names) {
+    this.st.names = normaliseNames(names);
+    const given = names && names.functions;
+    return given ? this.setFunctions(given) : false;
+  }
+
+  /** Everything Tab could do at the caret, without doing any of it. */
+  completions() { return completionsFor(this.st); }
+
+  /** Tab. See tabComplete(). */
+  tab() { return tabComplete(this.st); }
 
   /**
    * Tell the row which names the document defines as functions. Re-reads the
@@ -1002,6 +1403,9 @@ export class MathModel {
 // ===========================================================================
 
 const SVG_NS = 'http://www.w3.org/2000/svg';
+
+/** How many completions the menu shows before it says "+n more". */
+const MENU_MAX = 10;
 
 function el(tag, cls) {
   const e = document.createElement(tag);
@@ -1155,6 +1559,8 @@ function renderAtom(list, at, path, ctx) {
  * @param host  element to mount into (the field replaces its contents)
  * @param opts.functions  names the document defines as functions, so that
  *                        `d(x, y)` reads as a call - see setFunctions()
+ * @param opts.documentNames  { functions, params, states } for Tab completion
+ *                        - see setDocumentNames()
  * @param opts  { value?: string, onChange?: (field) => void,
  *                onFocus?: (field) => void, onBlur?: (field) => void,
  *                onEnter?: (field) => void, onNavigate?: (field, dir) => void }
@@ -1164,6 +1570,8 @@ export class MathField {
     this.host = host;
     this.opts = opts;
     this.model = new MathModel(opts.value || '', opts.functions);
+    if (opts.documentNames) this.model.setDocumentNames(opts.documentNames);
+    this._menu = null;
     this.focused = false;
     this.diagnostic = null;
     this.diagnosticMessage = '';
@@ -1184,7 +1592,7 @@ export class MathField {
     this._onKeyDown = (e) => this._keydown(e);
     this._onPointerDown = (e) => this._pointerdown(e);
     this._onFocus = () => { this.focused = true; root.classList.add('is-focused'); this.render(); if (opts.onFocus) opts.onFocus(this); };
-    this._onBlur = () => { this.focused = false; root.classList.remove('is-focused'); this.render(); if (opts.onBlur) opts.onBlur(this); };
+    this._onBlur = () => { this.focused = false; this._closeMenu(); root.classList.remove('is-focused'); this.render(); if (opts.onBlur) opts.onBlur(this); };
     this._onPaste = (e) => this._paste(e);
 
     root.addEventListener('keydown', this._onKeyDown);
@@ -1221,6 +1629,27 @@ export class MathField {
     return changed;
   }
 
+  /** The document's names, as last given: { functions, params, states }. */
+  get documentNames() { return this.model.documentNames; }
+
+  /**
+   * Tell the field what the document defines, so Tab can complete it: user
+   * functions, parameters and states. `functions` is forwarded to
+   * setFunctions() as well, since it is the same fact; omit that key to leave
+   * the parser's function set alone. Returns true when the row was re-read.
+   */
+  setDocumentNames(names) {
+    const changed = this.model.setDocumentNames(names);
+    if (changed) this.render();
+    return changed;
+  }
+
+  /** Everything Tab could do at the caret, without doing any of it. */
+  completions() { return this.model.completions(); }
+
+  /** True while the completion menu is open. */
+  get menuOpen() { return this._menu != null; }
+
   focus() { this.el.focus(); }
   blur() { this.el.blur(); }
   isEmpty() { return this.model.isEmpty(); }
@@ -1238,6 +1667,7 @@ export class MathField {
   }
 
   destroy() {
+    this._closeMenu();
     this.el.removeEventListener('keydown', this._onKeyDown);
     this.el.removeEventListener('mousedown', this._onPointerDown);
     this.el.removeEventListener('focus', this._onFocus);
@@ -1281,6 +1711,20 @@ export class MathField {
 
   _keydown(e) {
     if (e.ctrlKey || e.metaKey || e.altKey) return;
+
+    // While the menu is open it owns the navigation keys. Anything else closes
+    // it and is then handled as if it had never been there.
+    if (this._menu) {
+      switch (e.key) {
+        case 'ArrowDown': this._moveMenu(1); e.preventDefault(); return;
+        case 'ArrowUp': this._moveMenu(-1); e.preventDefault(); return;
+        case 'Tab': this._moveMenu(e.shiftKey ? -1 : 1); e.preventDefault(); return;
+        case 'Enter': this._acceptMenu(this._menu.index); e.preventDefault(); return;
+        case 'Escape': this._closeMenu(); e.preventDefault(); return;
+        default: this._closeMenu(); break;
+      }
+    }
+
     const st = this.model.st;
     const nav = (dir) => {
       if (!moveVert(st, dir) && this.opts.onNavigate) this.opts.onNavigate(this, dir < 0 ? 'up' : 'down');
@@ -1304,6 +1748,11 @@ export class MathField {
         if (this.opts.onEnter) this.opts.onEnter(this);
         e.preventDefault(); return;
       case 'Escape': this.blur(); e.preventDefault(); return;
+      case 'Tab':
+        // Shift+Tab never completes, and a Tab that completes nothing is not
+        // ours: both fall through to whatever moves focus between rows.
+        if (!e.shiftKey) this._tab(e);
+        return;
       default: break;
     }
 
@@ -1328,6 +1777,7 @@ export class MathField {
   }
 
   _pointerdown(e) {
+    this._closeMenu();
     const hit = this._nearest(e.clientX, e.clientY);
     if (hit) {
       this.model.st.path = hit._mfPath;
@@ -1337,6 +1787,111 @@ export class MathField {
     if (!this.focused) this.el.focus();
     this.render();
     e.preventDefault();
+  }
+
+  /**
+   * Tab. Returns true when the field consumed the key; when it returns false
+   * the event is left alone, so the browser moves focus out of the field.
+   */
+  _tab(e) {
+    const r = tabComplete(this.model.st);
+    if (r.action === 'none') { this._closeMenu(); return false; }
+    e.preventDefault();
+    if (r.action === 'menu') {
+      this._openMenu(r.candidates);
+      return true;
+    }
+    this._closeMenu();
+    this._apply(true);
+    return true;
+  }
+
+  _openMenu(candidates) {
+    this._closeMenu();
+    if (typeof document === 'undefined' || !document.body) return;
+    const shown = candidates.slice(0, MENU_MAX);
+    const menu = el('div', 'mf-menu');
+    menu.setAttribute('role', 'listbox');
+    const items = shown.map((c, i) => {
+      const item = el('div', 'mf-menu-item');
+      item.setAttribute('role', 'option');
+      const label = el('span', 'mf-menu-label');
+      label.textContent = c.label;
+      item.appendChild(label);
+      if (c.hint) {
+        const hint = el('span', 'mf-menu-hint');
+        hint.textContent = c.hint;
+        item.appendChild(hint);
+      }
+      item.addEventListener('mousedown', (ev) => { ev.preventDefault(); this._acceptMenu(i); });
+      item.addEventListener('mousemove', () => this._selectMenu(i));
+      menu.appendChild(item);
+      return item;
+    });
+    if (candidates.length > shown.length) {
+      const more = el('div', 'mf-menu-more');
+      more.textContent = '+' + (candidates.length - shown.length) + ' more';
+      menu.appendChild(more);
+    }
+    document.body.appendChild(menu);
+    this._menu = { el: menu, items, candidates: shown, index: 0 };
+    this._positionMenu();
+    this._paintMenu();
+    this._onViewChange = () => this._closeMenu();
+    if (typeof window !== 'undefined' && window.addEventListener) {
+      window.addEventListener('scroll', this._onViewChange, true);
+      window.addEventListener('resize', this._onViewChange);
+    }
+  }
+
+  _positionMenu() {
+    const caret = this._positions.find((q) => q.classList.contains('mf-pos--caret'));
+    const box = (caret || this.el).getBoundingClientRect();
+    const width = typeof window !== 'undefined' && window.innerWidth ? window.innerWidth : 1024;
+    const style = this._menu.el.style;
+    style.position = 'fixed';
+    style.left = Math.round(Math.max(4, Math.min(box.left, width - 280))) + 'px';
+    style.top = Math.round(box.bottom + 4) + 'px';
+  }
+
+  _paintMenu() {
+    this._menu.items.forEach((item, i) => {
+      item.classList.toggle('is-selected', i === this._menu.index);
+    });
+  }
+
+  _selectMenu(i) {
+    if (!this._menu) return;
+    this._menu.index = i;
+    this._paintMenu();
+  }
+
+  _moveMenu(delta) {
+    if (!this._menu) return;
+    const n = this._menu.candidates.length;
+    this._selectMenu(((this._menu.index + delta) % n + n) % n);
+  }
+
+  _acceptMenu(i) {
+    if (!this._menu) return;
+    const chosen = this._menu.candidates[i];
+    this._closeMenu();
+    if (!chosen) return;
+    chosen.apply(this.model.st);
+    this.model.st.pristine = null;
+    this._apply(true);
+  }
+
+  _closeMenu() {
+    if (!this._menu) return;
+    const { el: menu } = this._menu;
+    this._menu = null;
+    if (menu.parentNode) menu.parentNode.removeChild(menu);
+    if (typeof window !== 'undefined' && window.removeEventListener && this._onViewChange) {
+      window.removeEventListener('scroll', this._onViewChange, true);
+      window.removeEventListener('resize', this._onViewChange);
+    }
+    this._onViewChange = null;
   }
 
   /** Nearest valid caret position to a point. Same-line candidates win. */

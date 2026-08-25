@@ -1,23 +1,18 @@
 // Demo gallery.
 //
-// Demos are part of the product, not marketing (VISION.md). Each one is a
+// Demos are part of the product, not marketing (VISION.md). Each entry is a
 // complete document in the v1 source format plus the sliders that make it
-// worth touching: the knob is the whole point, because a model you can only
-// look at teaches far less than one you can lean on.
+// worth touching.
 //
-// Rules every entry here obeys, all enforced by `demos.test.mjs` against the
-// real WASM build:
+// Rules every entry obeys, all enforced by `demos.test.mjs` against the real
+// WASM build:
 //
 //   - only v1 document rows: `x' =`, `x'' =`, `k =`, `f(u) =`, `x(0) =`, `#`
-//   - every knob `name` is a parameter that actually exists in the source, on
-//     its own line, so the shell can rewrite that one line and re-solve
-//   - the source comments explain the physics; the source *is* the teaching
-//     material, so nothing here is written to be clever
+//   - every knob `name` is a parameter that exists in the source, on its own
+//     line, so the shell can rewrite that one line and re-solve
 //   - it is interesting inside its own `tSpan`, at its own default knob values
-//
-// Identifiers follow the Desmos convention the lexer implements: one letter
-// plus an optional subscript, so `x y` is a product and `x_3` is a name. That
-// is why the string's masses are `x_1 .. x_6` and not `m1 .. m6`.
+//   - the source says what to look at in a line or two, and names the knobs
+//     whose letters are not self-explaining. No essays.
 
 /**
  * Strip the leading newline and the common indentation from a source block, so
@@ -63,26 +58,16 @@ export const DEMOS = [
     blurb:
       'Six beads on a string, pulled aside and let go. Raise the tension and the pitch climbs; raise the damping and the note dies away. Turn up the stretch nonlinearity with a big pluck and the tone changes shape while it decays.',
     source: doc(`
-      # A PLUCKED STRING
-      #
-      # A string is a chain of little masses, each one pulled toward its two
-      # neighbours. Write that chain out and you have discretised the wave
-      # equation: k(x_{i+1} - 2x_i + x_{i-1}) is the curvature of the string
-      # around mass i, and curvature is what accelerates it.
-      #
-      # The two ends are nailed down. Mass 0 and mass 7 are the nut and the
-      # bridge, so they never move and never appear as states — they show up
-      # in rows 1 and 6 as the missing neighbour.
+      # Six beads, ends nailed down: k(x_{i+1} - 2x_i + x_{i-1}) is the
+      # curvature at mass i, and curvature is what accelerates it.
 
-      # tension: how hard a neighbour pulls. This is the pitch.
+      # tension — this is the pitch
       k = 60
-      # damping: energy lost to the air and the bridge.
+      # damping — energy lost to the air and the bridge
       c = 0.15
-      # stretch nonlinearity: a real string gets stiffer the further you pull
-      # it. At g = 0 the modes never talk; above it they trade energy and the
-      # tone shifts as the note decays. Needs a big pluck (a) to bite.
+      # stretch stiffening: at 0 the modes never talk, and it needs a big pluck
       g = 0
-      # pluck depth.
+      # pluck depth
       a = 1
 
       x_1'' = k(x_2 - 2x_1) + g((x_2 - x_1)^3 - x_1^3) - c x_1'
@@ -92,15 +77,13 @@ export const DEMOS = [
       x_5'' = k(x_6 - 2x_5 + x_4) + g((x_6 - x_5)^3 - (x_5 - x_4)^3) - c x_5'
       x_6'' = k(x_5 - 2x_6) + g(-x_6^3 - (x_6 - x_5)^3) - c x_6'
 
-      # THE PLUCK: a triangle with its corner at mass 2, released from rest.
-      # Every velocity starts at 0, which is what "let go" means.
+      # the pluck: a triangle peaking at mass 2, released from rest
       x_1(0) = 0.5a
       x_2(0) = a
       x_3(0) = 0.8a
       x_4(0) = 0.6a
       x_5(0) = 0.4a
       x_6(0) = 0.2a
-      # Released from rest: every mass starts with zero velocity.
       x_1'(0) = 0
       x_2'(0) = 0
       x_3'(0) = 0
@@ -120,26 +103,77 @@ export const DEMOS = [
   },
 
   {
+    id: 'colliding-strings',
+    title: 'Colliding strings',
+    blurb:
+      'Two strings a knob apart, plucked away from each other so they swing back and clash. Wind the distance down and every cycle ends in a clatter; wind it up past about 1.2 and they never touch again, and ring on independently.',
+    source: doc(`
+      # Two strings of beads, rest lines d apart. There is no event detection
+      # here: contact is a one-sided penalty force, p max(0, 2r - gap).
+
+      # tension
+      k = 60
+      # damping
+      c = 0.2
+      # DISTANCE between the two rest lines — the knob that changes everything
+      d = 0.5
+      # contact stiffness, tuned so the beads never pass through each other
+      p = 20000
+      # bead radius: contact begins when two centres close to 2r
+      r = 0.1
+      # pluck depth
+      q = 0.5
+
+      # the gap between facing beads i is d + a_i - b_i; max clamps the
+      # overlap at zero, so the force only ever pushes and never pulls
+      a_1'' = k(a_2 - 2a_1) - c a_1' + p max(0, 2r - (d + a_1 - b_1))
+      a_2'' = k(a_3 - 2a_2 + a_1) - c a_2' + p max(0, 2r - (d + a_2 - b_2))
+      a_3'' = k(-2a_3 + a_2) - c a_3' + p max(0, 2r - (d + a_3 - b_3))
+      b_1'' = k(b_2 - 2b_1) - c b_1' - p max(0, 2r - (d + a_1 - b_1))
+      b_2'' = k(b_3 - 2b_2 + b_1) - c b_2' - p max(0, 2r - (d + a_2 - b_2))
+      b_3'' = k(-2b_3 + b_2) - c b_3' - p max(0, 2r - (d + a_3 - b_3))
+
+      # both plucked outwards, in different shapes, released from rest
+      a_1(0) = 0.5q
+      a_2(0) = q
+      a_3(0) = 0.5q
+      b_1(0) = -q
+      b_2(0) = -0.7q
+      b_3(0) = -0.4q
+      a_1'(0) = 0
+      a_2'(0) = 0
+      a_3'(0) = 0
+      b_1'(0) = 0
+      b_2'(0) = 0
+      b_3'(0) = 0
+    `),
+    tSpan: [0, 12],
+    knobs: [
+      { name: 'd', min: 0.25, max: 2, step: 0.01, value: 0.5, label: 'string distance' },
+      { name: 'k', min: 10, max: 250, step: 1, value: 60, label: 'tension' },
+      { name: 'c', min: 0, max: 1.5, step: 0.01, value: 0.2, label: 'damping' },
+    ],
+    audio: true,
+    tags: ['contact', 'collision', 'waves', 'coupling', 'audio'],
+  },
+
+  {
     id: 'harmonic-oscillator',
     title: 'Mass on a spring',
     blurb:
       'The whole of vibration in one row. Damping starts at zero, so the phase portrait is a perfect closed circle and the energy never moves; nudge c off zero and the circle becomes a spiral.',
     source: doc(`
-      # A MASS ON A SPRING
-      #
-      # The spring pulls back in proportion to how far the mass has moved
-      # (-w^2 x) and the dashpot resists however fast it is moving (-c x').
-      # One second-order row; the solver splits it into position and velocity
-      # for you, which is why the phase portrait x against x' is available.
+      # The spring pulls back (-w^2 x), the dashpot resists (-c x'). At c = 0
+      # the phase portrait closes into a circle and the energy never moves.
 
-      # natural frequency: how stiff the spring feels.
+      # natural frequency — how stiff the spring feels
       w = 1
-      # damping. At 0 this runs forever; energy is exactly conserved.
+      # damping
       c = 0
 
       x'' = -w^2 x - c x'
 
-      # Pulled aside by 1 and released from rest.
+      # pulled aside by 1 and released from rest
       x(0) = 1
       x'(0) = 0
     `),
@@ -158,27 +192,21 @@ export const DEMOS = [
     blurb:
       'A pendulum is only a sine wave when you barely disturb it. Started at 3 radians it hangs at the top and rushes through the bottom — pull the angle down toward zero and watch the shape relax into a sine and the period drop by half.',
     source: doc(`
-      # A PENDULUM AT LARGE ANGLE
-      #
-      # The textbook pendulum uses sin q = q, which is a lie that only holds
-      # for small swings. Keep the sine and the swing is no longer a sine
-      # wave in time: near the top the restoring pull almost vanishes, so the
-      # bob loiters there, and the period grows with the amplitude.
-      #
-      # At a = 0.2 the period is 2.0 s. At a = 3.0 it is 5.0 s. Same pendulum.
+      # Keep the sine and the swing is no longer a sine wave in time: near the
+      # top the restoring pull almost vanishes, so the period grows with a.
 
-      # gravity and length set the small-angle period, 2 pi sqrt(l/g).
+      # gravity and length set the small-angle period, 2 pi sqrt(l/g)
       g = 9.81
       l = 1
-      # air drag. Leave at 0 to compare periods honestly.
+      # air drag — leave at 0 to compare periods honestly
       c = 0
-      # the angle it is released from, in radians. pi would be straight up.
+      # release angle in radians; pi would be straight up
       a = 3
 
       q'' = -(g/l) sin q - c q'
 
+      # released from rest at angle a
       q(0) = a
-      # Released from rest at angle a.
       q'(0) = 0
     `),
     tSpan: [0, 20],
@@ -197,28 +225,21 @@ export const DEMOS = [
     blurb:
       'The same spring, now shaken at frequency u. Sweep u slowly through 1 and the response swells about twenty-fold, then collapses again — that peak is resonance, and lowering the damping makes it sharper and taller.',
     source: doc(`
-      # A DRIVEN, DAMPED OSCILLATOR
-      #
-      # Push a swing at any old rhythm and nothing much happens. Push it at
-      # its own frequency and it grows until the damping can bleed away
-      # exactly as much energy per cycle as you put in.
-      #
-      # The first few seconds are the transient — the oscillator's own ring,
-      # dying at rate c. What survives is the drive, at the drive's frequency.
-      # Steady-state amplitude peaks at u = w, where it is about f/(c w).
+      # The first seconds are the oscillator's own ring dying at rate c; what
+      # survives is the drive. Steady amplitude peaks at u = w, near f/(c w).
 
-      # the oscillator's own frequency.
+      # the oscillator's own frequency
       w = 1
-      # damping. Small damping means a tall, narrow resonance peak.
+      # damping — small damping means a tall, narrow peak
       c = 0.15
-      # the DRIVE frequency. This is the knob to sweep.
+      # the DRIVE frequency: this is the knob to sweep
       u = 1
-      # how hard we shake it.
+      # how hard we shake it
       f = 0.5
 
       x'' = -w^2 x - c x' + f cos(u t)
 
-      # starts at rest, at the origin: everything you see was driven.
+      # starts at rest at the origin, so everything you see was driven
       x(0) = 0
       x'(0) = 0
     `),
@@ -239,30 +260,18 @@ export const DEMOS = [
     blurb:
       'Start one swinging and the other still. Within twenty seconds the first has stopped dead and the second has all the motion — then it hands it back. Coupling strength sets how fast they trade; this is the clearest picture of coupling there is.',
     source: doc(`
-      # BEATING: ENERGY SLOSHING BETWEEN TWO OSCILLATORS
-      #
-      # Two identical pendulums, joined by a weak spring. The spring only
-      # cares about the difference between them, so it pushes each one toward
-      # the other: c(y - x) for the first, c(x - y) for the second. That is
-      # the entire coupling — two terms.
-      #
-      # Alone, each has frequency w. Together they have two normal modes:
-      # swinging together (still w) and swinging against each other (faster,
-      # sqrt(w^2 + 2c)). Starting one pendulum alone excites both modes
-      # equally, and the two frequencies drift in and out of step. When they
-      # are out of step, all the motion is in one pendulum; the other is
-      # completely still. Nothing was lost — it is all in the neighbour.
+      # The spring only sees the difference, c(y - x), so the pair trade their
+      # motion: x goes completely still, y has all of it, then back again.
 
-      # each pendulum's own frequency.
+      # each pendulum's own frequency
       w = 1
-      # coupling: how stiff the spring between them is. Weak coupling means a
-      # slow, complete handover; strong coupling means a fast, muddier one.
+      # coupling — weak gives a slow, complete handover
       c = 0.2
 
       x'' = -w^2 x + c(y - x)
       y'' = -w^2 y + c(x - y)
 
-      # one pulled aside, one hanging still, both let go from rest.
+      # one pulled aside, one hanging still, both let go from rest
       x(0) = 1
       y(0) = 0
       x'(0) = 0
@@ -283,27 +292,15 @@ export const DEMOS = [
     blurb:
       'A spring with negative damping when it is small and positive damping when it is large, so it can neither die out nor run away. Every starting point winds onto the same loop — look at it in the phase view, and raise m to see the sine wave turn into a relaxation twitch.',
     source: doc(`
-      # THE VAN DER POL OSCILLATOR
-      #
-      # m(1 - x^2)x' is a damping term that changes its mind. Near x = 0 the
-      # bracket is positive, so the "damping" pumps energy IN. Out past
-      # x = 1 it goes negative and takes energy back out. Neither rest nor
-      # runaway is stable, so the system settles onto the one orbit where the
-      # pumping and the bleeding cancel over a cycle: a LIMIT CYCLE.
-      #
-      # Change x(0), change x'(0), start anywhere you like — after a few
-      # seconds you are on the same loop, at amplitude about 2. That is what
-      # makes it a limit cycle rather than just an orbit: the system chooses
-      # it, not the initial conditions. Heartbeats and neurons work this way.
-      #
-      # At large m the shape stops being a wave: it creeps, then snaps.
+      # m(1 - x^2)x' pumps energy in near x = 0 and takes it back out past
+      # x = 1, so every start winds onto the same loop, at amplitude about 2.
 
-      # nonlinearity. Small m: nearly a sine. Large m: relaxation spikes.
+      # nonlinearity — small m is nearly a sine, large m creeps then snaps
       m = 2
 
       x'' = m(1 - x^2)x' - x
 
-      # a tiny nudge off the (unstable) resting point is all it takes.
+      # a tiny nudge off the unstable resting point is all it takes
       x(0) = 0.1
       x'(0) = 0
     `),
@@ -321,34 +318,22 @@ export const DEMOS = [
     blurb:
       'Hares boom, lynxes follow, hares crash, lynxes starve, repeat — forever, in a closed loop in the phase view. The peaks are permanently a quarter-cycle apart, and no knob setting ever damps the cycle out.',
     source: doc(`
-      # LOTKA-VOLTERRA: PREDATOR AND PREY
-      #
-      # x is prey, y is predators. Prey breed on their own (a x) and are
-      # eaten at a rate set by how often the two meet (b x y). Predators
-      # starve on their own (-c y) and are fed by the same meetings (d x y).
-      # The product x y is the whole model: it is the coupling.
-      #
-      # The population sits at a fixed point when x = c/d and y = a/b.
-      # Anywhere else it circles that point forever — the predator peak
-      # always lags the prey peak by a quarter of a cycle, because predators
-      # can only grow once there is something to eat.
-      #
-      # It never settles. There is a conserved quantity hiding in here, the
-      # same way energy hides in a pendulum: d x - c ln x + b y - a ln y.
+      # Prey x, predators y; the meeting term x y is the whole coupling. It
+      # never settles, and the predator peak lags the prey peak by a quarter.
 
-      # prey birth rate.
+      # prey birth rate
       a = 1
-      # how efficiently predators find prey.
+      # how efficiently predators find prey
       b = 0.5
-      # predator death rate.
+      # predator death rate
       c = 0.75
-      # how much a meal is worth to a predator.
+      # what a meal is worth to a predator
       d = 0.25
 
       x' = a x - b x y
       y' = -c y + d x y
 
-      # well away from the fixed point (3, 2), so the swings are big.
+      # well away from the fixed point (3, 2), so the swings are big
       x(0) = 6
       y(0) = 2
     `),
@@ -368,31 +353,19 @@ export const DEMOS = [
     blurb:
       'Three populations that only ever pass people between them, so the total is pinned at 1 forever. Drop the contact rate b below about 0.15 and the outbreak never starts at all — the curve goes flat, which is the entire argument for intervening early.',
     source: doc(`
-      # THE SIR EPIDEMIC MODEL
-      #
-      # s susceptible, i infected, r recovered — as fractions of one
-      # population. Nobody is created or destroyed: every term that leaves
-      # one row arrives in another, so s + i + r stays exactly 1. That is a
-      # conservation law, and it is worth watching the solver hold it.
-      #
-      # b s i is the meeting term again (see the predator-prey demo — the
-      # mathematics does not care that one is foxes and the other is flu).
-      # g i is recovery.
-      #
-      # The outbreak grows only while b s > g. Since s starts at ~1, the
-      # whole story is the ratio b/g: above 1 there is an epidemic, below 1
-      # the seed infection just fizzles. Nothing else matters at the start.
+      # Fractions of one population, so s + i + r stays exactly 1. The
+      # outbreak grows only while b s > g: the whole story is the ratio b/g.
 
-      # contact rate.
+      # contact rate
       b = 0.6
-      # recovery rate — 1/g is how long people stay infectious.
+      # recovery rate — 1/g is how long people stay infectious
       g = 0.15
 
       s' = -b s i
       i' = b s i - g i
       r' = g i
 
-      # one person in a thousand starts out infected.
+      # one person in a thousand starts out infected
       s(0) = 0.999
       i(0) = 0.001
       r(0) = 0
@@ -412,29 +385,15 @@ export const DEMOS = [
     blurb:
       'The butterfly. Move the initial x by one part in a million — the a knob — and the two runs stay glued together for fifteen seconds before separating completely. Pull r below 24.7 and the chaos vanishes into a fixed point.',
     source: doc(`
-      # THE LORENZ SYSTEM
-      #
-      # A savagely cut-down model of a convecting fluid: x is the roll speed,
-      # y and z are two temperature differences. Three rows, two nonlinear
-      # terms (x z and x y), and no periodic solution anywhere.
-      #
-      # The trajectory never repeats and never escapes. It circles one wing
-      # of the attractor a while, then flips to the other, with no rule you
-      # can write down for when.
-      #
-      # SENSITIVE DEPENDENCE: a is just the starting x. Change it from 1 to
-      # 1.000001 — a millionth — and the two runs are indistinguishable for
-      # about fifteen seconds, then have nothing to do with each other. This
-      # is why weather forecasts stop, and it is why "deterministic" and
-      # "predictable" are not the same word.
-      #
-      # r is the drive. Below about 24.74 all this stops and the flow settles
-      # onto a steady roll; the chaos genuinely switches off.
+      # Three rows, two nonlinear terms, no periodic solution anywhere. Below
+      # r = 24.74 the chaos switches off and the flow settles to a steady roll.
 
+      # Prandtl number
       s = 10
+      # the drive (Rayleigh number)
       r = 28
       b = 8/3
-      # the starting x. Nudge the last digit.
+      # the starting x — nudge the last digit and the runs part by t = 20
       a = 1
 
       x' = s(y - x)
@@ -461,28 +420,14 @@ export const DEMOS = [
     blurb:
       'Inverse-square gravity in two rows, written with a helper function for the distance. At v = 1 the orbit is a circle; anything else is an ellipse that swings out and speeds through perihelion, and past about 1.41 it never comes back.',
     source: doc(`
-      # AN ORBIT
-      #
-      # Gravity pulls toward the origin, along (x, y), with strength m/r^2.
-      # Splitting that into components divides by another r, so each row
-      # carries m/r^3 — which is what the helper row below computes once and
-      # both rows then use.
-      #
-      # A helper function is an ordinary row: name it, give it arguments, use
-      # it anywhere.
-      #
-      # At v = 1 the pull exactly matches what a circle needs. Slower and the
-      # orbit falls inward into an ellipse; faster and it swings out into a
-      # longer one, moving slowest at the far end and fastest at the near end
-      # — Kepler's second law, visible as the spacing of the trail. Past
-      # v = sqrt(2) = 1.414 it is a hyperbola and never returns.
-      #
-      # Two things stay fixed to machine precision the whole way round:
-      # energy, and angular momentum x y' - y x'. Good test of a solver.
+      # Gravity pulls along (x, y) with strength m/r^2; splitting that into
+      # components leaves m/r^3, which the helper row computes once for both.
+      # Energy and the angular momentum x y' - y x' stay fixed all the way.
 
-      # the central mass (times G).
+      # the central mass (times G)
       m = 1
-      # the speed it is launched with, sideways, from a distance of 1.
+      # launch speed, sideways, from a distance of 1. 1 is a circle;
+      # sqrt(2) = 1.414 escapes and never comes back.
       v = 1.1
 
       d(p, q) = (p^2 + q^2)^1.5

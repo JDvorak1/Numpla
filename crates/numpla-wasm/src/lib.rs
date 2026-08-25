@@ -39,10 +39,29 @@ impl Model {
         self.inner.set_source_json(src)
     }
 
-    /// Integrate over `[t0, t1]`. Returns SolveReport as a JSON string.
-    /// Safe to call when the document is invalid — reports `ok: false`.
+    /// Integrate over `[t0, t1]` with the default method. Returns SolveReport
+    /// as a JSON string. Safe to call when the document is invalid — reports
+    /// `ok: false`.
     pub fn solve(&mut self, t0: f64, t1: f64) -> String {
         self.inner.solve_json(t0, t1)
+    }
+
+    /// Integrate with a named method — `"Tsit5"`, `"Verlet"`, `"Yoshida4"`,
+    /// case-insensitive. This is what the mode slider calls.
+    ///
+    /// A string rather than an enum because `wasm_bindgen` enums cross as
+    /// integers, and an integer is exactly the kind of thing that ends up one
+    /// off between a shell and a rebuilt module. The name is echoed back in the
+    /// report, so a mistyped one reports itself instead of silently selecting
+    /// a neighbour.
+    pub fn solve_with(&mut self, t0: f64, t1: f64, method: &str) -> String {
+        self.inner.solve_named_json(t0, t1, method)
+    }
+
+    /// The available methods as JSON, in slider order — so the shell builds the
+    /// slider from the implementation rather than from a copy of it.
+    pub fn methods() -> String {
+        numpla_model::Model::methods_json()
     }
 
     /// Uniformly sample the last solution: `n` points, flattened row-major as
@@ -61,5 +80,21 @@ impl Model {
     /// StepRecord list as JSON — for the telemetry strip.
     pub fn telemetry(&self) -> String {
         self.inner.telemetry_json()
+    }
+
+    /// Track a named row along the last solution. Returns ConservationReport as
+    /// a JSON string; the series itself comes back from `conservation_series`.
+    ///
+    /// `samples` is a floor, not a quota — pass 0 to let the model choose. See
+    /// `docs/wasm-api.md`: asking for a pixel count is how a bounded energy
+    /// wobble gets reported as drift.
+    pub fn conservation(&mut self, name: &str, samples: usize) -> String {
+        self.inner.conservation_json(name, samples)
+    }
+
+    /// The series behind the last `conservation` call, flattened as `[t, value]`
+    /// pairs. Length = `2 * samples`. Empty if that call failed.
+    pub fn conservation_series(&self) -> Vec<f64> {
+        self.inner.conservation_series()
     }
 }

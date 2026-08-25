@@ -53,7 +53,7 @@
 
   /* the fixed geometry of the shell */
   --topbar-h:   52px;
-  --controls-h: 66px;   /* transport only: play, t, readout */
+  --plothead-h: 42px;   /* the plot's control strip: play, views, frame */
   --div-w:      9px;
   --doc-w:      348px;   /* driven by the divider; persisted in localStorage */
 }
@@ -217,10 +217,12 @@ body.ready .loader {
    App shell + entrance
    ============================================================ */
 
+/* Two rows, not three: the transport moved onto the plot's own control strip
+   and the bottom bar is gone, so the workspace has that height. */
 .app {
   height: 100%;
   display: grid;
-  grid-template-rows: var(--topbar-h) minmax(0, 1fr) var(--controls-h);
+  grid-template-rows: var(--topbar-h) minmax(0, 1fr);
   overflow: hidden;
   opacity: 0;
   transform: translateY(14px) scale(.988);
@@ -232,10 +234,9 @@ body.ready .loader {
 
 body.ready .app { opacity: 1; transform: none; }
 
-/* staggered settle of the three regions */
+/* staggered settle of the two regions */
 body.ready .topbar    { animation: settle 620ms var(--ease) 260ms both; }
 body.ready .workspace { animation: settle 700ms var(--ease) 340ms both; }
-body.ready .controls  { animation: settle 700ms var(--ease) 430ms both; }
 
 @keyframes settle {
   from { opacity: 0; transform: translateY(8px); }
@@ -246,7 +247,7 @@ body.ready .controls  { animation: settle 700ms var(--ease) 430ms both; }
   .loader, .app { transition-duration: 140ms; transition-delay: 0ms; }
   body.ready .app { transform: none; }
   .loader__spiral, .loader__bar, .loader__inner,
-  body.ready .topbar, body.ready .workspace, body.ready .controls {
+  body.ready .topbar, body.ready .workspace {
     animation: none !important;
   }
   body.ready .loader { transform: none; filter: none; }
@@ -649,18 +650,22 @@ body.is-resizing { cursor: col-resize; user-select: none; }
 
 .plot {
   display: grid;
-  grid-template-rows: 46px minmax(0, 1fr);
+  grid-template-rows: var(--plothead-h) minmax(0, 1fr);
   min-height: 0;
   overflow: hidden;
 }
 
+/* One fixed strip. Every control that acts on the picture is here: play/pause,
+   which views are on, and the frame. A fixed height, so nothing in it can ever
+   change the size of the canvas below. */
 .plot__head {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-  padding: 0 20px;
+  gap: 12px;
+  height: var(--plothead-h);
+  padding: 0 16px 0 18px;
   border-bottom: 1px solid var(--line-soft);
+  min-width: 0;
   overflow: hidden;
 }
 
@@ -673,6 +678,7 @@ body.is-resizing { cursor: col-resize; user-select: none; }
   display: block;
   width: 100%;
   height: 100%;
+  touch-action: none;   /* the pointer gestures are pan / scale / zoom */
 }
 
 /* -- view chips -------------------------------------------- */
@@ -704,60 +710,65 @@ body.is-resizing { cursor: col-resize; user-select: none; }
 }
 .viewchip:hover { color: var(--text); }
 
-.viewchip.is-active {
+/* ON, not "the one selected": each chip is its own switch. */
+.viewchip.is-on {
   background: var(--paper);
   color: var(--accent);
   box-shadow: var(--shadow-1);
 }
 
-/* Disabled chips stay visible but muted - they are the discovery
-   mechanism, so they are never hidden. */
+/* A view the model cannot support stays visible but muted - it is how the
+   capability is discovered, so it is never hidden. If it was already on when
+   support went away it stays on (and says why on the canvas): nothing is ever
+   switched off on the user's behalf. */
 .viewchip.is-off {
   color: #bcc2cb;
   cursor: not-allowed;
 }
 .viewchip.is-off:hover { color: #bcc2cb; }
-
-.legend {
-  display: flex;
-  gap: 14px;
-  font-family: var(--mono);
-  font-size: 11.5px;
-  overflow: hidden;
-  white-space: nowrap;
+.viewchip.is-on.is-off {
+  background: var(--paper);
+  color: #b6bcc6;
+  box-shadow: var(--shadow-1);
+  cursor: pointer;
 }
-.legend__item { display: inline-flex; align-items: center; gap: 7px; color: var(--text-2); }
-.legend__swatch { width: 9px; height: 9px; border-radius: 2px; flex: 0 0 auto; }
+
+/* -- the frame controls ------------------------------------- */
+
+.frames { display: inline-flex; gap: 4px; flex: 0 0 auto; }
+
+.framebtn {
+  appearance: none;
+  padding: 3px 10px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--paper);
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: .02em;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: color 160ms var(--ease), border-color 160ms var(--ease),
+              background-color 160ms var(--ease);
+}
+.framebtn:hover { color: var(--accent); border-color: var(--accent-line); background: var(--accent-tint); }
+/* Lit while the frame is NOT the default one: the way back is visible
+   exactly when there is something to go back from. */
+.framebtn.is-live { color: var(--accent); border-color: var(--accent-line); }
 
 /* ============================================================
-   Transport - play/pause, the t slider, the readout
+   Play/pause - the only transport control left
 
-   `t` is the only slider here. Parameter sliders belong to the
-   rows that define them (see .row__knob), which is where the
-   number they drive is written.
+   There is no `t` widget. `t` is a row in the System pane like
+   any other variable (`t = [0, 20]` says what the span is), and
+   its slider lives on that row exactly like `k`'s does.
    ============================================================ */
-
-.controls {
-  height: var(--controls-h);
-  display: flex;
-  align-items: center;
-  gap: 18px;
-  padding: 0 20px;
-  border-top: 1px solid var(--line);
-  background: var(--paper);
-  overflow: hidden;
-}
-
-.transport {
-  flex: 1 1 auto;
-  min-width: 0;
-  max-width: 560px;
-}
 
 .playbtn {
   flex: 0 0 auto;
-  width: 28px;
-  height: 28px;
+  width: 24px;
+  height: 24px;
   display: grid;
   place-items: center;
   border-radius: 50%;
@@ -776,6 +787,8 @@ body.is-resizing { cursor: col-resize; user-select: none; }
 .playbtn.is-playing .icon--play  { display: none; }
 .playbtn.is-playing .icon--pause { display: block; }
 
+/* The readout doubles as the legend - the same colour, the same name, plus the
+   value at the playhead - so the plot needs only one of them. */
 .readout {
   flex: 1 1 auto;
   display: flex;
@@ -790,7 +803,7 @@ body.is-resizing { cursor: col-resize; user-select: none; }
   display: inline-flex;
   align-items: baseline;
   gap: 8px;
-  padding: 3px 11px;
+  padding: 2px 10px;
   border-radius: 999px;
   border: 1px solid var(--line);
   background: var(--paper-2);
@@ -803,65 +816,8 @@ body.is-resizing { cursor: col-resize; user-select: none; }
 .chip__name { color: var(--muted); }
 .chip__val { color: var(--text); font-variant-numeric: tabular-nums; }
 
-/* -- the t slider ------------------------------------------ */
-
-.slider {
-  min-width: 0;
-  padding: 2px 0 4px;
-  border-radius: var(--r-sm);
-  transition: background-color 160ms var(--ease);
-}
-.slider.is-open { background: var(--accent-tint); }
-
-.slider__top {
-  display: flex;
-  align-items: baseline;
-  gap: 8px;
-  height: 20px;
-}
-
-.slider__name {
-  appearance: none;
-  border: 0;
-  padding: 0 2px;
-  background: transparent;
-  font-family: var(--mono);
-  font-size: 13px;
-  color: var(--text);
-  cursor: pointer;
-  border-bottom: 1px dotted var(--line-strong);
-  transition: color 160ms var(--ease), border-color 160ms var(--ease);
-}
-.slider__name:hover { color: var(--accent); border-bottom-color: var(--accent-line); }
-.slider.is-open .slider__name { color: var(--accent); border-bottom-color: var(--accent); }
-
-.slider__value {
-  flex: 1 1 auto;
-  min-width: 0;
-  font-family: var(--mono);
-  font-size: 12.5px;
-  color: var(--text-2);
-  font-variant-numeric: tabular-nums;
-  white-space: nowrap;
-  overflow: hidden;
-}
-
-.slider__gear {
-  flex: 0 0 auto;
-  width: 20px;
-  height: 18px;
-  display: grid;
-  place-items: center;
-  border: 0;
-  border-radius: 5px;
-  background: transparent;
-  color: #b8bfc9;
-  cursor: pointer;
-  transition: color 160ms var(--ease), background-color 160ms var(--ease);
-}
-.slider__gear:hover { color: var(--accent); background: var(--accent-tint); }
-.slider__gear svg { width: 13px; height: 13px; fill: currentColor; }
-.slider.is-open .slider__gear { color: var(--accent); }
+/* There is no `.slider` any more: every slider in the app is a `.knob` on the
+   row that defines its variable, `t` included. See .row__knob above. */
 
 /* -- range input, restyled for paper ----------------------- */
 
@@ -989,13 +945,14 @@ body.is-resizing { cursor: col-resize; user-select: none; }
    ============================================================ */
 
 @media (max-width: 1080px) {
-  .legend { display: none; }
+  .framebtn { padding: 3px 8px; }
 }
 
 @media (max-width: 900px) {
   .readout { display: none; }
   .telemetry .stat { display: none; }
   .telemetry .stat--solve { display: inline-flex; }
+  .info { width: calc(100vw - 20px); }
 }
 
 @media (max-width: 760px) {
@@ -1092,3 +1049,285 @@ body.is-resizing { cursor: col-resize; user-select: none; }
   border: 1px solid var(--line-soft);
   background: var(--paper-2);
 }
+
+/* ── the reference ──────────────────────────────────────────────────────
+   "What can I type here?" used to be answerable only by reading the Rust
+   source. It is a searchable list next to the solve status, and every entry
+   is insertable, so it is a way to write and not only a way to read. Like
+   the other two overlays it is fixed-position: opening it cannot reflow the
+   workspace. */
+
+.sr-only {
+  position: absolute;
+  width: 1px; height: 1px;
+  margin: -1px; padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.infobtn {
+  flex: 0 0 auto;
+  width: 22px;
+  height: 22px;
+  display: inline-grid;
+  place-items: center;
+  padding: 0;
+  border: 1px solid var(--line-strong);
+  border-radius: 50%;
+  background: var(--paper);
+  color: var(--muted);
+  font: inherit;
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+  transition: color 160ms var(--ease), border-color 160ms var(--ease),
+              background-color 160ms var(--ease);
+}
+.infobtn:hover { color: var(--accent); border-color: var(--accent-line); background: var(--accent-tint); }
+.infobtn[aria-expanded="true"] {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: var(--accent-tint);
+}
+
+.info {
+  position: fixed;
+  z-index: 80;
+  width: 440px;
+  max-width: calc(100vw - 20px);
+  max-height: min(560px, calc(100vh - 90px));
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r);
+  background: var(--paper);
+  box-shadow: var(--shadow-2);
+  animation: pop 150ms var(--ease) both;
+  overflow: hidden;
+}
+.info[hidden] { display: none; }
+
+.info__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 10px 9px 12px;
+  border-bottom: 1px solid var(--line-soft);
+  background: var(--paper-2);
+}
+
+.info__search {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-family: var(--mono);
+  font-size: 12.5px;
+  color: var(--text);
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 6px 9px;
+  transition: border-color 160ms var(--ease), box-shadow 160ms var(--ease);
+}
+.info__search::placeholder { color: var(--faint); }
+.info__search:focus {
+  outline: none;
+  border-color: var(--accent-line);
+  box-shadow: 0 0 0 3px var(--accent-tint);
+}
+
+.info__close {
+  flex: 0 0 auto;
+  width: 24px; height: 24px;
+  display: grid; place-items: center;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: #c2c8d1;
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+  transition: color 140ms var(--ease), background-color 140ms var(--ease);
+}
+.info__close:hover { color: var(--error); background: var(--error-tint); }
+
+.info__list {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 4px 0 8px;
+  scrollbar-width: thin;
+  scrollbar-color: #dde1e6 transparent;
+}
+.info__list::-webkit-scrollbar { width: 10px; }
+.info__list::-webkit-scrollbar-thumb {
+  background: #dde1e6;
+  border: 3px solid var(--paper);
+  border-radius: 999px;
+}
+
+.info__group {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  padding: 9px 14px 5px;
+  background: var(--paper);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: .14em;
+  text-transform: uppercase;
+  color: var(--faint);
+}
+
+.info__note {
+  padding: 0 14px 6px;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+/* One entry: signature, description, and the two ways to take it with you. */
+.entry {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: baseline;
+  gap: 2px 8px;
+  width: 100%;
+  padding: 6px 12px 6px 14px;
+  border: 0;
+  border-left: 2px solid transparent;
+  background: none;
+  text-align: left;
+  font: inherit;
+  color: var(--text);
+  cursor: pointer;
+  transition: background-color 110ms var(--ease), border-color 110ms var(--ease);
+}
+.entry:hover { background: var(--paper-2); }
+.entry.is-sel { background: var(--paper-2); border-left-color: var(--accent-line); }
+.entry:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+
+.entry__sig {
+  grid-column: 1;
+  font-family: var(--mono);
+  font-size: 12.5px;
+  color: var(--text);
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.entry.is-live .entry__sig { color: var(--accent); }
+
+.entry__desc {
+  grid-column: 1 / -1;
+  grid-row: 2;
+  font-size: 11.5px;
+  line-height: 1.4;
+  color: var(--muted);
+  min-width: 0;
+}
+
+.entry__act {
+  grid-row: 1;
+  flex: 0 0 auto;
+  padding: 2px 8px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--paper);
+  color: var(--faint);
+  font: inherit;
+  font-size: 10.5px;
+  line-height: 15px;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 120ms var(--ease), color 140ms var(--ease),
+              border-color 140ms var(--ease), background-color 140ms var(--ease);
+}
+.entry:hover .entry__act,
+.entry.is-sel .entry__act,
+.entry__act:focus-visible { opacity: 1; }
+.entry__act:hover { color: var(--accent); border-color: var(--accent-line); background: var(--accent-tint); }
+
+.info__empty {
+  padding: 20px 14px;
+  text-align: center;
+  font-size: 12px;
+  color: var(--faint);
+}
+
+.info__foot {
+  flex: 0 0 auto;
+  margin: 0;
+  padding: 8px 14px;
+  border-top: 1px solid var(--line-soft);
+  background: var(--paper-2);
+  font-size: 10.5px;
+  color: var(--faint);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* `t` in the readout: the playhead's own number. No series colour, because it
+   is not a series - it is the row `t = [0, 20]` saying where you are in it. */
+.chip--t .chip__dot {
+  background: transparent;
+  border: 1px solid var(--line-strong);
+}
+.chip--t .chip__name { color: var(--accent); }
+
+/* ── hear ───────────────────────────────────────────────────────────────
+   Sound is a way of looking at a signal, so the control sits quietly with
+   the view switches, and its panel is a fixed-position overlay like every
+   other panel here — opening it must not reflow the workspace. */
+
+.framebtn--hear { display: inline-flex; align-items: center; gap: 5px; }
+.framebtn--hear .icon { width: 13px; height: 13px; }
+.framebtn--hear.is-on { color: var(--accent); border-color: var(--accent-line); background: var(--accent-tint); }
+
+.hearpanel {
+  position: fixed;
+  z-index: 70;
+  width: 232px;
+  padding: 12px 14px 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r);
+  background: var(--paper);
+  box-shadow: var(--shadow-2);
+  animation: pop 150ms var(--ease) both;
+}
+.hearpanel[hidden] { display: none; }
+
+.hearpanel__head { display: flex; align-items: center; margin-bottom: 9px; }
+.hearpanel__title {
+  font-size: 11px; letter-spacing: .07em; text-transform: uppercase; color: var(--muted);
+}
+.hearpanel__close {
+  margin-left: auto; padding: 0 4px; font-size: 15px; line-height: 1;
+  color: var(--muted); background: none; border: 0; cursor: pointer;
+}
+.hearpanel__close:hover { color: var(--text); }
+
+.hearpanel__field {
+  display: grid; grid-template-columns: 52px 1fr; align-items: center;
+  gap: 8px; margin-bottom: 6px; font-size: 12px; color: var(--text-2);
+}
+.hearpanel__field input,
+.hearpanel__field select {
+  width: 100%; padding: 4px 6px; font: inherit; font-size: 12px;
+  color: var(--text); background: var(--paper-2);
+  border: 1px solid var(--line); border-radius: 6px;
+}
+.hearpanel__field input:focus-visible,
+.hearpanel__field select:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+.hearpanel__note {
+  margin: 8px 0 10px; font-size: 11px; line-height: 1.4; color: var(--muted);
+  min-height: 2.8em;   /* reserved, so a message can never resize the panel */
+}
+.hearpanel__play {
+  width: 100%; padding: 6px 0; font: inherit; font-size: 12.5px;
+  color: var(--accent); background: var(--accent-tint);
+  border: 1px solid var(--accent-line); border-radius: 7px; cursor: pointer;
+}
+.hearpanel__play:hover { background: var(--paper-2); }
+.hearpanel__play:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }

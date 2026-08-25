@@ -52,6 +52,14 @@
       <span class="stat" title="Rejected steps"><i>rej</i><b id="stat-rejected">—</b></span>
       <span class="stat" title="Right-hand-side evaluations"><i>rhs</i><b id="stat-rhs">—</b></span>
       <span class="stat stat--solve" id="stat-solve">idle</span>
+      <!-- Next to the status, because "what can I type here?" is the question
+           the status raises. -->
+      <button id="info-btn" class="infobtn" type="button"
+              aria-haspopup="dialog" aria-expanded="false" aria-controls="infopanel"
+              title="What can I type here? (F1)">
+        <span aria-hidden="true">?</span>
+        <span class="sr-only">Open the reference</span>
+      </button>
     </div>
   </header>
 
@@ -82,16 +90,48 @@
          aria-orientation="vertical" aria-label="Resize the expression pane"
          title="Drag to resize · arrow keys to nudge"><span class="divider__grip" aria-hidden="true"></span></div>
 
-    <!-- one plot surface -->
+    <!-- One plot surface. Its control strip owns everything that acts on the
+         picture: play/pause, which views are on, and the frame. There is no
+         bottom bar - the plot has that height instead - and no `t` widget:
+         `t` is a row in the system like any other variable. -->
     <section class="pane pane--plot">
       <div class="plot">
         <div class="plot__head">
-          <div class="views" id="views" role="group" aria-label="Plot view">
-            <button class="viewchip is-active" type="button" data-view="time">t–y</button>
-            <button class="viewchip" type="button" data-view="phase">phase</button>
-            <button class="viewchip" type="button" data-view="polar">polar</button>
+          <button id="play" class="playbtn" type="button" aria-label="Play" title="Play / pause (space)">
+            <svg class="icon icon--play" viewBox="0 0 16 16" aria-hidden="true"><path d="M4.5 2.8v10.4L13 8z"/></svg>
+            <svg class="icon icon--pause" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 2.6h3v10.8H4zM9 2.6h3v10.8H9z"/></svg>
+          </button>
+
+          <!-- Independent switches, not a choice: any number may be on. -->
+          <div class="views" id="views" role="group" aria-label="Plot views">
+            <button class="viewchip is-on" type="button" data-view="time" aria-pressed="true">t–y</button>
+            <button class="viewchip" type="button" data-view="phase" aria-pressed="false">phase</button>
+            <button class="viewchip" type="button" data-view="polar" aria-pressed="false">polar</button>
           </div>
-          <div class="legend" id="legend"></div>
+
+          <!-- Hear. Deliberately quiet: sound is a way of looking at a
+               signal, not the headline control. -->
+          <button id="hear-btn" class="framebtn framebtn--hear" type="button"
+                  aria-haspopup="dialog" aria-expanded="false" aria-controls="hearpanel"
+                  title="Listen to a state as sound">
+            <svg class="icon" viewBox="0 0 16 16" aria-hidden="true">
+              <path d="M3.5 6.2h2.3L9 3.4v9.2L5.8 9.8H3.5z" fill="currentColor"/>
+              <path d="M11 5.8a3.4 3.4 0 0 1 0 4.4" fill="none" stroke="currentColor"
+                    stroke-width="1.4" stroke-linecap="round"/>
+            </svg>
+            hear
+          </button>
+
+          <div class="frames">
+            <button id="frame-fit" class="framebtn" type="button"
+                    title="Fit every visible view around its own curve">fit</button>
+            <button id="frame-reset" class="framebtn" type="button"
+                    title="Back to the default frame: −5 to 5 on both axes">−5…5</button>
+          </div>
+
+          <!-- The readout is the legend, and it is where `t` is read: colour,
+               name, value at the playhead. -->
+          <div class="readout" id="readout"></div>
         </div>
         <div class="plot__canvas"><canvas id="canvas"></canvas></div>
       </div>
@@ -99,18 +139,34 @@
 
   </main>
 
-  <!-- Transport. `t` is the one knob with no row to live on - it is the
-       playhead, not a parameter - so it stays here with play/pause and the
-       readout. Every OTHER slider lives on the row that defines it. -->
-  <footer class="controls">
-    <button id="play" class="playbtn" type="button" aria-label="Play" title="Play / pause (space)">
-      <svg class="icon icon--play" viewBox="0 0 16 16" aria-hidden="true"><path d="M4.5 2.8v10.4L13 8z"/></svg>
-      <svg class="icon icon--pause" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 2.6h3v10.8H4zM9 2.6h3v10.8H9z"/></svg>
-    </button>
-    <div class="transport" id="transport"></div>
-    <div class="readout" id="readout"></div>
-  </footer>
+</div>
 
+<!-- Hear. A document-level overlay in fixed coordinates, like the other
+     panels, so opening it cannot reflow the workspace. -->
+<div class="hearpanel" id="hearpanel" role="dialog" aria-modal="false"
+     aria-label="Listen to a state" hidden>
+  <div class="hearpanel__head">
+    <span class="hearpanel__title">hear</span>
+    <button class="hearpanel__close" id="hear-close" type="button" aria-label="Close">&#215;</button>
+  </div>
+  <label class="hearpanel__field">
+    <span>state</span>
+    <select id="hear-state"></select>
+  </label>
+  <label class="hearpanel__field">
+    <span>from</span>
+    <input id="hear-from" type="number" step="any">
+  </label>
+  <label class="hearpanel__field">
+    <span>to</span>
+    <input id="hear-to" type="number" step="any">
+  </label>
+  <label class="hearpanel__field">
+    <span>speed</span>
+    <input id="hear-compression" type="number" step="any" min="0.1">
+  </label>
+  <p class="hearpanel__note" id="hear-note">simulation seconds per second of sound</p>
+  <button class="hearpanel__play" id="hear-play" type="button">listen</button>
 </div>
 
 <!-- Demo gallery. Like the slider settings, a document-level overlay in fixed
@@ -131,6 +187,22 @@
     <label class="settings__field"><span>step</span><input id="settings-step" type="number" step="any" min="0"></label>
   </div>
   <p class="settings__foot" id="settings-foot">Esc to close</p>
+</div>
+
+<!-- The reference. What the engine supports, searchable by name and by
+     description, with every entry insertable into the document - so it is a way
+     to write and not only a way to read. A document-level overlay, like the
+     other two, so opening it cannot reflow the workspace. -->
+<div class="info" id="infopanel" role="dialog" aria-modal="false"
+     aria-label="What this engine supports" hidden>
+  <div class="info__head">
+    <input id="info-search" class="info__search" type="search" autocomplete="off"
+           spellcheck="false" placeholder="search: sin, noise, symplectic, x'' …"
+           aria-label="Search the reference" aria-controls="info-list">
+    <button id="info-close" class="info__close" type="button" aria-label="Close the reference">×</button>
+  </div>
+  <div class="info__list" id="info-list" role="list" aria-label="Reference entries"></div>
+  <p class="info__foot" id="info-foot"></p>
 </div>
 
 <script type="module" src="./main.js"></script>

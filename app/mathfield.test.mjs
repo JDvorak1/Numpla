@@ -11,6 +11,7 @@
 import {
   A, MathModel, parseSource, toSource, toLatex, newState, typeString,
   backspace, moveLeft, moveRight, moveVert, curList, slotKeys, tailStart, functionNamesIn, normaliseFunctions,
+  FUNCS, CONSTS, arityOf, commonPrefix,
 } from './mathfield.js';
 import { DEMOS } from './demos.js';
 
@@ -977,7 +978,394 @@ function reflow(source, funcs) {
 }
 
 // ---------------------------------------------------------------------------
-// 16. The rendering half, over a ~40-line DOM shim
+// 16. Tab completion
+//
+// Type a prefix, press Tab. One match completes; several fill in as much as the
+// candidates agree on and then, when that adds nothing, offer a menu. Nothing
+// completes to something the engine does not have - there is no `diff`.
+// ---------------------------------------------------------------------------
+
+/** Type `text` into a fresh row, press Tab, and report what happened. */
+function tabbed(text, names) {
+  const m = new MathModel();
+  if (names) m.setDocumentNames(names);
+  m.type(text);
+  const r = m.tab();
+  return { model: m, action: r.action, source: m.source, cands: r.candidates };
+}
+
+const labelsOf = (r) => (r.cands || r.candidates || []).map((c) => c.label).join(' | ');
+
+// --- one match completes ----------------------------------------------------
+
+{
+  const cases = [
+    ['sq', 'sqrt()'], ['sqr', 'sqrt()'], ['ab', 'abs()'], ['fl', 'floor()'],
+    ['ce', 'ceil()'], ['ro', 'round()'], ['ex', 'exp()'], ['mo', 'mod(, )'],
+    ['wh', 'white()'], ['sm', 'smooth()'], ['te', 'telegraph()'],
+    ['bl', 'blue()'], ['br', 'brown()'], ['pin', 'pink()'],
+    ['arcs', 'arcsin()'], ['arcc', 'arccos()'], ['arct', 'arctan()'],
+  ];
+  for (const [prefix, want] of cases) {
+    const r = tabbed(prefix);
+    eq('Tab on ' + JSON.stringify(prefix) + ' completes', r.source, want);
+    eq('and reports it: ' + prefix, r.action, 'applied');
+  }
+}
+
+{
+  // Every builtin the engine has is reachable, and completes to itself.
+  for (const name of FUNCS) {
+    const m = new MathModel();
+    m.st.root = Array.from(name.slice(0, -1)).map((c) => A.var(c));
+    m.st.index = m.st.root.length;
+    const before = m.st.root.length;
+    const r = m.tab();
+    ok('a prefix of ' + name + ' completes to something', r.action !== 'none');
+    ok('and it offers ' + name,
+      r.action === 'applied' || r.candidates.some((c) => c.word === name),
+      labelsOf(r));
+    ok('the prefix was consumed for ' + name,
+      r.action !== 'applied' || m.st.root.length < before + name.length);
+  }
+  for (const name of CONSTS) {
+    const m = new MathModel();
+    m.type(name.slice(0, 1));
+    const r = m.tab();
+    ok('the constant ' + name + ' is offered',
+      r.candidates.some((c) => c.word === name)
+      || (r.action === 'applied' && m.source === name), labelsOf({ cands: r.candidates }));
+  }
+}
+
+// --- structure, not letters -------------------------------------------------
+
+{
+  const r = tabbed('sq');
+  eq('sqrt completes to a real radical', r.model.root[0].type, 'sqrt');
+  ok('and not to four letters', !r.model.root.some((a) => a.type === 'var'));
+  r.model.type('2');
+  eq('with the caret inside it', r.model.source, 'sqrt(2)');
+}
+
+{
+  const r = tabbed('wh');
+  eq('a noise call is a function atom', r.model.root[0].type, 'func');
+  eq('with its parentheses', r.model.root[1].type, 'group');
+}
+
+// --- caret placement --------------------------------------------------------
+
+{
+  const after = (prefix, typing) => {
+    const r = tabbed(prefix);
+    r.model.type(typing);
+    return r.model.source;
+  };
+  eq('sqrt leaves the caret inside the radical', after('sq', 'x'), 'sqrt(x)');
+  eq('abs leaves it inside the call', after('ab', 'x'), 'abs(x)');
+  eq('min leaves it in the first argument', after('mi', 'a'), 'min(a, )');
+  eq('max too', after('ma', 'a'), 'max(a, )');
+  eq('mod too', after('mo', 'a'), 'mod(a, )');
+  eq('log leaves it on the only required argument', after('lo', 'x'), 'log(x)');
+  eq('a noise call leaves it on t', after('sm', 't'), 'smooth(t)');
+  // rand() usually wants no argument at all, so the caret lands after the call.
+  eq('rand leaves the caret after the call', after('randn', '+1'), 'randn() + 1');
+  eq('and the argument is still reachable', (() => {
+    const m = new MathModel();
+    m.type('randn');
+    m.left();
+    m.type('7');
+    return m.source;
+  })(), 'randn(7)');
+}
+
+{
+  // The second argument of a two-argument call is one arrow away, and typing a
+  // comma steps over the one that is already there rather than doubling it.
+  const m = new MathModel();
+  m.type('mi');
+  m.tab();
+  m.type('a');
+  m.type(',');
+  m.type('b');
+  eq('a two-argument call fills in naturally', m.source, 'min(a, b)');
+}
+
+// --- several matches --------------------------------------------------------
+
+{
+  const r = tabbed('ar');
+  eq('a shared prefix is filled in first', r.action, 'extended');
+  eq('as far as the candidates agree', r.source, 'arc');
+  eq('and all three are still on offer', r.cands.length, 3);
+  const again = r.model.tab();
+  eq('a second Tab has nothing left to fill in', again.action, 'menu');
+  eq('so it offers the three', again.candidates.map((c) => c.word).join(','),
+    'arccos,arcsin,arctan');
+}
+
+{
+  // When the shared prefix is itself a name, filling it in would look finished.
+  const r = tabbed('si');
+  eq('so the menu opens instead', r.action, 'menu');
+  eq('with nothing typed for the user', r.source, 'si');
+  eq('shortest first, then alphabetical', r.cands.map((c) => c.word).join(','),
+    'sin,sign,sinh');
+  const rr = tabbed('ra');
+  eq('rand and randn behave the same way', rr.action, 'menu');
+  eq('and both are offered', rr.cands.map((c) => c.word).join(','), 'rand,randn');
+  eq('nothing was typed', rr.source, 'ra');
+}
+
+{
+  const r = tabbed('c');
+  ok('a one-letter prefix still offers what starts with it',
+    r.cands.every((c) => !c.word || c.word.startsWith('c')), labelsOf(r));
+  ok('including cos and ceil',
+    r.cands.some((c) => c.word === 'cos') && r.cands.some((c) => c.word === 'ceil'));
+}
+
+// --- nothing matches --------------------------------------------------------
+
+{
+  for (const prefix of ['zz', 'qq', 'diff', 'derivative', 'integrate', 'solve']) {
+    const r = tabbed(prefix);
+    eq('Tab on ' + JSON.stringify(prefix) + ' does nothing', r.action, 'none');
+    eq('and leaves the row alone', r.source, new MathModel(prefix).source);
+  }
+  ok('there is no diff to complete',
+    !FUNCS.includes('diff') && !CONSTS.includes('diff'));
+}
+
+{
+  const m = new MathModel();
+  const r = m.tab();
+  eq('Tab on an empty row does nothing', r.action, 'none');
+  eq('and Tab mid-expression with no prefix does nothing',
+    (() => { const n = new MathModel('1 + 2'); return n.tab().action; })(), 'none');
+}
+
+// --- the names really are the engine's --------------------------------------
+
+{
+  // The builtin list is the lexer's list; the noise family is in it because the
+  // lexer reserves those names too (crates/numpla-expr/src/lexer.rs).
+  for (const n of ['sin', 'cos', 'tan', 'sqrt', 'exp', 'ln', 'log', 'abs', 'min',
+    'max', 'floor', 'ceil', 'round', 'sign', 'mod', 'arcsin', 'arccos', 'arctan',
+    'sinh', 'cosh', 'tanh', 'white', 'pink', 'brown', 'blue', 'smooth',
+    'telegraph', 'rand', 'randn']) {
+    ok('the field knows ' + n, FUNCS.includes(n));
+  }
+  for (const n of ['pi', 'tau', 'inf']) ok('the field knows ' + n, CONSTS.includes(n));
+  eq('two-argument builtins', ['min', 'max', 'mod'].map((n) => arityOf(n).join('-')).join(' '),
+    '2-2 2-2 2-2');
+  eq('log takes an optional base', arityOf('log').join('-'), '1-2');
+  eq('noise takes an optional rate and seed', arityOf('smooth').join('-'), '1-3');
+  eq('rand takes an optional seed', arityOf('rand').join('-'), '0-1');
+  eq('everything else takes one', arityOf('sin').join('-'), '1-1');
+}
+
+// --- a name that inflated can still grow ------------------------------------
+
+{
+  // `sin` inflates the moment it is typed, so `sinh` has to be able to grow out
+  // of it - likewise `pink` out of `pi` and `randn` out of `rand`.
+  const typed = (t) => { const m = new MathModel(); m.type(t); return m.source; };
+  eq('sinh is typeable', typed('sinh'), 'sinh()');
+  eq('cosh is typeable', typed('cosh'), 'cosh()');
+  eq('tanh is typeable', typed('tanh'), 'tanh()');
+  eq('pink is typeable', typed('pink'), 'pink()');
+  eq('randn is typeable', typed('randn'), 'randn()');
+  eq('and the short names still inflate', typed('sin'), 'sin()');
+  eq('pi still inflates', typed('pi'), 'pi');
+  eq('rand still inflates', typed('rand'), 'rand()');
+  eq('pi times t is still a product', typed('pit'), 'pit');
+  eq('sin of x is still sin of x', typed('sinx'), 'sin(x)');
+  eq('a full noise call types straight through', typed('smootht'), 'smooth(t)');
+  eq('and so does a nested one', typed('sqrtpink2'), 'sqrt(pink(2))');
+}
+
+// --- row kinds --------------------------------------------------------------
+
+{
+  const r = tabbed('x');
+  eq('a lone identifier offers the row kinds', r.action, 'menu');
+  eq('all four of them',
+    r.cands.map((c) => c.label).join(' | '), "x' = | x'' = | x(0) = | x(u) =");
+  ok('and nothing else', r.cands.every((c) => c.kind === 'row'));
+}
+
+{
+  /** Pick a candidate by the label the menu shows, then apply it. */
+  const pick = (prefix, label, typing) => {
+    const r = tabbed(prefix);
+    const chosen = r.cands.find((c) => c.label === label);
+    ok('there is a candidate labelled ' + label, !!chosen, labelsOf(r));
+    if (!chosen) return null;
+    chosen.apply(r.model.st);
+    if (typing) r.model.type(typing);
+    return r.model.source;
+  };
+  eq('first-order ODE row, caret after the equals',
+    pick('x', "x' =", '-y'), "x' = -y");
+  eq('second-order ODE row', pick('x', "x'' =", '-x'), "x'' = -x");
+  eq('initial condition', pick('x', 'x(0) =', '1'), 'x(0) = 1');
+  eq('function definition, caret on the argument',
+    pick('f', 'f(u) =', 'u'), 'f(u) = ');
+  eq('and then the body is one arrow away', (() => {
+    const r = tabbed('f');
+    r.cands.find((c) => c.label === 'f(u) =').apply(r.model.st);
+    r.model.type('u');
+    r.model.end();
+    r.model.type('2u');
+    return r.model.source;
+  })(), 'f(u) = 2u');
+}
+
+{
+  const r = tabbed("x'");
+  eq('a primed identifier offers what fits it',
+    r.cands.map((c) => c.label).join(' | '), "x' = | x'(0) =");
+  const sub = new MathModel('k_1');
+  const s = { cands: sub.tab().candidates };
+  ok('so does a subscripted one', s.cands.some((c) => c.label === "k_1' ="),
+    labelsOf(s));
+}
+
+{
+  const m = new MathModel('1 + x');
+  m.end();
+  const r = m.tab();
+  eq('an identifier inside an expression is not a row kind', r.action, 'none');
+  const n = new MathModel('x');
+  n.home();
+  eq('nor is one with the caret before it', n.tab().action, 'none');
+}
+
+// --- the comment snippet ----------------------------------------------------
+
+{
+  const r = tabbed('com');
+  eq('com completes to a comment row', r.source, '# ');
+  ok('and the row really is a comment', r.model.isComment());
+  r.model.type('like this');
+  eq('with the caret ready for prose', r.model.source, '# like this');
+  ok('co offers it alongside the cosines',
+    tabbed('co').cands.some((c) => c.label === '# comment'));
+  ok('c alone does not', !tabbed('c').cands.some((c) => c.label === '# comment'));
+  ok('and neither does a half-written expression',
+    !(() => { const m = new MathModel('1 + com'); m.end(); return m.tab().candidates; })()
+      .some((c) => c.label === '# comment'));
+}
+
+// --- document names ---------------------------------------------------------
+
+{
+  const names = { functions: ['d'], params: ['k_1', 'm'], states: ['theta'] };
+  const m = new MathModel();
+  m.setDocumentNames(names);
+  eq('the names come back', m.documentNames.functions.join(','), 'd');
+  eq('parameters too', m.documentNames.params.join(','), 'k_1,m');
+
+  const r = tabbed('d', names);
+  ok('a document function is offered as a call',
+    r.cands.some((c) => c.word === 'd' && c.label === 'd(x)'), labelsOf(r));
+  const call = r.cands.find((c) => c.word === 'd');
+  call.apply(r.model.st);
+  r.model.type('x');
+  eq('and completes with its parentheses', r.model.source, 'd(x)');
+
+  const p = tabbed('k', names);
+  ok('a parameter completes to its full name',
+    p.cands.some((c) => c.word === 'k_1'), labelsOf(p));
+  const t = tabbed('t', names);
+  ok('a state does too', t.cands.some((c) => c.word === 'theta'), labelsOf(t));
+}
+
+{
+  // setDocumentNames carries the function set, since it is the same fact.
+  const m = new MathModel("x'' = -m x / d(x, y)");
+  eq('it starts as a coefficient', m.source, "x'' = -(mx)/(d)(x, y)");
+  ok('setDocumentNames re-reads the row', m.setDocumentNames({ functions: ['d'] }));
+  eq('and the call is restored', m.source, "x'' = -(mx)/(d(x, y))");
+  eq('the parser set agrees', m.functions.join(','), 'd');
+
+  const n = new MathModel("x'' = -m x / d(x, y)", ['d']);
+  ok('omitting functions leaves the parser alone',
+    n.setDocumentNames({ params: ['k'] }) === false);
+  eq('so the row keeps its call', n.source, "x'' = -(mx)/(d(x, y))");
+  eq('and the parser set is untouched', n.functions.join(','), 'd');
+}
+
+{
+  // A name that is no longer than the prefix would complete to itself, so it is
+  // not offered - only the row kinds are, because the row is a lone identifier.
+  const m = new MathModel();
+  m.setDocumentNames({ params: ['k'] });
+  m.type('k');
+  const r = m.completions();
+  ok('a name no longer than the prefix is not a completion',
+    !r.candidates.some((c) => c.word === 'k'), labelsOf(r));
+  ok('only the row kinds are left', r.candidates.every((c) => c.kind === 'row'));
+
+  const n = new MathModel('1 + k');
+  n.setDocumentNames({ params: ['k'] });
+  n.end();
+  eq('and mid-expression there is nothing at all', n.tab().action, 'none');
+}
+
+// --- completionsFor is a pure question --------------------------------------
+
+{
+  const m = new MathModel();
+  m.type('sq');
+  const before = m.source;
+  const list = m.completions();
+  eq('asking does not change the row', m.source, before);
+  eq('the prefix is reported', list.prefix, 'sq');
+  eq('and where it starts', list.start, 0);
+  eq('with one candidate', list.candidates.length, 1);
+  eq('carrying a label', list.candidates[0].label, 'sqrt(x)');
+  eq('and a hint', list.candidates[0].hint, 'square root');
+  eq('and its kind', list.candidates[0].kind, 'builtin');
+}
+
+{
+  eq('the common prefix of nothing is nothing', commonPrefix([]), '');
+  eq('of one word, itself', commonPrefix(['sin']), 'sin');
+  eq('of a family, the shared head', commonPrefix(['arcsin', 'arccos', 'arctan']), 'arc');
+  eq('of strangers, nothing', commonPrefix(['sin', 'cos']), '');
+}
+
+// --- completion inside structures -------------------------------------------
+
+{
+  const m = new MathModel();
+  m.type('1/sq');
+  eq('completion works inside a denominator', m.tab().action, 'applied');
+  m.type('2');
+  eq('and builds there', m.source, '(1)/(sqrt(2))');
+}
+
+{
+  const m = new MathModel();
+  m.type('#');
+  m.type('sq');
+  eq('Tab does not complete inside a comment', m.tab().action, 'none');
+  eq('the prose is untouched', m.source, '#sq');
+}
+
+{
+  const m = new MathModel();
+  m.type('k_');
+  m.type('m');
+  eq('nor inside a subscript', m.tab().action, 'none');
+  eq('the subscript is a label', m.source, 'k_m');
+}
+
+// ---------------------------------------------------------------------------
+// 17. The rendering half, over a ~40-line DOM shim
 //
 // The model above needs no DOM at all. The projection obviously does, so it is
 // exercised through the smallest possible stand-in - enough to prove that every
@@ -1008,7 +1396,12 @@ class ShimEl {
   set className(v) { this._class = v || ''; }
   get innerHTML() { return ''; }
   set innerHTML(v) { if (v === '') this.children = []; }
-  appendChild(c) { this.children.push(c); return c; }
+  appendChild(c) { this.children.push(c); c.parentNode = this; return c; }
+  removeChild(c) {
+    this.children = this.children.filter((x) => x !== c);
+    c.parentNode = null;
+    return c;
+  }
   setAttribute(k, v) { this.attrs[k] = v; if (k === 'class') this._class = v; }
   removeAttribute(k) { delete this.attrs[k]; }
   addEventListener(k, f) { (this.listeners[k] = this.listeners[k] || []).push(f); }
@@ -1030,6 +1423,7 @@ class ShimEl {
 globalThis.document = {
   createElement: (t) => new ShimEl(t),
   createElementNS: (_ns, t) => new ShimEl(t),
+  body: new ShimEl('body'),
 };
 
 const { MathField } = await import('./mathfield.js');
@@ -1111,7 +1505,7 @@ const press = (f, k) => f.el.fire('keydown', {
 }
 
 // ---------------------------------------------------------------------------
-// 17. Comment rows, rendered
+// 18. Comment rows, rendered
 // ---------------------------------------------------------------------------
 
 {
@@ -1179,7 +1573,7 @@ const press = (f, k) => f.el.fire('keydown', {
 }
 
 // ---------------------------------------------------------------------------
-// 18. The function set, through the field
+// 19. The function set, through the field
 // ---------------------------------------------------------------------------
 
 {
@@ -1207,6 +1601,194 @@ const press = (f, k) => f.el.fire('keydown', {
   eq('setFunctions does not echo onChange - the shell made the change',
     changes, 0);
   h.destroy();
+}
+
+// ---------------------------------------------------------------------------
+// 20. Tab completion, through the field
+// ---------------------------------------------------------------------------
+
+/** Press Tab, and report whether the field consumed the key. */
+function pressTab(f, shift) {
+  let prevented = false;
+  f.el.fire('keydown', {
+    key: 'Tab',
+    shiftKey: !!shift,
+    ctrlKey: false,
+    metaKey: false,
+    altKey: false,
+    preventDefault() { prevented = true; },
+  });
+  return prevented;
+}
+
+const menuOf = () => document.body.children[document.body.children.length - 1];
+const selectedIn = (menu) => menu.children.findIndex((c) => c.classes().join(' ').includes('is-selected'));
+
+{
+  const f = new MathField(new ShimEl('div'), { value: '' });
+  f.focus();
+  for (const ch of 'sq') press(f, ch);
+  ok('Tab consumes the key when it completes', pressTab(f));
+  eq('and completes', f.source, 'sqrt()');
+  ok('with no menu', !f.menuOpen);
+  eq('the body is left clean', document.body.children.length, 0);
+  f.destroy();
+}
+
+{
+  const f = new MathField(new ShimEl('div'), { value: '' });
+  f.focus();
+  for (const ch of 'si') press(f, ch);
+  ok('Tab consumes the key when it opens a menu', pressTab(f));
+  ok('the menu is open', f.menuOpen);
+  eq('and is in the document', document.body.children.length, 1);
+
+  const menu = menuOf();
+  eq('with one item per candidate', menu.children.length, 3);
+  eq('the first is selected', selectedIn(menu), 0);
+  ok('items carry the signature', menu.text().includes('sin(x)'));
+  ok('and the hint', menu.text().includes('sine'));
+
+  press(f, 'ArrowDown');
+  eq('arrow down moves the selection', selectedIn(menuOf()), 1);
+  press(f, 'ArrowUp');
+  eq('arrow up moves it back', selectedIn(menuOf()), 0);
+  press(f, 'ArrowUp');
+  eq('and it wraps', selectedIn(menuOf()), 2);
+
+  pressTab(f);
+  eq('Tab cycles forward', selectedIn(menuOf()), 0);
+  pressTab(f, true);
+  eq('shift+Tab cycles back', selectedIn(menuOf()), 2);
+
+  press(f, 'Enter');
+  ok('Enter accepts and closes', !f.menuOpen);
+  eq('the chosen completion is inserted', f.source, 'sinh()');
+  eq('and the menu is gone from the document', document.body.children.length, 0);
+  f.destroy();
+}
+
+{
+  const f = new MathField(new ShimEl('div'), { value: '' });
+  f.focus();
+  let entered = 0;
+  f.opts.onEnter = () => { entered += 1; };
+  for (const ch of 'si') press(f, ch);
+  pressTab(f);
+  press(f, 'Enter');
+  eq('Enter into a menu does not also submit the row', entered, 0);
+  press(f, 'Enter');
+  eq('but the next one does', entered, 1);
+  f.destroy();
+}
+
+{
+  const f = new MathField(new ShimEl('div'), { value: '' });
+  f.focus();
+  for (const ch of 'si') press(f, ch);
+  pressTab(f);
+  press(f, 'Escape');
+  ok('Escape dismisses the menu', !f.menuOpen);
+  eq('and leaves the row untouched', f.source, 'si');
+  eq('the document is clean', document.body.children.length, 0);
+  ok('the field still has focus', f.focused);
+  f.destroy();
+}
+
+{
+  const f = new MathField(new ShimEl('div'), { value: '' });
+  f.focus();
+  for (const ch of 'si') press(f, ch);
+  pressTab(f);
+  press(f, 'n');
+  ok('typing dismisses the menu', !f.menuOpen);
+  eq('and the key is not swallowed', f.source, 'sin()');
+  f.destroy();
+}
+
+{
+  const f = new MathField(new ShimEl('div'), { value: '' });
+  f.focus();
+  for (const ch of 'si') press(f, ch);
+  pressTab(f);
+  f.el.fire('mousedown', { clientX: 0, clientY: 0, preventDefault() {} });
+  ok('clicking in the field dismisses the menu', !f.menuOpen);
+  f.destroy();
+}
+
+{
+  const f = new MathField(new ShimEl('div'), { value: '' });
+  f.focus();
+  for (const ch of 'si') press(f, ch);
+  pressTab(f);
+  const item = menuOf().children[2];
+  item.fire('mousedown', { preventDefault() {} });
+  eq('clicking an item completes it', f.source, 'sinh()');
+  ok('and closes the menu', !f.menuOpen);
+  f.destroy();
+}
+
+{
+  const f = new MathField(new ShimEl('div'), { value: '' });
+  f.focus();
+  for (const ch of 'si') press(f, ch);
+  pressTab(f);
+  f.blur();
+  ok('blur dismisses the menu', !f.menuOpen);
+  eq('nothing is left behind', document.body.children.length, 0);
+  f.destroy();
+}
+
+{
+  const f = new MathField(new ShimEl('div'), { value: '' });
+  f.focus();
+  for (const ch of 'si') press(f, ch);
+  pressTab(f);
+  f.destroy();
+  eq('destroy takes the menu with it', document.body.children.length, 0);
+}
+
+{
+  // A Tab that completes nothing belongs to whoever moves focus.
+  const f = new MathField(new ShimEl('div'), { value: '' });
+  f.focus();
+  ok('Tab on an empty row is not consumed', pressTab(f) === false);
+  for (const ch of 'zz') press(f, ch);
+  ok('nor is Tab on a prefix that matches nothing', pressTab(f) === false);
+  eq('and the row is unchanged', f.source, 'zz');
+  ok('shift+Tab never completes', pressTab(f, true) === false);
+  f.destroy();
+}
+
+{
+  let changes = 0;
+  const f = new MathField(new ShimEl('div'), { value: '', onChange: () => { changes += 1; } });
+  f.focus();
+  for (const ch of 'sq') press(f, ch);
+  const before = changes;
+  pressTab(f);
+  eq('a completion is a change like any other', changes, before + 1);
+  f.destroy();
+}
+
+{
+  // Document names reach completion through the field.
+  const f = new MathField(new ShimEl('div'), {
+    value: '',
+    documentNames: { functions: ['d'], params: ['k_1'], states: [] },
+  });
+  f.focus();
+  eq('the field reports them back', f.documentNames.functions.join(','), 'd');
+  for (const ch of 'k') press(f, ch);
+  const labels = f.completions().candidates.map((c) => c.label);
+  ok('a document parameter is offered', labels.includes('k_1'), labels.join(' | '));
+  f.destroy();
+
+  const g = new MathField(new ShimEl('div'), { value: "x'' = -m x / d(x, y)" });
+  ok('setDocumentNames re-reads the row through the field',
+    g.setDocumentNames({ functions: ['d'] }));
+  eq('and fixes the call', g.source, "x'' = -(mx)/(d(x, y))");
+  g.destroy();
 }
 
 // ---------------------------------------------------------------------------

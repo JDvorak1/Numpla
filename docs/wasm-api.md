@@ -33,7 +33,30 @@ Row kinds:
 | `x'' = <expr>` | Second order. Lowered to two first-order states (see below). |
 | `x(0) = <number>` | Initial condition for state `x`. Defaults to 0 if absent, *and says so* — see "missing information". |
 | `k = <expr>` | Parameter/constant, visible to every row. |
+| `E = <expr reading states or t>` | **Derived row** — a function of the solution, not a constant. See below. |
 | `f(x) = <expr>` | Function definition. |
+
+### Derived rows
+
+A `name = ...` row whose expression reads a state, a lowered velocity, `t`, or
+another derived row is not a constant: it has no value until there is a
+trajectory to read it along. The compiler recognises that and sets it aside.
+
+```
+x'' = -x
+x(0) = 1
+x'(0) = 0
+E = 0.5(x'^2 + x^2)      # derived: the energy, sampled along the solution
+```
+
+Derived rows appear in `Diagnostics.derived`, **not** in `params`, and they are
+the names `conservation` accepts. They may be written in named pieces —
+`K = 0.5x'^2`, `U = 0.5x^2`, `E = K + U` — and are relaxed against each other at
+every sample, so order does not matter here either. A typo inside one is
+reported when it is typed, like any other row.
+
+Added after v1. Previously such a row was an `"error"` ("`x` is not defined"),
+so the change only ever turns red rows green.
 
 Second-order rows are lowered automatically: `x'' = -x` introduces a hidden
 state for `x'`, and `x'(0) = v` sets its initial condition. State order in all
@@ -78,9 +101,19 @@ impl Model {
     /// Never throws: unparseable rows come back as diagnostics.
     pub fn set_source(&mut self, src: &str) -> String;
 
-    /// Integrate over [t0, t1]. Returns SolveReport as a JSON string.
+    /// Integrate over [t0, t1] with the default method (Tsit5).
+    /// Returns SolveReport as a JSON string.
     /// Safe to call when the document is invalid — reports ok: false.
     pub fn solve(&mut self, t0: f64, t1: f64) -> String;
+
+    /// Integrate with a named method: "Tsit5" | "Verlet" | "Yoshida4",
+    /// case-insensitive. Returns SolveReport as a JSON string.
+    /// An unknown name is reported, never silently defaulted.
+    pub fn solve_with(&mut self, t0: f64, t1: f64, method: &str) -> String;
+
+    /// The available methods as JSON, in slider order. Static — call as
+    /// `Model.methods()`, no instance needed.
+    pub fn methods() -> String;
 
     /// Uniformly sample the last solution: n points, flattened row-major as
     /// [t, y_0, .., y_{d-1}] repeated n times. Length = n * (dim + 1).
@@ -93,6 +126,15 @@ impl Model {
 
     /// StepRecord list as JSON — for the telemetry strip.
     pub fn telemetry(&self) -> String;
+
+    /// Track a named row along the last solution.
+    /// Returns ConservationReport as a JSON string.
+    /// `samples` is a floor, not a quota — pass 0 to let the model choose.
+    pub fn conservation(&mut self, name: &str, samples: usize) -> String;
+
+    /// The series behind the last `conservation` call, flattened as
+    /// [t, value] pairs. Length = 2 * samples. Empty if that call failed.
+    pub fn conservation_series(&self) -> Vec<f64>;
 }
 ```
 
@@ -105,6 +147,9 @@ impl Model {
 {
   "states": ["x", "y"],          // state vector order, length = dim
   "params": ["k"],               // named constants in scope
+  "derived": ["E"],              // rows that are functions of the solution;
+                                 // always present, [] when there are none.
+                                 // These are the names `conservation` accepts.
   "issues": [
     {
       "line": 3,                 // 0-based line in the source
@@ -172,13 +217,15 @@ A genuine mistake — bad syntax, a wrong arity, a row the format has no meaning
 for — stays `"error"` and carries no `fix`.
 
 ```jsonc
-// SolveReport — returned by solve
+// SolveReport — returned by solve and solve_with
 {
   "ok": true,
   "t0": 0.0, "t1": 20.0,
   "dim": 2,
   "states": ["x", "y"],
   "accepted": 84, "rejected": 3, "rhsEvals": 522,
+  "method": "Verlet",            // the integrator that produced this solution
+  "symplectic": true,            // did this *run* preserve the symplectic form
   "error": null                  // else a human-readable string, ok: false
 }
 ```
@@ -189,6 +236,163 @@ for — stays `"error"` and carries no `fix`.
   "steps": [ { "t": 0.0, "dt": 0.01, "error": 0.42, "accepted": true } ]
 }
 ```
+
+A fixed-step method has no error estimate to report, so after a `Verlet` or
+`Yoshida4` run every step is `"error": 0.0, "accepted": true` and the strip has
+only step size to draw. `methods()[i].adaptive` says which kind is on screen.
+
+## Choosing a method
+
+The mode slider is the point of this. Three integrators over one state layout
+and one solution type; swapping them changes the shape of the error and nothing
+else about the call.
+
+```jsonc
+// methods — returned by Model.methods(), in slider order
+{
+  "methods": [
+    { "name": "Tsit5",    "adaptive": true,  "symplectic": false, "order": 5 },
+    { "name": "Verlet",   "adaptive": false, "symplectic": true,  "order": 2 },
+    { "name": "Yoshida4", "adaptive": false, "symplectic": true,  "order": 4 }
+  ]
+}
+```
+
+**The method is an argument, not a setting.** There is no `set_method`: the call
+that produces an answer is the one that says which method produced it, so the
+report and the drawn curve cannot drift apart. `solve(t0, t1)` is exactly
+`solve_with(t0, t1, "Tsit5")`.
+
+**`method` vs `symplectic`.** `method` is what ran. `symplectic` is what the run
+achieved, and they are different questions: Verlet applied to
+`x'' = -x - 0.4x'` is a symplectic *method* on a system with no symplectic
+structure left to preserve, and reports `"method": "Verlet", "symplectic":
+false`. Only the model layer can answer that, because only it knows whether the
+acceleration row mentions `x'`. Label a plot from `method`; set the conservation
+monitor's expectations from `symplectic`.
+
+### Symplectic methods need second-order rows
+
+`Verlet` and `Yoshida4` integrate positions and velocities separately, so they
+have to know which states are which. A document of plain `x' = ...` rows never
+said, and **that is reported rather than worked around**:
+
+```jsonc
+{
+  "ok": false,
+  "method": "Verlet", "symplectic": false,
+  "error": "Verlet needs second-order rows — x is a first-order row, so the
+            document has no position/velocity structure. Write it as
+            `x'' = ...`, or choose Tsit5"
+}
+```
+
+There is deliberately **no silent fallback to Tsit5**. For the first few periods
+of a well-behaved system the two curves are indistinguishable, so a fallback
+would draw a Tsit5 curve under a label reading "Verlet" and teach the opposite of
+what the slider exists to show. A mixed document — one first-order row among
+second-order ones — is refused the same way, naming the row.
+
+Shell consequence: if the current document has no second-order rows, the
+symplectic entries on the slider are not available. Either disable them, or let
+the click happen and render the returned sentence — it names the row and the
+fix. `solve` invalidates the previous solution *before* it checks, so a refused
+solve leaves `sample`/`eval` empty rather than showing a stale curve.
+
+### Step size
+
+Fixed-step methods take their step from the visible window: `(t1 - t0) / 5000`.
+Chosen so that dragging the slider does not change the frame time — Tsit5 at its
+default tolerance spends roughly the same number of right-hand-side evaluations
+on the same window — and so Verlet's second-order error stays under a pixel for
+a window with tens of oscillations in it. The honest consequence: a wider window
+is a coarser step, so a symplectic energy band *widens* as you zoom out. It stays
+flat across the run, which is the property being shown.
+
+## Conservation
+
+The Ge–Marsden trade-off (`docs/solvers.md`) says no fixed-step method preserves
+the symplectic form, momentum and energy at once. The monitor is how you *see*
+which one a method gave up: write the invariant as a derived row, integrate,
+and watch the line.
+
+```jsonc
+// ConservationReport — returned by conservation(name, samples)
+{
+  "ok": true,
+  "name": "E",
+  "samples": 5001,               // what was actually taken — see below
+  "initial": 0.5,                // the value at t0; everything is measured
+                                 // against it, since the true value is
+                                 // whatever the initial condition had
+  "drift": {                     // measured on the dense output — the curve
+                                 // the monitor draws
+    "maxAbsDeviation": 2.0e-4,
+    "relativeDrift": 4.0e-4,     // the same, over |initial|
+    "netDrift": -1.5e-4,         // signed, end to end
+    "secularRatio": 1.0000       // band over the last tenth of the run,
+                                 // divided by the band over the first tenth
+  },
+  "atSteps": { ... },            // the same four, at the integrator's own
+                                 // step points
+  "error": null                  // else a human-readable string, ok: false
+}
+```
+
+`secularRatio` is the number the whole feature turns on. **Around 1 means
+bounded** — the energy wobbles in a band no wider at the end of the run than at
+the start, which is what a symplectic method buys. **Much greater than 1 means
+secular drift.** On a harmonic oscillator over 200 time units: Verlet and
+Yoshida4 report ≈ 1.0, Tsit5 reports ≈ 11.
+
+The series crosses separately, as a `Float64Array` of `[t, value]` pairs:
+
+```js
+const c = JSON.parse(model.conservation("E", 0));
+const series = model.conservation_series();   // length 2 * c.samples
+```
+
+### `samples` is a floor, not a quota
+
+Ask for 300 and you may get 5001. This is deliberate and it is the one place the
+API overrides the caller.
+
+A pixel count is a fact about a screen; aliasing is a fact about the system. A
+symplectic method's energy error does not grow, but it *oscillates* at twice the
+system's frequency — sample that too sparsely and the samples creep through its
+phase over the run, and a bounded wobble is reported as a band that widens.
+`numpla-ode` measured a **nineteenfold phantom growth at two samples per
+period**, on a run whose energy was flat to four figures. A monitor that turned a
+conserved quantity into a drifting one would teach precisely the wrong lesson.
+
+So the floor is one sample per accepted step (clamped to 256…20000): whatever
+resolution the integrator needed to resolve the dynamics is a resolution that
+cannot alias them. Pass `0` to leave the choice entirely to the model, or pass
+your pixel width and read `samples` back to find out what you got.
+
+### Why `drift` and `atSteps` are both reported
+
+A quantity a method conserves *exactly* is exact **at step points**, and only
+nearly exact on the interpolant between them. `drift` describes the curve the
+user is looking at; `atSteps` describes what the integrator actually did. When
+they disagree the difference is the cubic Hermite between step points, not the
+method losing the invariant — reporting only `drift` would slander the
+integrator, and reporting only `atSteps` would describe a curve nobody can see.
+For a well-resolved run they agree to several figures.
+
+### Errors
+
+`ok: false` with a sentence, never an exception:
+
+| situation | `error` |
+|---|---|
+| nothing solved yet | "nothing has been integrated yet" |
+| no row by that name | "there is no row called `Q` — write one, such as ..." |
+| the row cannot be evaluated | "`E` cannot be measured: ..." |
+
+`conservation_series()` is empty whenever the last call failed, and any
+`set_source` or `solve` drops it — a drift curve outliving the trajectory it was
+measured on is the same bug as a stale sample.
 
 ## Notes for the shell
 
@@ -202,3 +406,13 @@ for — stays `"error"` and carries no `fix`.
 - `dt_max` is set internally from `t1 - t0` so a narrow feature cannot be
   stepped over — see `docs/solvers.md`.
 - `sample` is for drawing the whole curve; `eval` is for the scrubber playhead.
+- Build the mode slider from `Model.methods()` rather than from a hard-coded
+  list, so a method added to `numpla-ode` reaches the UI without a second edit.
+- Dragging the slider is `solve_with` again over the same window, then a
+  re-`sample`. Nothing else changes: the state vector, its column order and the
+  dense output are identical whichever method ran.
+- Label the plot from `SolveReport.method` and never from what was requested;
+  they differ exactly when something went wrong, which is when it matters.
+- Offer the conservation monitor's menu from `Diagnostics.derived`. An empty
+  list means the document has not named a quantity to watch yet — the useful
+  prompt is a row, e.g. `E = 0.5(x'^2 + x^2)`, not a dialog.

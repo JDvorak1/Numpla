@@ -211,6 +211,123 @@ const PHYSICS = {
     ok(ratio > 1.15, `the stretch nonlinearity has no effect on the tone: ratio ${ratio}`);
   },
 
+  'colliding-strings': (demo) => {
+    const span = demo.tSpan;
+    // Non-penetration is a property of the WHOLE trajectory, so it is sampled
+    // far more finely than the plot would: 24000 points over 12 s is 0.5 ms,
+    // and a contact lasts about 15 ms at this stiffness.
+    const N = 24000;
+    const R = Number(readParam(demo.source, 'r'));
+    const K = Number(readParam(demo.source, 'k'));
+    const P = Number(readParam(demo.source, 'p'));
+    const D0 = Number(readParam(demo.source, 'd'));
+    const dk = demo.knobs.find((x) => x.name === 'd');
+    const kk = demo.knobs.find((x) => x.name === 'k');
+    const ck = demo.knobs.find((x) => x.name === 'c');
+
+    /**
+     * Facing beads i sit `d + a_i - b_i` apart. Contact begins at 2r, the bead
+     * diameter; a gap of ZERO is the two centres crossing, and that is the
+     * thing the penalty force exists to prevent.
+     */
+    const gaps = (r, d) =>
+      [1, 2, 3].map((i) => {
+        const a = r.col(`a_${i}`);
+        const b = r.col(`b_${i}`);
+        return a.map((q, j) => d + q - b[j]);
+      });
+    const closest = (r, d) => Math.min(...gaps(r, d).map((g) => Math.min(...g)));
+
+    /** Kinetic energy of one string plus the tension it has stored. */
+    const stringEnergy = (r, name, k) => {
+      const x = [1, 2, 3].map((i) => r.col(`${name}_${i}`));
+      const v = [1, 2, 3].map((i) => r.col(`${name}_${i}'`));
+      return x[0].map((_, j) => {
+        const [p1, p2, p3] = [x[0][j], x[1][j], x[2][j]];
+        const kinetic = 0.5 * (v[0][j] ** 2 + v[1][j] ** 2 + v[2][j] ** 2);
+        const stretch = p1 * p1 + (p2 - p1) ** 2 + (p3 - p2) ** 2 + p3 * p3;
+        return kinetic + 0.5 * k * stretch;
+      });
+    };
+
+    /** Energy stored in the squashed contact springs. */
+    const contactEnergy = (r, d, p) => {
+      const g = gaps(r, d);
+      return g[0].map((_, j) =>
+        g.reduce((sum, col) => {
+          const overlap = Math.max(0, 2 * R - col[j]);
+          return sum + 0.5 * p * overlap * overlap;
+        }, 0)
+      );
+    };
+
+    // Both strings are plucked and let go, so every velocity starts at zero.
+    const base = run(demo.source, span, N);
+    for (const s of base.diagnostics.states) {
+      if (s.endsWith("'")) close(base.col(s)[0], 0, 0, `${s} must start at rest`);
+    }
+
+    // THE ASSERTION THIS DEMO EXISTS FOR: the strings never cross. Checked on
+    // every facing pair at every sample, at the default and at both ends of
+    // the distance knob, and at the corners that hit hardest (max tension,
+    // no damping, smallest gap).
+    const settings = [
+      { d: dk.min, k: K, c: 0.2 },
+      { d: D0, k: K, c: 0.2 },
+      { d: 0.8, k: K, c: 0.2 },
+      { d: dk.max, k: K, c: 0.2 },
+      { d: dk.min, k: kk.max, c: ck.min },
+      { d: dk.min, k: kk.max, c: ck.max },
+      { d: dk.min, k: kk.min, c: ck.min },
+      { d: D0, k: kk.max, c: ck.min },
+    ];
+    for (const s of settings) {
+      let src = setParam(demo.source, 'd', s.d);
+      src = setParam(src, 'k', s.k);
+      src = setParam(src, 'c', s.c);
+      const r = run(src, span, N);
+      const min = closest(r, s.d);
+      const where = `d=${s.d} k=${s.k} c=${s.c}`;
+      ok(min > 0, `the strings crossed at ${where}: the gap fell to ${min}`);
+      // And they do not merely avoid crossing: the beads squash by less than
+      // their own radius, so the contact is stiff enough to be a contact.
+      ok(2 * R - min < R, `the beads sank ${2 * R - min} into each other at ${where}`);
+    }
+
+    // The penalty force is what does that. Switch it off and the same pluck
+    // sends the two strings clean through one another — so the check above is
+    // measuring the contact and not the geometry.
+    const ghost = run(setParam(demo.source, 'p', 0), span, N);
+    const through = closest(ghost, D0);
+    ok(through < -0.2, `with p = 0 they should pass through, but the gap only reached ${through}`);
+
+    // At the default distance they really do touch, and gently: less than
+    // half a bead radius of squash.
+    const nearest = closest(base, D0);
+    ok(nearest < 2 * R, `the strings never touch at d = ${D0}: closest gap ${nearest}`);
+    ok(2 * R - nearest < 0.5 * R, `the default contact is too soft: ${2 * R - nearest} of squash`);
+
+    // KNOB, far end: wound out to the top of the slider they never touch at
+    // all, and with the damping off each string's own energy is then exactly
+    // constant — two independent strings, ringing on.
+    const apartSrc = setParam(setParam(demo.source, 'd', dk.max), 'c', 0);
+    const apart = run(apartSrc, span, N);
+    ok(closest(apart, dk.max) > 2 * R, 'at the far end of the knob they must never touch');
+    ok(drift(stringEnergy(apart, 'a', K)) < 1e-4, 'an untouched string must conserve its energy');
+    ok(drift(stringEnergy(apart, 'b', K)) < 1e-4, 'an untouched string must conserve its energy');
+
+    // KNOB, near end: the collision moves energy from one string to the other
+    // — neither is conserved on its own any more — while the pair plus the
+    // squashed contact springs still conserve the total.
+    const near = run(setParam(demo.source, 'c', 0), span, N);
+    const ea = stringEnergy(near, 'a', K);
+    const eb = stringEnergy(near, 'b', K);
+    const ec = contactEnergy(near, D0, P);
+    ok(spread(ea) / ea[0] > 0.5, `the collision barely moved energy: ${spread(ea) / ea[0]}`);
+    const total = ea.map((v, j) => v + eb[j] + ec[j]);
+    ok(drift(total) < 2e-3, `the colliding pair lost energy: drift ${drift(total)}`);
+  },
+
   'harmonic-oscillator': (demo) => {
     // Undamped by default, so energy is exactly conserved. Anything that
     // drifts here is the integrator leaking, not the model.
