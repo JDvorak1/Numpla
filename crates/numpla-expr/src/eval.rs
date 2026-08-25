@@ -391,11 +391,28 @@ fn builtin(name: &str, args: &[Value], env: &Env) -> Result<Value, EvalError> {
 mod tests {
     use super::*;
     use crate::ast::Stmt;
-    use crate::parser::parse;
+    use crate::parser::{parse_with, FuncNames};
+
+    /// The functions an environment already defines.
+    ///
+    /// The parser needs this to tell `f(3)` (a call) from `k(3)` (a product),
+    /// so these tests do in miniature what `numpla-model` does over a whole
+    /// document: gather the function names first, then parse.
+    fn known(env: &Env) -> FuncNames {
+        env.funcs.keys().cloned().collect()
+    }
 
     fn ev(src: &str, env: &Env) -> Result<Value, EvalError> {
-        match parse(src).0 {
+        match parse_with(src, &known(env)).0 {
             Stmt::Expr(e) => eval(&e, env),
+            other => panic!("expected a bare expression, got {:?}", other),
+        }
+    }
+
+    /// A function body, parsed against the functions defined so far.
+    fn body(src: &str, env: &Env) -> Expr {
+        match parse_with(src, &known(env)).0 {
+            Stmt::Expr(e) => e,
             other => panic!("expected a bare expression, got {:?}", other),
         }
     }
@@ -433,10 +450,7 @@ mod tests {
     #[test]
     fn user_functions() {
         let mut env = Env::new();
-        let body = match parse("x^2 + 1").0 {
-            Stmt::Expr(e) => e,
-            _ => unreachable!(),
-        };
+        let body = body("x^2 + 1", &env);
         env.def_fn("f", &["x"], body);
         assert_eq!(num("f(3)", &env), 10.0);
     }
@@ -465,10 +479,7 @@ mod tests {
     #[test]
     fn a_parameter_does_not_leak_out_of_its_function() {
         let mut env = Env::new();
-        let body = match parse("u * 2").0 {
-            Stmt::Expr(e) => e,
-            _ => unreachable!(),
-        };
+        let body = body("u * 2", &env);
         env.def_fn("f", &["u"], body);
         assert_eq!(num("f(3)", &env), 6.0);
         // `u` was only ever a parameter, so it must be undefined outside.
@@ -479,10 +490,7 @@ mod tests {
     fn a_parameter_shadows_a_global_of_the_same_name() {
         let mut env = Env::new();
         env.set("u", 100.0);
-        let body = match parse("u * 2").0 {
-            Stmt::Expr(e) => e,
-            _ => unreachable!(),
-        };
+        let body = body("u * 2", &env);
         env.def_fn("f", &["u"], body);
         assert_eq!(num("f(3)", &env), 6.0);
         // ...and the global is untouched afterwards.
@@ -493,10 +501,7 @@ mod tests {
     fn a_function_body_still_sees_globals() {
         let mut env = Env::new();
         env.set("k", 10.0);
-        let body = match parse("k * u").0 {
-            Stmt::Expr(e) => e,
-            _ => unreachable!(),
-        };
+        let body = body("k * u", &env);
         env.def_fn("f", &["u"], body);
         assert_eq!(num("f(3)", &env), 30.0);
     }
@@ -506,15 +511,9 @@ mod tests {
         let mut env = Env::new();
         // g takes no parameter named `u`; if the caller's frame leaked through,
         // `g(1)` would resolve `u` to f's argument instead of failing.
-        let gbody = match parse("u + 1").0 {
-            Stmt::Expr(e) => e,
-            _ => unreachable!(),
-        };
+        let gbody = body("u + 1", &env);
         env.def_fn("g", &["w"], gbody);
-        let fbody = match parse("g(u)").0 {
-            Stmt::Expr(e) => e,
-            _ => unreachable!(),
-        };
+        let fbody = body("g(u)", &env);
         env.def_fn("f", &["u"], fbody);
         assert_eq!(ev("f(5)", &env), Err(EvalError::Undefined("u".into())));
     }
@@ -522,15 +521,9 @@ mod tests {
     #[test]
     fn nested_calls_bind_their_own_arguments() {
         let mut env = Env::new();
-        let sq = match parse("w * w").0 {
-            Stmt::Expr(e) => e,
-            _ => unreachable!(),
-        };
+        let sq = body("w * w", &env);
         env.def_fn("g", &["w"], sq);
-        let f = match parse("g(u) + g(u + 1)").0 {
-            Stmt::Expr(e) => e,
-            _ => unreachable!(),
-        };
+        let f = body("g(u) + g(u + 1)", &env);
         env.def_fn("f", &["u"], f);
         // 3^2 + 4^2
         assert_eq!(num("f(3)", &env), 25.0);

@@ -6,6 +6,16 @@
 //   edit    ->  debounce  ->  set_source  ->  per-row diagnostics  ->  solve
 //   sliders ->  t drives eval(t); a parameter slider rewrites its own row
 //
+// Rows are Desmos-shaped: a blank row always sits at the end of the list and is
+// not a real row until something is typed into it, Enter opens a row below, and
+// Backspace in an empty row deletes it the way Backspace deletes a character.
+// There is no "add row" button, because rows appear by typing.
+//
+// A parameter's slider lives ON the row that defines it, and only once it has
+// been asked for: every scalar row offers "add slider" in the line it already
+// reserves for its diagnostic. `t` is the exception - it has no defining row -
+// and lives in the transport bar with play/pause and the readout.
+//
 // Three structural rules this file exists to enforce:
 //
 //   1. GRAY-NOT-RED. `severity: "pending"` is muted. Only `"error"` is red,
@@ -38,8 +48,9 @@ const el = {
   app:          $('app'),
 
   rows:      $('rows'),
-  addRow:    $('add-row'),
-  diagCount: $('diag-count'),
+  issuebar:  $('issuebar'),
+  issueMsg:  $('issue-msg'),
+  issueFix:  $('issue-fix'),
 
   divider: $('divider'),
 
@@ -47,9 +58,9 @@ const el = {
   legend: $('legend'),
   canvas: $('canvas'),
 
-  play:    $('play'),
-  readout: $('readout'),
-  sliders: $('sliders'),
+  play:      $('play'),
+  readout:   $('readout'),
+  transport: $('transport'),
 
   settings:     $('slider-settings'),
   settingsName: $('settings-name'),
@@ -174,7 +185,9 @@ function parseJson(text, what) {
 }
 
 let M = null;             // { setSource, solve, sample, eval }
+let ModelCtor = null;     // the Model class itself - demo previews need their own
 let MathField = null;     // the class from ./mathfield.js
+let funcNames = () => []; // MathField's functionNamesIn, bound at boot
 
 // ---------------------------------------------------------------------------
 // Application state
@@ -252,10 +265,19 @@ const niceStepFor = (span) => niceFloor(Math.abs(span) / 200) || 0.01;
 
 // ---------------------------------------------------------------------------
 // The expression list - one MathField per row
+//
+// `rows` holds every row, and the LAST one is always the trailing blank row: a
+// real, focusable field that is not part of the document. It is not numbered,
+// never diagnosed and never reaches the solver; the moment something is typed
+// into it, it becomes a real row and a fresh blank one takes its place. Because
+// it is always last, leaving it out of the document cannot shift any other
+// row's line number - row i is still line i.
 // ---------------------------------------------------------------------------
 
 /** @type {{el:HTMLElement, host:HTMLElement, idxEl:HTMLElement,
- *          msgEl:HTMLElement, field:any}[]} */
+ *          msgEl:HTMLElement, footEl:HTMLElement, knobEl:HTMLElement,
+ *          offerEl:HTMLButtonElement, offerName:string, knobKey:string,
+ *          field:any}[]} */
 const rows = [];
 
 const DEL_MARK = '×';   // ×
@@ -270,30 +292,110 @@ function rowSource(row) {
   }
 }
 
-/** The document sent to set_source: the rows' sources, joined with newlines. */
+/** "Nothing has been typed here" - the trailing blank row's whole definition. */
+function rowIsEmpty(row) {
+  if (!row) return true;
+  try {
+    if (row.field && typeof row.field.isEmpty === 'function') return !!row.field.isEmpty();
+  } catch (err) { /* fall through to the source */ }
+  return rowSource(row).trim() === '';
+}
+
+/**
+ * A `# ...` row: prose for the reader, skipped by the parser. The field knows
+ * (it renders comments as prose); the text is the fallback.
+ */
+function isCommentRow(row) {
+  try {
+    if (row && row.field && typeof row.field.isComment === 'function') {
+      return !!row.field.isComment();
+    }
+  } catch (err) { /* fall through to the source */ }
+  return rowSource(row).trim().charAt(0) === '#';
+}
+
+/**
+ * How many rows are real: everything except a trailing blank one. Computed
+ * rather than remembered, so it is correct even in the middle of a keystroke.
+ */
+function realRowCount() {
+  const n = rows.length;
+  return n && rowIsEmpty(rows[n - 1]) ? n - 1 : n;
+}
+
+function realRows() {
+  return rows.slice(0, realRowCount());
+}
+
+function isTailRow(row) {
+  const n = rows.length;
+  return n > 0 && rows[n - 1] === row && rowIsEmpty(row);
+}
+
+/** The document sent to set_source: the REAL rows' sources, joined. */
 function docSource() {
-  return rows.map(rowSource).join('\n');
+  return realRows().map(rowSource).join('\n');
 }
 
 function indexOfRow(row) {
   return rows.indexOf(row);
 }
 
+/**
+ * The number in the gutter counts equations. Comment rows, blank spacer rows
+ * and the trailing blank get none - a document with four lines of prose in it
+ * should not read as a list with holes punched in it. A row's *position* is
+ * still its line, which is what diagnostics are keyed by.
+ */
 function renumber() {
+  const real = realRowCount();
+  let n = 0;
   rows.forEach((row, i) => {
-    row.idxEl.textContent = String(i + 1);
+    const tail = i >= real;
+    const comment = !tail && isCommentRow(row);
+    const blank = !tail && rowIsEmpty(row);
+    row.el.classList.toggle('is-tail', tail);
+    row.el.classList.toggle('is-comment', comment);
+    row.idxEl.textContent = (tail || comment || blank) ? '' : String(++n);
+    if (tail) setRowDiagnostic(row, null, '');
   });
 }
 
-function focusRow(i, atEnd) {
-  const row = rows[clamp(i, 0, rows.length - 1)];
+/** The invariant: a blank row is always sitting at the end of the list. */
+function ensureTail() {
+  if (rows.length && rowIsEmpty(rows[rows.length - 1])) return null;
+  return makeRow('', rows.length);
+}
+
+/**
+ * Put the caret in a row. `atEnd` is the entire point of this function: walking
+ * UP into a row, or backspacing INTO one, has to land after that row's last
+ * atom, never before its first. MathField.focus() takes no position, so the
+ * caret is set on the model first and the field is repainted after focusing.
+ */
+function placeCaret(row, atEnd) {
   if (!row || !row.field) return;
   try {
-    row.field.focus(atEnd);
+    const m = row.field.model;
+    if (m && typeof m.end === 'function' && typeof m.home === 'function') {
+      if (atEnd) m.end(); else m.home();
+    }
+    row.field.focus();
+    if (typeof row.field.render === 'function') row.field.render();
   } catch (err) {
-    console.error('[numpla] MathField.focus threw', err);
+    console.error('[numpla] focusing a row threw', err);
   }
   setActiveRow(row);
+}
+
+function focusRow(i, atEnd) {
+  placeCaret(rows[clamp(i, 0, rows.length - 1)], atEnd);
+}
+
+/** Clicking the empty space below the list lands in the blank row. */
+function focusTail() {
+  ensureTail();
+  placeCaret(rows[rows.length - 1], true);
 }
 
 function setActiveRow(row) {
@@ -314,6 +416,55 @@ function navigate(row, dir) {
   focusRow(j, !forward);
 }
 
+// ---------------------------------------------------------------------------
+// Which names the document defines as functions
+//
+// `d(x, y)` is a call only when the document has a `d(x, y) = ...` row;
+// otherwise it is `d` times `(x, y)`. Same tokens, two different systems. The
+// Rust parser resolves this in a two-pass compile, and the field has to agree
+// with it or a correct document gets silently rewritten into a broken one - so
+// the shell is what tells both of them, from the one document they share.
+//
+// Rows are constructed with the set already known, which is the reliable path:
+// once a row has been DISPLAYED in the wrong reading, its text genuinely means
+// the wrong thing and re-reading it later cannot always recover the intent.
+// setFunctions() is the safety net for a definition appearing later.
+// ---------------------------------------------------------------------------
+
+let docFunctions = [];
+
+const sameNames = (a, b) => a.length === b.length && a.every((x, i) => x === b[i]);
+
+/**
+ * Re-derive the function set from the document and hand it to every row.
+ * Returns true if any row had to be re-read - its `source` may have changed, so
+ * the caller must re-read the document too.
+ */
+function refreshFunctions(src) {
+  let next;
+  try {
+    next = funcNames(src) || [];
+  } catch (err) {
+    console.error('[numpla] functionNamesIn threw', err);
+    return false;
+  }
+  if (sameNames(next, docFunctions)) return false;
+  docFunctions = next;
+
+  let changed = false;
+  for (const row of rows) {
+    try {
+      if (row.field && typeof row.field.setFunctions === 'function' &&
+          row.field.setFunctions(next)) {
+        changed = true;
+      }
+    } catch (err) {
+      console.error('[numpla] MathField.setFunctions threw', err);
+    }
+  }
+  return changed;
+}
+
 function makeRow(source, at) {
   const wrap = document.createElement('div');
   wrap.className = 'row';
@@ -332,12 +483,33 @@ function makeRow(source, at) {
   del.setAttribute('aria-label', 'Delete this row');
   del.textContent = DEL_MARK;
 
+  // The reserved line under the field. It carries the diagnostic AND the slider
+  // offer, so neither of them appearing can move anything: the space is already
+  // spoken for.
+  const footEl = document.createElement('div');
+  footEl.className = 'row__foot';
+
   const msgEl = document.createElement('div');
   msgEl.className = 'row__msg';
 
-  wrap.append(idxEl, host, del, msgEl);
+  const offerEl = document.createElement('button');
+  offerEl.type = 'button';
+  offerEl.className = 'row__offer';
+  offerEl.textContent = 'add slider';
+  offerEl.hidden = true;
 
-  const row = { el: wrap, host, idxEl, msgEl, field: null };
+  footEl.append(msgEl, offerEl);
+
+  // Where a promoted slider lives. Empty (and therefore invisible) otherwise.
+  const knobEl = document.createElement('div');
+  knobEl.className = 'row__knob';
+
+  wrap.append(idxEl, host, del, footEl, knobEl);
+
+  const row = {
+    el: wrap, host, idxEl, msgEl, footEl, knobEl, offerEl,
+    offerName: '', knobKey: '', field: null,
+  };
 
   const index = at == null ? rows.length : clamp(at, 0, rows.length);
   const before = rows[index] ? rows[index].el : null;
@@ -346,7 +518,14 @@ function makeRow(source, at) {
 
   row.field = new MathField(host, {
     value: source || '',
-    onChange: () => scheduleRecompute(),
+    functions: docFunctions,
+    onChange: () => {
+      // Typing into the blank row is what makes it a row. A fresh blank one
+      // takes its place immediately, so the list always ends in one.
+      ensureTail();
+      renumber();
+      scheduleRecompute();
+    },
     onFocus: () => setActiveRow(row),
     onBlur: () => row.el.classList.remove('is-active'),
     onEnter: () => insertAfter(row),
@@ -355,26 +534,39 @@ function makeRow(source, at) {
 
   del.addEventListener('click', (e) => {
     e.preventDefault();
-    removeRow(row);
+    const i = removeRow(row);
+    if (i >= 0) focusRow(Math.min(i, rows.length - 1), true);
   });
 
-  // Backspace in an already-empty row deletes the row. Captured on the host so
-  // it is decided BEFORE the field sees the key - otherwise a backspace that
-  // empties the field would immediately delete the row too.
+  offerEl.addEventListener('click', (e) => {
+    e.preventDefault();
+    promoteParam(row.offerName);
+  });
+
+  // Backspace in an already-empty row deletes the row and leaves the caret at
+  // the END of the row above - deleting the row you are in should feel like
+  // deleting a character, not like operating a control. Captured on the host so
+  // it is decided BEFORE the field sees the key; otherwise the backspace that
+  // empties a field would delete its row in the same stroke.
   host.addEventListener('keydown', (e) => {
-    if (e.key !== 'Backspace' || rows.length < 2) return;
-    let empty = false;
-    try {
-      empty = typeof row.field.isEmpty === 'function'
-        ? !!row.field.isEmpty()
-        : rowSource(row) === '';
-    } catch (err) {
-      empty = rowSource(row) === '';
-    }
-    if (!empty) return;
+    if (e.key !== 'Backspace' || e.ctrlKey || e.metaKey || e.altKey) return;
+    if (!rowIsEmpty(row)) return;                 // there is a character to eat
+    const i = indexOfRow(row);
+    if (i < 0) return;
     e.preventDefault();
     e.stopPropagation();
+
+    if (isTailRow(row)) {
+      // The blank row is not a row, so there is nothing here to delete. Step
+      // back over it instead, the way backspacing over a line break does.
+      if (i > 0) focusRow(i - 1, true);
+      return;
+    }
+
     removeRow(row);
+    // i > 0: land at the end of the row above. i === 0: there is no row above,
+    // so land at the start of whatever moved up into first place.
+    focusRow(Math.max(0, i - 1), i > 0);
   }, true);
 
   renumber();
@@ -384,37 +576,45 @@ function makeRow(source, at) {
 function insertAfter(row) {
   const i = indexOfRow(row);
   const created = makeRow('', i < 0 ? rows.length : i + 1);
+  ensureTail();
+  renumber();
   scheduleRecompute();
-  focusRow(indexOfRow(created), false);
+  placeCaret(created, false);
   return created;
 }
 
+/** Removes a row and returns the index it occupied (-1 if it was not there). */
 function removeRow(row) {
   const i = indexOfRow(row);
-  if (i < 0) return;
+  if (i < 0) return -1;
 
-  // Never leave the document with no rows: empty the last one instead.
-  if (rows.length === 1) {
-    try { row.field.source = ''; } catch (err) { /* the field is gone; fine */ }
-    setRowDiagnostic(row, null, '');
-    scheduleRecompute(0);
-    focusRow(0, true);
-    return;
-  }
+  if (openSlider && openSlider.el && row.el.contains(openSlider.el)) closeSettings();
 
   try { row.field.destroy(); } catch (err) { console.error('[numpla] destroy threw', err); }
   row.el.remove();
   rows.splice(i, 1);
+  ensureTail();
   renumber();
   scheduleRecompute(0);
-  focusRow(Math.min(i, rows.length - 1), true);
+  return i;
 }
 
 function buildRows(lines) {
+  // Before any row is constructed: a row that has already been displayed in the
+  // wrong reading cannot always be talked out of it.
+  try {
+    docFunctions = funcNames(lines.join('\n')) || [];
+  } catch (err) {
+    console.error('[numpla] functionNamesIn threw', err);
+    docFunctions = [];
+  }
   lines.forEach((line) => makeRow(line, null));
+  ensureTail();
+  renumber();
 }
 
 function clearRows() {
+  closeSettings();
   for (const row of rows) {
     try { row.field.destroy(); } catch (err) { console.error('[numpla] destroy threw', err); }
     row.el.remove();
@@ -428,7 +628,7 @@ function clearRows() {
 // Demos are part of the product, not marketing: they are how someone finds out
 // what the software can do. Each carries the range over which its knobs are
 // actually interesting, which a generic guess around the current value cannot
-// know - so loading one stages those ranges for syncSliders to pick up when it
+// know - so loading one stages those ranges for syncKnobs to pick up when it
 // creates the sliders.
 // ---------------------------------------------------------------------------
 
@@ -439,8 +639,15 @@ function loadDemo(demo) {
   closeSettings();
   setPlaying(false);
 
+  // A demo's author has already answered the question the offer asks, so its
+  // knobs arrive promoted, with the ranges over which they are interesting.
   pendingKnobs.clear();
-  for (const k of demo.knobs || []) pendingKnobs.set(k.name, k);
+  promoted.clear();
+  knobRanges.clear();
+  for (const k of demo.knobs || []) {
+    pendingKnobs.set(k.name, k);
+    promoted.add(k.name);
+  }
 
   // Drop the parameter sliders so they are rebuilt against the demo's ranges.
   for (const [name, s] of Array.from(sliders)) {
@@ -448,7 +655,6 @@ function loadDemo(demo) {
     s.el.remove();
     sliders.delete(name);
   }
-  sliderOrderKey = '';
 
   clearRows();
   buildRows(demo.source.split('\n'));
@@ -471,39 +677,163 @@ function loadDemo(demo) {
 
 function buildDemoMenu() {
   el.demomenu.textContent = '';
-  for (const demo of DEMOS) {
+  DEMOS.forEach((demo, i) => {
     const item = document.createElement('button');
     item.type = 'button';
     item.className = 'demoitem';
     item.setAttribute('role', 'menuitem');
+    item.dataset.index = String(i);
+
+    // The blurb is no longer on screen - the preview says it better - but it is
+    // still the best hover text there is.
+    const tip = [demo.blurb, demo.audio ? 'a good candidate for render-to-sound' : '']
+      .filter(Boolean).join(' · ');
+    if (tip) item.title = tip;
 
     const title = document.createElement('span');
     title.className = 'demoitem__title';
     title.textContent = demo.title;
 
-    const blurb = document.createElement('span');
-    blurb.className = 'demoitem__blurb';
-    blurb.textContent = demo.blurb;
+    const canvas = document.createElement('canvas');
+    canvas.className = 'demoitem__preview';
+    canvas.width = PREVIEW_W;
+    canvas.height = PREVIEW_H;
+    canvas.setAttribute('aria-hidden', 'true');
 
-    item.append(title, blurb);
-
-    if (demo.audio) {
-      const tag = document.createElement('span');
-      tag.className = 'demoitem__tag';
-      tag.textContent = 'audio';
-      tag.title = 'A good candidate for render-to-sound';
-      item.append(tag);
-    }
-
+    item.append(title, canvas);
     item.addEventListener('click', () => loadDemo(demo));
     el.demomenu.append(item);
+  });
+}
+
+// -- previews ---------------------------------------------------------------
+//
+// The entry shows what the demo actually does: a thumbnail of its own
+// trajectory. Each is a throwaway Model - set_source, solve, sample - drawn
+// once into a small canvas. They are generated the first time the menu opens,
+// one per animation frame so the menu paints immediately, and never again: the
+// menu's DOM outlives closing it, so the pixels are the cache. A preview that
+// cannot be produced takes its canvas with it, leaving the title alone.
+
+const PREVIEW_W = 112;
+const PREVIEW_H = 34;
+const PREVIEW_N = 220;
+let previewsStarted = false;
+
+function previewSeries(demo) {
+  let m = null;
+  try {
+    m = new ModelCtor();
+    const setSource = bindMethod(m, 'set_source');
+    const solve = bindMethod(m, 'solve');
+    const sample = bindMethod(m, 'sample');
+
+    const diag = parseJson(setSource(demo.source), 'Diagnostics');
+    if (!diag) return null;
+    const issues = Array.isArray(diag.issues) ? diag.issues : [];
+    if (issues.some((i) => i.severity === 'error')) return null;
+
+    const span = Array.isArray(demo.tSpan) && demo.tSpan.length === 2 ? demo.tSpan : [0, 20];
+    const report = parseJson(solve(span[0], span[1]), 'SolveReport');
+    if (!report || report.ok !== true) return null;
+
+    const dim = Number.isInteger(report.dim) ? report.dim : 0;
+    if (dim < 1) return null;
+
+    const stride = dim + 1;
+    const data = toF64(sample(PREVIEW_N));
+    const n = Math.floor(data.length / stride);
+    return n >= 2 ? { dim, stride, n, data } : null;
+  } catch (err) {
+    console.warn('[numpla] demo preview failed:', demo && demo.title, err);
+    return null;
+  } finally {
+    try { if (m && typeof m.free === 'function') m.free(); } catch (err) { /* fine */ }
   }
+}
+
+function drawPreview(canvas, s) {
+  const dpr = Math.min(3, Math.max(1, window.devicePixelRatio || 1));
+  canvas.width = Math.round(PREVIEW_W * dpr);
+  canvas.height = Math.round(PREVIEW_H * dpr);
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return false;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, PREVIEW_W, PREVIEW_H);
+
+  // One shared range for every state, so their relative sizes stay honest.
+  let lo = Infinity;
+  let hi = -Infinity;
+  for (let i = 0; i < s.n; i++) {
+    for (let d = 1; d <= s.dim; d++) {
+      const v = s.data[i * s.stride + d];
+      if (!isFinite(v)) continue;
+      if (v < lo) lo = v;
+      if (v > hi) hi = v;
+    }
+  }
+  if (!isFinite(lo) || !isFinite(hi)) return false;
+  if (hi - lo < 1e-12) { const c = (hi + lo) / 2; lo = c - 1; hi = c + 1; }
+
+  const padX = 3;
+  const padY = 4;
+  const xAt = (i) => padX + (i / (s.n - 1)) * (PREVIEW_W - padX * 2);
+  const yAt = (v) => PREVIEW_H - padY - ((v - lo) / (hi - lo)) * (PREVIEW_H - padY * 2);
+
+  const shown = Math.min(s.dim, 3);
+  ctx.lineWidth = 1.25;
+  ctx.lineJoin = 'round';
+  ctx.lineCap = 'round';
+  for (let d = 0; d < shown; d++) {
+    ctx.strokeStyle = seriesColor(d);
+    ctx.globalAlpha = d === 0 ? 1 : 0.5;
+    ctx.beginPath();
+    let started = false;
+    for (let i = 0; i < s.n; i++) {
+      const v = s.data[i * s.stride + d + 1];
+      if (!isFinite(v)) { started = false; continue; }
+      const px = xAt(i);
+      const py = yAt(v);
+      if (started) { ctx.lineTo(px, py); } else { ctx.moveTo(px, py); started = true; }
+    }
+    ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+  return true;
+}
+
+function generatePreviews() {
+  if (previewsStarted || typeof ModelCtor !== 'function') return;
+  previewsStarted = true;
+
+  const items = Array.from(el.demomenu.querySelectorAll('.demoitem'));
+  let i = 0;
+  const step = () => {
+    if (i >= items.length) return;
+    const item = items[i++];
+    const canvas = item.querySelector('.demoitem__preview');
+    const demo = DEMOS[Number(item.dataset.index)];
+    if (canvas) {
+      let ok = false;
+      try {
+        const s = demo ? previewSeries(demo) : null;
+        ok = s ? drawPreview(canvas, s) : false;
+      } catch (err) {
+        console.warn('[numpla] preview draw failed', err);
+        ok = false;
+      }
+      if (!ok) canvas.remove();      // just the title; never a broken box
+    }
+    requestAnimationFrame(step);
+  };
+  requestAnimationFrame(step);
 }
 
 function openDemos() {
   const r = el.demosBtn.getBoundingClientRect();
   el.demomenu.hidden = false;
   el.demosBtn.setAttribute('aria-expanded', 'true');
+  generatePreviews();
   // Position after unhiding so the measured height is real.
   const mw = el.demomenu.offsetWidth;
   const left = clamp(r.left, 8, Math.max(8, window.innerWidth - mw - 8));
@@ -554,18 +884,120 @@ function applyDiagnostics(issues) {
     }
   }
 
+  const real = realRowCount();
   rows.forEach((row, i) => {
-    const d = worst.get(i);
+    // The trailing blank row is not part of the document and a comment row is
+    // prose for the reader: neither is ever diagnosed.
+    const d = (i < real && !isCommentRow(row)) ? worst.get(i) : null;
     setRowDiagnostic(row, d ? d.sev : null, d ? d.msg : '');
   });
 
+  renderIssueBar(issues);
+}
+
+// ---------------------------------------------------------------------------
+// The issue bar - what the document still needs, and the default on offer
+//
+// A state with no initial condition used to start silently at zero: a guess
+// presented as a fact. Now it is stated in a plain sentence, with the default
+// one click away. `fix` is optional in the contract - the compiler emits it
+// only when it can propose something concrete - so a missing `fix` means no
+// button, never a crash and never an empty one.
+// ---------------------------------------------------------------------------
+
+const squash = (s) => s.replace(/\s+/g, '');
+
+function usableFix(it) {
+  const f = it && it.fix;
+  if (!f || typeof f !== 'object') return null;
+  const insert = typeof f.insert === 'string' ? f.insert.trim() : '';
+  if (!insert) return null;
+  const label = typeof f.label === 'string' && f.label.trim()
+    ? f.label.trim()
+    : 'add ' + insert;
+  const message = typeof it.message === 'string' && it.message.trim()
+    ? it.message.trim()
+    : label;
+  return { insert, label, message };
+}
+
+/** The fixes the bar is currently offering, in the order they were reported. */
+let offeredFixes = [];
+
+function renderIssueBar(issues) {
   const errs = issues.filter((i) => i.severity === 'error').length;
   const pend = issues.length - errs;
-  const bits = [];
-  if (errs) bits.push(errs + (errs === 1 ? ' error' : ' errors'));
-  if (pend) bits.push(pend + ' pending');
-  el.diagCount.textContent = bits.length ? bits.join(' · ') : 'clean';
-  el.diagCount.classList.toggle('is-error', errs > 0);
+
+  // Something already written down is not missing, whatever the compiler said
+  // a moment ago.
+  const have = new Set(realRows().map((r) => squash(rowSource(r))));
+  const seen = new Set();
+  const fixes = [];
+  for (const it of issues) {
+    const f = usableFix(it);
+    if (!f) continue;
+    const key = squash(f.insert);
+    if (seen.has(key) || have.has(key)) continue;
+    seen.add(key);
+    fixes.push(f);
+  }
+
+  // A genuine error outranks a missing default: there is no point offering to
+  // complete a document that cannot be read yet.
+  offeredFixes = errs ? [] : fixes;
+
+  if (offeredFixes.length) {
+    const more = offeredFixes.length - 1;
+    el.issueMsg.textContent = more
+      ? offeredFixes[0].message + ' · and ' + more + ' more'
+      : offeredFixes[0].message;
+    // One fix gets its own imperative label. Several share one button: they are
+    // all the same kind of answer - "this is what it would have assumed" - and
+    // making someone click through them one re-solve at a time is exactly the
+    // asking-for-things this is meant to remove. Every row still carries its
+    // own message, so batching hides nothing.
+    el.issueFix.textContent = more
+      ? 'add all ' + offeredFixes.length + ' defaults'
+      : offeredFixes[0].label;
+    el.issueFix.title = offeredFixes.map((f) => f.insert).join('   ·   ');
+    el.issueFix.hidden = false;
+    el.issuebar.classList.add('has-fix');
+  } else {
+    const bits = [];
+    if (errs) bits.push(errs + (errs === 1 ? ' error' : ' errors'));
+    if (pend) bits.push(pend + ' pending');
+    el.issueMsg.textContent = bits.length ? bits.join(' · ') : 'clean';
+    el.issueFix.hidden = true;
+    el.issueFix.textContent = '';
+    el.issueFix.removeAttribute('title');
+    el.issuebar.classList.remove('has-fix');
+  }
+
+  el.issueMsg.classList.toggle('is-error', errs > 0);
+}
+
+/** Append every proposed row to the document, then recompile. */
+function applyOfferedFixes() {
+  if (!offeredFixes.length) return;
+  const have = new Set(realRows().map((r) => squash(rowSource(r))));
+  let last = null;
+  for (const f of offeredFixes) {
+    const key = squash(f.insert);
+    if (have.has(key)) continue;
+    have.add(key);
+    last = makeRow(f.insert, realRowCount());   // before the trailing blank row
+  }
+
+  offeredFixes = [];
+  el.issueFix.hidden = true;
+  el.issuebar.classList.remove('has-fix');
+
+  ensureTail();
+  renumber();
+  scheduleRecompute(0);
+  // The button that had focus has just gone away; put the caret where the new
+  // text is instead of dropping focus on the floor.
+  if (last) placeCaret(last, true);
 }
 
 function setSolveBadge(text, kind) {
@@ -704,13 +1136,21 @@ function scheduleDraw() {
 }
 
 // ---------------------------------------------------------------------------
-// ONE controls section: every slider, `t` included
+// Sliders
 //
-// At rest a row shows name, value, track. Range and step live in an overlay
-// that opens on demand - they are set once, while the value is watched
-// constantly, so giving them permanent screen space buries the number that
-// matters. The overlay is positioned over the page rather than inserted into
-// it, so opening it cannot move anything.
+// A slider is a statement that THIS number is worth playing with, and only the
+// person writing the document knows which ones those are. So a scalar row is
+// offered a slider - a quiet "add slider" in the line the row already reserves
+// - and one click promotes it into a real slider, sitting on the row that
+// defines the number it drives. The × on it goes back to the offer.
+//
+// `t` is the exception twice over: it always has a slider, and it has no row to
+// sit on, so it lives in the transport bar.
+//
+// Range and step live in an overlay that opens on demand - they are set once,
+// while the value is watched constantly, so giving them permanent screen space
+// buries the number that matters. The overlay is positioned over the page
+// rather than inserted into it, so opening it cannot move anything.
 // ---------------------------------------------------------------------------
 
 const GEAR_SVG =
@@ -718,15 +1158,37 @@ const GEAR_SVG =
   '<circle cx="3" cy="8" r="1.5"/><circle cx="8" cy="8" r="1.5"/>' +
   '<circle cx="13" cy="8" r="1.5"/></svg>';
 
-/** name -> slider record */
+/** name -> slider record. `t` is always in here; parameters only once asked for. */
 const sliders = new Map();
 let openSlider = null;
-let sliderOrderKey = '';
 
-function makeSlider(name, kind, init) {
+/** Parameter names the user (or a demo) has asked to have a slider for. */
+const promoted = new Set();
+
+/** name -> the range the user chose, kept across recompiles and row edits. */
+const knobRanges = new Map();
+
+function wireRange(s) {
+  s.range.addEventListener('pointerdown', () => { s.dragging = true; });
+  s.range.addEventListener('input', () => {
+    const v = Number(s.range.value);
+    if (!isFinite(v)) return;
+    s.value = v;
+    paintSlider(s);
+    if (s.kind === 'time') {
+      if (state.playing) setPlaying(false);
+      setTime(v, true);
+    } else {
+      writeParam(s);
+    }
+  });
+}
+
+/** The transport slider: name, value, track, and the settings affordance. */
+function makeTimeSlider(init) {
   const wrap = document.createElement('div');
   wrap.className = 'slider';
-  wrap.dataset.name = name;
+  wrap.dataset.name = 't';
 
   const top = document.createElement('div');
   top.className = 'slider__top';
@@ -734,8 +1196,8 @@ function makeSlider(name, kind, init) {
   const nameBtn = document.createElement('button');
   nameBtn.type = 'button';
   nameBtn.className = 'slider__name';
-  nameBtn.textContent = name;
-  nameBtn.title = 'Range and step for ' + name;
+  nameBtn.textContent = 't';
+  nameBtn.title = 'Range and step for t';
   nameBtn.setAttribute('aria-expanded', 'false');
 
   const valueEl = document.createElement('span');
@@ -745,22 +1207,23 @@ function makeSlider(name, kind, init) {
   gear.type = 'button';
   gear.className = 'slider__gear';
   gear.innerHTML = GEAR_SVG;
-  gear.title = 'Range and step for ' + name;
-  gear.setAttribute('aria-label', 'Range and step for ' + name);
+  gear.title = 'Range and step for t';
+  gear.setAttribute('aria-label', 'Range and step for t');
 
   top.append(nameBtn, valueEl, gear);
 
   const range = document.createElement('input');
   range.type = 'range';
   range.className = 'range';
-  range.setAttribute('aria-label', name);
+  range.setAttribute('aria-label', 't');
 
   wrap.append(top, range);
-  el.sliders.appendChild(wrap);
+  el.transport.appendChild(wrap);
 
   const s = {
-    name,
-    kind,
+    name: 't',
+    kind: 'time',
+    label: '',
     el: wrap,
     nameBtn,
     valueEl,
@@ -772,27 +1235,68 @@ function makeSlider(name, kind, init) {
     dragging: false,
   };
 
-  const toggle = (e) => {
-    e.preventDefault();
-    openSettingsFor(s);
-  };
+  const toggle = (e) => { e.preventDefault(); openSettingsFor(s); };
   nameBtn.addEventListener('click', toggle);
   gear.addEventListener('click', toggle);
 
-  range.addEventListener('pointerdown', () => { s.dragging = true; });
-  range.addEventListener('input', () => {
-    const v = Number(range.value);
-    if (!isFinite(v)) return;
-    s.value = v;
-    paintSlider(s);
-    if (s.kind === 'time') {
-      if (state.playing) setPlaying(false);
-      setTime(v, true);
-    } else {
-      writeParam(s);
-    }
-  });
+  wireRange(s);
+  applyRange(s);
+  sliders.set('t', s);
+  return s;
+}
 
+/**
+ * A parameter slider. It carries no name and no value readout, because it sits
+ * directly under the row that says both - `k = 60` is the readout, and dragging
+ * rewrites it live.
+ */
+function makeParamSlider(name, init) {
+  const wrap = document.createElement('div');
+  wrap.className = 'knob';
+  wrap.dataset.name = name;
+
+  const range = document.createElement('input');
+  range.type = 'range';
+  range.className = 'range';
+  range.setAttribute('aria-label', name);
+
+  const gear = document.createElement('button');
+  gear.type = 'button';
+  gear.className = 'knob__btn knob__gear';
+  gear.innerHTML = GEAR_SVG;
+  gear.title = 'Range and step for ' + name;
+  gear.setAttribute('aria-label', 'Range and step for ' + name);
+  gear.setAttribute('aria-expanded', 'false');
+
+  const off = document.createElement('button');
+  off.type = 'button';
+  off.className = 'knob__btn knob__off';
+  off.textContent = DEL_MARK;
+  off.title = 'Remove the slider for ' + name;
+  off.setAttribute('aria-label', 'Remove the slider for ' + name);
+
+  wrap.append(range, gear, off);
+
+  const knob = pendingKnobs.get(name);
+  const s = {
+    name,
+    kind: 'param',
+    label: knob && knob.label ? String(knob.label) : '',
+    el: wrap,
+    nameBtn: gear,          // what the settings overlay hangs off and returns to
+    valueEl: null,
+    range,
+    min: init.min,
+    max: init.max,
+    step: init.step,
+    value: init.value,
+    dragging: false,
+  };
+
+  gear.addEventListener('click', (e) => { e.preventDefault(); openSettingsFor(s); });
+  off.addEventListener('click', (e) => { e.preventDefault(); demoteParam(name); });
+
+  wireRange(s);
   applyRange(s);
   sliders.set(name, s);
   return s;
@@ -809,9 +1313,16 @@ function applyRange(s) {
 }
 
 function paintSlider(s) {
-  s.valueEl.textContent = s.kind === 'time'
-    ? s.value.toFixed(3)
-    : fmtStepped(s.value, s.step);
+  if (s.valueEl) {
+    s.valueEl.textContent = s.kind === 'time'
+      ? s.value.toFixed(3)
+      : fmtStepped(s.value, s.step);
+    return;
+  }
+  // No readout of its own: the row above it is the readout. The hover text is
+  // where a demo's description of the knob goes.
+  s.range.title = s.name + ' = ' + fmtStepped(s.value, s.step) +
+    (s.label ? ' · ' + s.label : '');
 }
 
 function setSliderValue(s, v) {
@@ -882,6 +1393,12 @@ function readSettings() {
 
   applyRange(s);
 
+  // A chosen range outlives the slider: deleting and retyping the row, or
+  // dismissing and re-adding the slider, must not throw it away.
+  if (s.kind === 'param') {
+    knobRanges.set(s.name, { min: s.min, max: s.max, step: s.step });
+  }
+
   if (s.kind === 'time' && spanChanged) {
     state.t0 = s.min;
     state.t1 = s.max;
@@ -898,10 +1415,10 @@ const ASSIGN_RE =
 /** Every `name = <number>` row in the document, mapped to its row. */
 function scanAssignments() {
   const map = new Map();
-  for (const row of rows) {
+  for (const row of realRows()) {
     const code = rowSource(row).split('#')[0];
     const m = ASSIGN_RE.exec(code);
-    if (m) map.set(m[1], { value: Number(m[2]), row });
+    if (m && !map.has(m[1])) map.set(m[1], { value: Number(m[2]), row });
   }
   return map;
 }
@@ -909,7 +1426,12 @@ function scanAssignments() {
 function writeParam(s) {
   const hit = scanAssignments().get(s.name);
   if (!hit) return;
-  const text = s.name + ' = ' + numText(s.value, s.step);
+  // Rewrite the number, not the row: a note the author left at the end of the
+  // line is theirs, and dragging a slider must not eat it.
+  const raw = rowSource(hit.row);
+  const hash = raw.indexOf('#');
+  const note = hash >= 0 ? '  ' + raw.slice(hash) : '';
+  const text = s.name + ' = ' + numText(s.value, s.step) + note;
   try {
     hit.row.field.source = text;
   } catch (err) {
@@ -920,67 +1442,114 @@ function writeParam(s) {
 }
 
 /**
- * Reconcile the slider set with the document: `t` always first, then every
- * scalar parameter that is a plain numeric assignment (those are the only ones
- * a slider can actually drive).
+ * Where a slider's range comes from, most specific first: the range the user
+ * set by hand, then the range the demo's author declared, then a guess made
+ * around the value that is written in the document.
  */
-function syncSliders(params) {
-  const assign = scanAssignments();
-  const wanted = [];
+function initialRangeFor(name, v) {
+  const saved = knobRanges.get(name);
+  if (saved && isFinite(saved.min) && isFinite(saved.max) && saved.max > saved.min) {
+    return { min: saved.min, max: saved.max, step: saved.step, value: v };
+  }
+  const knob = pendingKnobs.get(name);
+  if (knob && isFinite(knob.min) && isFinite(knob.max) && knob.max > knob.min) {
+    return {
+      min: knob.min,
+      max: knob.max,
+      step: knob.step > 0 ? knob.step : niceStepFor(knob.max - knob.min),
+      value: v,
+    };
+  }
+  const r = defaultRange(v);
+  return { min: r.min, max: r.max, step: niceStepFor(r.max - r.min), value: v };
+}
+
+function promoteParam(name) {
+  if (!name || promoted.has(name)) return;
+  promoted.add(name);
+  syncKnobs(state.params);
+  const s = sliders.get(name);
+  if (s && s.range) s.range.focus();   // the click's target is gone; land on the track
+}
+
+function demoteParam(name) {
+  if (!name || !promoted.has(name)) return;
+  const s = sliders.get(name);
+  if (s && openSlider === s) closeSettings();
+  promoted.delete(name);
+  syncKnobs(state.params);
+  const row = rows.find((r) => r.offerName === name);
+  if (row && !row.offerEl.hidden) row.offerEl.focus();
+}
+
+/**
+ * Reconcile every row's knob area with the document.
+ *
+ * A row earns a knob when it is a plain numeric assignment to a name the
+ * compiler reports as a parameter - those are the only ones a slider can
+ * actually drive. Promoted names get the slider; everything else gets the
+ * offer. A row whose knob is already correct is not touched at all: moving a
+ * node someone is dragging is exactly the jitter this shell exists to avoid.
+ */
+function syncKnobs(params) {
+  const drivable = new Set();
   for (const name of params) {
     if (name === 't') continue;
     if (state.names.indexOf(name) >= 0) continue;   // it is a state, not a knob
-    if (!assign.has(name)) continue;                // not a plain number
-    if (wanted.indexOf(name) < 0) wanted.push(name);
+    drivable.add(name);
   }
 
-  // drop sliders whose parameter left the document
+  const wanted = new Map();     // row -> { name, value }
+  const seen = new Set();
+  for (const row of realRows()) {
+    const m = ASSIGN_RE.exec(rowSource(row).split('#')[0]);
+    if (!m) continue;
+    const name = m[1];
+    if (!drivable.has(name) || seen.has(name)) continue;
+    seen.add(name);
+    wanted.set(row, { name, value: Number(m[2]) });
+  }
+
+  const keyFor = (w) => (w ? (promoted.has(w.name) ? 'slider:' : 'offer:') + w.name : '');
+
+  // 1. clear the rows whose knob is no longer what it should be
+  for (const row of rows) {
+    if (row.knobKey === keyFor(wanted.get(row))) continue;
+    row.knobEl.textContent = '';
+    row.offerEl.hidden = true;
+    row.offerEl.removeAttribute('title');
+    row.offerName = '';
+    row.knobKey = '';
+  }
+
+  // 2. mount what each row should have
+  for (const [row, w] of wanted) {
+    const key = keyFor(w);
+    if (row.knobKey === key) continue;
+    if (promoted.has(w.name)) {
+      const s = sliders.get(w.name) || makeParamSlider(w.name, initialRangeFor(w.name, w.value));
+      if (s.el.parentNode !== row.knobEl) row.knobEl.appendChild(s.el);
+    } else {
+      row.offerName = w.name;
+      row.offerEl.hidden = false;
+      row.offerEl.title = 'Add a slider for ' + w.name;
+      row.offerEl.setAttribute('aria-label', 'Add a slider for ' + w.name);
+    }
+    row.knobKey = key;
+  }
+
+  // 3. drop the sliders whose parameter left the document
   for (const [name, s] of Array.from(sliders)) {
-    if (name === 't' || wanted.indexOf(name) >= 0) continue;
+    if (name === 't' || seen.has(name)) continue;
     if (openSlider === s) closeSettings();
     s.el.remove();
     sliders.delete(name);
   }
 
-  // add the new ones, seeded from the value written in the document
-  for (const name of wanted) {
-    if (sliders.has(name)) continue;
-    const v = assign.get(name).value;
-    // A demo knows the range over which its knob is interesting; a generic
-    // guess around the current value usually does not. Prefer the demo's.
-    const knob = pendingKnobs.get(name);
-    const r = knob ? { min: knob.min, max: knob.max } : defaultRange(v);
-    makeSlider(name, 'param', {
-      min: r.min,
-      max: r.max,
-      step: (knob && knob.step > 0) ? knob.step : niceStepFor(r.max - r.min),
-      value: v,
-    });
-    if (knob && knob.label) {
-      const made = sliders.get(name);
-      const btn = made && made.el.querySelector('.slider__name');
-      if (btn) btn.title = knob.label;
-    }
-  }
-
-  // keep the document's value and the slider's value in step
-  for (const name of wanted) {
-    const s = sliders.get(name);
-    if (s && !s.dragging) setSliderValue(s, assign.get(name).value);
-  }
-
-  // only touch DOM order when the set actually changed - moving nodes around
-  // while someone is dragging one of them is exactly the jitter we are here to
-  // eliminate.
-  const key = 't|' + wanted.join('|');
-  if (key !== sliderOrderKey) {
-    sliderOrderKey = key;
-    const t = sliders.get('t');
-    if (t) el.sliders.appendChild(t.el);
-    for (const name of wanted) {
-      const s = sliders.get(name);
-      if (s) el.sliders.appendChild(s.el);
-    }
+  // 4. keep the document's value and the slider's value in step
+  for (const w of wanted.values()) {
+    const s = sliders.get(w.name);
+    if (s && s.kind === 'param' && !s.dragging) setSliderValue(s, w.value);
   }
 }
 
@@ -1062,7 +1631,10 @@ function sampleCount() {
 function recompute() {
   if (!M) return;
 
-  const src = docSource();
+  // 0. tell every row which names are functions; a row that had to be re-read
+  //    may say something slightly different now, so take the document again.
+  let src = docSource();
+  if (refreshFunctions(src)) src = docSource();
 
   // 1. set_source - cheap, runs on every edit, never throws.
   const diag = parseJson(M.setSource(src), 'Diagnostics')
@@ -1088,7 +1660,7 @@ function recompute() {
   // `phase` lights up the moment a system gains its second state.
   updateCapabilities(names);
   renderLegend(names);
-  syncSliders(params);
+  syncKnobs(params);
 
   if (!names.length) {
     setSolveBadge('no states', null);
@@ -1262,10 +1834,15 @@ function wireDivider() {
 // Wiring
 // ---------------------------------------------------------------------------
 
+/**
+ * Would this key belong to the thing that has focus? A field, an input - and a
+ * button, because space is how a focused button is pressed and the transport
+ * has no business stealing it.
+ */
 function isTypingTarget(node) {
   if (!node || node.nodeType !== 1) return false;
   const tag = node.tagName;
-  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return true;
+  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || tag === 'BUTTON') return true;
   if (node.isContentEditable) return true;
   return typeof node.closest === 'function' && !!node.closest('.row__field, .settings');
 }
@@ -1275,10 +1852,29 @@ function wire() {
   renderChips();
   wireDivider();
 
-  el.addRow.addEventListener('click', () => {
-    const created = makeRow('', rows.length);
-    scheduleRecompute(0);
-    focusRow(indexOfRow(created), false);
+  // Clicking the empty space below the list lands in the trailing blank row;
+  // clicking a row's own margins lands at the end of that row. mousedown, not
+  // click, so the caret arrives with the press like it does inside a field.
+  el.rows.addEventListener('mousedown', (e) => {
+    const t = e.target;
+    if (!t || typeof t.closest !== 'function') return;
+    if (t.closest('.row__field') || t.closest('.row__del') ||
+        t.closest('.row__offer') || t.closest('.row__knob')) return;
+    const rowEl = t.closest('.row');
+    if (rowEl) {
+      const row = rows.find((r) => r.el === rowEl);
+      if (!row) return;
+      e.preventDefault();
+      placeCaret(row, true);
+      return;
+    }
+    e.preventDefault();
+    focusTail();
+  });
+
+  el.issueFix.addEventListener('click', (e) => {
+    e.preventDefault();
+    applyOfferedFixes();
   });
 
   el.play.addEventListener('click', () => setPlaying(!state.playing));
@@ -1338,7 +1934,8 @@ function wire() {
     if (!openSlider) return;
     const t = e.target;
     if (t && typeof t.closest === 'function' &&
-        (t.closest('.settings') || t.closest('.slider.is-open'))) return;
+        (t.closest('.settings') || t.closest('.slider.is-open') ||
+         t.closest('.knob.is-open'))) return;
     closeSettings();
   }, true);
 
@@ -1378,6 +1975,9 @@ async function boot() {
       throw new Error('mathfield.js does not export a MathField class.');
     }
     MathField = mf.MathField;
+    funcNames = typeof mf.functionNamesIn === 'function'
+      ? mf.functionNamesIn
+      : () => [];
   } catch (err) {
     fail('Could not load ./mathfield.js.', err);
     return;
@@ -1392,13 +1992,12 @@ async function boot() {
   }
 
   // the time slider exists from the first frame: `t` is a slider like any other
-  makeSlider('t', 'time', {
+  makeTimeSlider({
     min: state.t0,
     max: state.t1,
     step: niceStepFor(state.t1 - state.t0),
     value: state.t,
   });
-  sliderOrderKey = 't|';
 
   // 2. the compute core
   let mod;
@@ -1432,6 +2031,7 @@ async function boot() {
     if (typeof mod.Model !== 'function') {
       throw new Error('numpla_wasm.js does not export a Model class.');
     }
+    ModelCtor = mod.Model;      // demo previews each solve in their own Model
     const model = new mod.Model();
     M = {
       setSource: bindMethod(model, 'set_source'),

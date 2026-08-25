@@ -38,7 +38,13 @@ Selection and rationale in `docs/solvers.md`.
       one, because scrubbing needs `solution(t)`, not a list of samples
 - [x] `Solution::eval` / `sample` — binary search + interpolation
 - [x] Step telemetry as data (accepted/rejected/local error, per attempt)
-- [ ] Velocity Verlet + Yoshida4 (makes the conservation demo work)
+- [x] Velocity Verlet + Yoshida4 — fixed step, symplectic, with cubic-Hermite
+      dense output so `Solution::eval` works the same whichever method ran
+- [x] `SecondOrderSystem` trait (`q'' = a(t, q, v)`), reachable from the
+      lowered position/velocity pairs `numpla-model` already produces
+- [x] `Method` selection over one state layout — what the mode slider drives
+- [x] Conservation measurement: any invariant sampled along a solution, plus
+      the drift statistics the conservation monitor plots
 - [ ] Event detection on the dense output
 - [ ] Rodas5P or an ESDIRK for stiffness
 - [ ] Port-Hamiltonian system type + power-conserving interconnection
@@ -111,32 +117,21 @@ idea-generation engine.
 
 ## Known bugs
 
-### Implicit multiplication loses to function-call syntax on `^`
+None outstanding.
 
-`g (y - x)^3` evaluates as `(g*(y-x))^3`, not `g*(y-x)^3`. At `g=40, y-x=-1`
-that is `-64000` instead of `-40`.
+Fixed:
 
-Cause: an identifier followed by `(` is parsed as `Expr::Call`, because the
-parser cannot yet know whether `g` is a function or a coefficient. The exponent
-then attaches to the whole call node, and eval's "not a function, so multiply"
-fallback happens *inside* the cube. The fallback itself is right — ordinary
-notation needs `2(x+1)` — but it silently changes precedence.
-
-Found by benchmarking two spellings of the same physics against each other and
-noticing the trajectories diverged. It is dangerous precisely because nothing
-errors: you get a plausible curve of the wrong system.
-
-Fix: resolve call-vs-coefficient with knowledge of which names are functions.
-`numpla-model` already collects the `f(u) = ...` rows, so the shape is a
-two-pass compile — gather definitions, then build expression trees with the
-function set in hand. Until then, parenthesise: `g ((y-x)^3)`.
-
-### `rand()` has no call-site identity
-
-Two separate `rand()` calls in one document draw the same value, because the
-evaluator has no notion of where a call sits in the tree. `numpla-noise`
-already exports `rand_at(seed, index)` and `derive_seed(doc, site)`; what is
-missing is the document layer assigning a stable index per call site.
+- **Implicit multiplication lost to function-call syntax on `^`.** `g (y - x)^3`
+  parsed as `(g*(y-x))^3`, silently integrating a different system. Resolved by
+  the two-pass compile in `numpla-model`: gather the `f(u) = ...` definitions,
+  then build the trees with the function set in hand
+  (`numpla_expr::parse_with`). A name that is not a function and is followed by
+  `(` is implicit multiplication, at multiplication precedence.
+- **`rand()` had no call-site identity.** Two `rand()`s in one document drew the
+  same number. `numpla-model` now names each call site — hashed from the row's
+  handle and the position of the call within it, so an unrelated edit does not
+  reshuffle anyone's stream — and folds the draw to a literal, since it cannot
+  depend on `t` or the state.
 
 
 ## Crate split (published separately)

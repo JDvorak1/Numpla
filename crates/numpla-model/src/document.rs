@@ -6,9 +6,13 @@
 //! distinction is the reason this pass evaluates as much as it can up front
 //! instead of waiting for the solver to fall over.
 
-use numpla_expr::{eval, parse, Env, EvalError, Expr, Stmt, Value};
+use std::collections::HashMap;
 
-use crate::report::{Diagnostics, Issue, Severity};
+use numpla_expr::{
+    deriv_key, eval, parse, parse_with, Env, EvalError, Expr, FuncNames, ParseError, Stmt, Value,
+};
+
+use crate::report::{Diagnostics, Fix, Issue, Severity};
 
 /// Where one state's derivative comes from.
 #[derive(Debug, Clone, PartialEq)]
@@ -48,6 +52,20 @@ impl Document {
         self.issues.iter().any(|i| i.severity == Severity::Pending)
     }
 
+    /// The first pending issue that actually stops the document integrating.
+    ///
+    /// Not every pending issue does. A state with no initial condition is
+    /// reported *and* defaulted in the same pass, so the document still
+    /// solves; a name that is not defined yet is pending because we can
+    /// propose a value, but nothing has been assumed on the user's behalf and
+    /// there is nothing to integrate until they accept it.
+    pub fn first_blocker(&self) -> Option<String> {
+        self.issues
+            .iter()
+            .find(|i| i.severity == Severity::Pending && i.blocking)
+            .map(|i| format!("line {}: {}", i.line + 1, i.message))
+    }
+
     /// The first error, phrased for a person: `solve` reports this rather than
     /// a count, because one concrete line beats "3 problems".
     pub fn first_error(&self) -> Option<String> {
@@ -77,55 +95,101 @@ struct Row {
     /// error, so such a row already carries a `Pending` issue and must not be
     /// given a second one by the passes below.
     hole: bool,
+    /// A stable handle for the row, used to name the random call sites inside
+    /// it. See [`resolve_random_sites`].
+    key: String,
 }
 
 pub fn compile(src: &str) -> Document {
     let mut doc = Document::default();
-    let rows = read_rows(src, &mut doc.issues);
+    let mut rows = read_rows(src, &mut doc.issues);
+    resolve_random_sites(&mut rows, doc.env.noise_seed);
 
-    let ode_rows = declare_states(&rows, &mut doc);
+    let states = declare_states(&rows, &mut doc);
     bind_assignments(&rows, &mut doc);
-    apply_initial_conditions(&rows, &mut doc);
-    probe_right_hand_sides(&rows, &ode_rows, &mut doc);
+    let stated = apply_initial_conditions(&rows, &mut doc);
+    report_missing_initial_conditions(&rows, &states, &stated, &mut doc);
+    probe_right_hand_sides(&rows, &states.ode_rows, &mut doc);
     reject_unsupported_rows(&rows, &mut doc);
 
     doc.issues.sort_by_key(|i| (i.line, i.start));
+    offer_each_fix_once(&mut doc.issues);
     doc
 }
 
-/// Parse every line. Blank lines and comments simply do not exist downstream.
+/// Read every line, in two passes. Blank lines and comments simply do not
+/// exist downstream.
+///
+/// # Why twice
+///
+/// `g (y - x)^3` and `f(y - x)^3` are the same token sequence and mean
+/// different things — the first scales a cubed difference, the second cubes
+/// the result of a call. Nothing inside the row can tell them apart; only the
+/// rest of the document can, by saying whether `f` has an `f(u) = ...` row.
+/// So the first pass reads every row knowing only the builtins and collects
+/// the function definitions, and the second re-reads them with that set in
+/// hand. Getting this wrong is not a syntax error — it silently changes the
+/// precedence of `^` and integrates a different system.
+///
+/// A document with no function definitions is the common case and skips the
+/// second pass entirely: with an empty set the two passes agree by definition.
 fn read_rows(src: &str, issues: &mut Vec<Issue>) -> Vec<Row> {
-    let mut rows = Vec::new();
-    for (line, raw) in src.lines().enumerate() {
-        let code = match raw.find('#') {
-            Some(i) => &raw[..i],
-            None => raw,
-        };
-        if code.trim().is_empty() {
-            continue;
-        }
-        // Not trimmed at the front: the lexer skips whitespace itself, and
-        // trimming would slide every span off the text it underlines.
-        let (stmt, errors) = parse(code);
+    // Not trimmed at the front: the lexer skips whitespace itself, and
+    // trimming would slide every span off the text it underlines.
+    let code: Vec<(usize, &str)> = src
+        .lines()
+        .enumerate()
+        .map(|(line, raw)| {
+            (
+                line,
+                match raw.find('#') {
+                    Some(i) => &raw[..i],
+                    None => raw,
+                },
+            )
+        })
+        .filter(|(_, c)| !c.trim().is_empty())
+        .collect();
+
+    let mut parsed: Vec<(Stmt, Vec<ParseError>)> = code.iter().map(|(_, c)| parse(c)).collect();
+
+    let funcs: FuncNames = parsed
+        .iter()
+        .filter_map(|(stmt, _)| match stmt {
+            // A row with parameters. `x(0) = 1` reaches us as an equation
+            // rather than an assignment, so an initial condition cannot be
+            // mistaken for a function definition here.
+            Stmt::Assign { name, params, .. } if !params.is_empty() => Some(name.clone()),
+            _ => None,
+        })
+        .collect();
+
+    if !funcs.is_empty() {
+        parsed = code.iter().map(|(_, c)| parse_with(c, &funcs)).collect();
+    }
+
+    let mut rows = Vec::with_capacity(parsed.len());
+    for ((line, code), (stmt, errors)) in code.into_iter().zip(parsed) {
         let hole = stmt_has_hole(&stmt);
         for e in errors {
-            issues.push(Issue {
+            issues.push(Issue::new(
                 line,
                 // A row the parser could not finish reading is a row still
                 // being typed. Anything else it complains about is real.
-                severity: if hole {
+                if hole {
                     Severity::Pending
                 } else {
                     Severity::Error
                 },
-                message: e.msg,
-                start: byte_offset(code, e.start),
-                end: byte_offset(code, e.end),
-            });
+                e.msg,
+                byte_offset(code, e.start),
+                byte_offset(code, e.end),
+            ));
         }
         rows.push(Row {
             line,
             len: code.trim_end().len(),
+            key: row_key(&stmt, code),
             stmt,
             hole,
         });
@@ -133,13 +197,41 @@ fn read_rows(src: &str, issues: &mut Vec<Issue>) -> Vec<Row> {
     rows
 }
 
+/// A stable handle for one row, used to name the random call sites inside it.
+///
+/// A row that defines something is named by *what it defines*, so that editing
+/// its right-hand side — which happens on every keystroke, since the shell
+/// recompiles as you type — does not re-roll the numbers already on screen. A
+/// row that defines nothing has only its text to be identified by.
+fn row_key(stmt: &Stmt, code: &str) -> String {
+    match stmt {
+        Stmt::Assign { name, .. } => name.clone(),
+        Stmt::Ode { name, order, .. } => deriv_key(name, *order),
+        Stmt::Equation { .. } | Stmt::Expr(_) => code.trim().to_string(),
+    }
+}
+
+/// Which rows the states came from.
+struct States {
+    /// The row that introduced each state, aligned with `Document::states`.
+    ///
+    /// A missing initial condition belongs to the whole document, but the UI
+    /// can only highlight a line — so it is reported against the row that
+    /// brought the state into existence, which is the one place a person can
+    /// look and see why the state exists at all.
+    row_of: Vec<usize>,
+    /// The ODE rows, for the right-hand-side probe.
+    ode_rows: Vec<usize>,
+}
+
 /// Pass 1: which rows are states, and in what order.
 ///
 /// Declaration order, with each lowered velocity immediately after its
 /// position. That order is public — it is what every `Float64Array` crossing
 /// the boundary is laid out in — so it is decided here and nowhere else.
-fn declare_states(rows: &[Row], doc: &mut Document) -> Vec<usize> {
+fn declare_states(rows: &[Row], doc: &mut Document) -> States {
     let mut ode_rows = Vec::new();
+    let mut row_of = Vec::new();
     for (idx, row) in rows.iter().enumerate() {
         let Stmt::Ode { name, order, rhs } = &row.stmt else {
             continue;
@@ -155,6 +247,7 @@ fn declare_states(rows: &[Row], doc: &mut Document) -> Vec<usize> {
             1 => {
                 doc.states.push(name.clone());
                 doc.rhs.push(StateRhs::Expr(rhs.clone()));
+                row_of.push(idx);
             }
             2 => {
                 // The hidden state is *named* `x'` on purpose: that is the key
@@ -164,8 +257,11 @@ fn declare_states(rows: &[Row], doc: &mut Document) -> Vec<usize> {
                 let velocity = doc.states.len() + 1;
                 doc.states.push(name.clone());
                 doc.rhs.push(StateRhs::Velocity(velocity));
-                doc.states.push(numpla_expr::deriv_key(name, 1));
+                doc.states.push(deriv_key(name, 1));
                 doc.rhs.push(StateRhs::Expr(rhs.clone()));
+                // Both halves of a lowered row came from the same line.
+                row_of.push(idx);
+                row_of.push(idx);
             }
             _ => {
                 doc.issues.push(row.issue(
@@ -177,7 +273,7 @@ fn declare_states(rows: &[Row], doc: &mut Document) -> Vec<usize> {
         }
         ode_rows.push(idx);
     }
-    ode_rows
+    States { row_of, ode_rows }
 }
 
 /// Pass 2: constants and user functions.
@@ -237,12 +333,12 @@ fn bind_assignments(rows: &[Row], doc: &mut Document) {
 
     for &c in &unresolved {
         let (idx, name, rhs) = constants[c];
-        let message = match eval(rhs, &doc.env) {
-            Err(e) => describe(&e),
+        let issue = match eval(rhs, &doc.env) {
+            Err(e) => issue_for_eval_error(&rows[idx], &e, doc),
             // Unreachable: the loop above only keeps rows that fail.
-            Ok(_) => "could not be evaluated".to_string(),
+            Ok(_) => rows[idx].issue(Severity::Error, "could not be evaluated".to_string()),
         };
-        doc.issues.push(rows[idx].issue(Severity::Error, message));
+        doc.issues.push(issue);
         // Rows downstream of a broken definition go gray rather than inheriting
         // the red: the definition is the one place worth pointing at.
         doc.env.set_value(name, Value::Unevaluated);
@@ -260,8 +356,15 @@ fn bind_assignments(rows: &[Row], doc: &mut Document) {
 }
 
 /// Pass 3: initial conditions. Absent means zero, per the contract.
-fn apply_initial_conditions(rows: &[Row], doc: &mut Document) {
+///
+/// Returns, per state, whether the document actually said where it starts —
+/// which is what [`report_missing_initial_conditions`] turns into an offer.
+/// A row that names the state counts even if it is broken: the person is
+/// plainly trying to say where the state begins, and stacking "and it has no
+/// starting point" on top of their red row would be noise, not information.
+fn apply_initial_conditions(rows: &[Row], doc: &mut Document) -> Vec<bool> {
     doc.y0 = vec![0.0; doc.states.len()];
+    let mut stated = vec![false; doc.states.len()];
 
     for row in rows {
         let Stmt::Equation { lhs, rhs } = &row.stmt else {
@@ -282,6 +385,7 @@ fn apply_initial_conditions(rows: &[Row], doc: &mut Document) {
             ));
             continue;
         };
+        stated[i] = true;
         if *at != 0.0 {
             doc.issues.push(row.issue(
                 Severity::Error,
@@ -300,9 +404,49 @@ fn apply_initial_conditions(rows: &[Row], doc: &mut Document) {
                 Severity::Error,
                 "an initial condition must be a single number".to_string(),
             )),
-            Err(e) => doc.issues.push(row.issue(Severity::Error, describe(&e))),
+            Err(e) => {
+                let issue = issue_for_eval_error(row, &e, doc);
+                doc.issues.push(issue);
+            }
         }
     }
+    stated
+}
+
+/// Say which states are still starting from the default, and offer the row
+/// that would say so out loud.
+///
+/// A state with no initial condition starts at zero, and until now it did so
+/// in silence — a guess presented as a fact. It is reported instead, with the
+/// row we would have written, and the document still integrates: this is
+/// information, not an obstruction (`docs/ui-v3.md` §3). A lowered velocity
+/// gets the same treatment under its own name, `x'`, because it is as real a
+/// state as its position.
+fn report_missing_initial_conditions(
+    rows: &[Row],
+    states: &States,
+    stated: &[bool],
+    doc: &mut Document,
+) {
+    let mut notes = Vec::new();
+    for (i, name) in doc.states.iter().enumerate() {
+        if stated[i] {
+            continue;
+        }
+        let row = &rows[states.row_of[i]];
+        // A row still being typed already says it is incomplete. Telling the
+        // person their half-written state has no starting point yet would be
+        // shouting about the obvious.
+        if row.hole {
+            continue;
+        }
+        notes.push(
+            row.issue(Severity::Pending, format!("{} has no starting point", name))
+                .with_fix(Fix::append(format!("{}(0) = 0", name)))
+                .informational(),
+        );
+    }
+    doc.issues.extend(notes);
 }
 
 /// Pass 4: evaluate every right-hand side once, at `t = 0` with the states at
@@ -336,7 +480,10 @@ fn probe_right_hand_sides(rows: &[Row], ode_rows: &[usize], doc: &mut Document) 
                 Severity::Error,
                 "an ODE right-hand side must be a single number".to_string(),
             )),
-            Err(e) => doc.issues.push(row.issue(Severity::Error, describe(&e))),
+            Err(e) => {
+                let issue = issue_for_eval_error(row, &e, doc);
+                doc.issues.push(issue);
+            }
         }
     }
 }
@@ -364,17 +511,184 @@ fn reject_unsupported_rows(rows: &[Row], doc: &mut Document) {
     }
 }
 
+/// An eval failure, as an issue on the row that hit it.
+///
+/// A name that has not been defined *yet* is the ordinary state of a document
+/// being written, so when we can name the definition it is waiting for it
+/// becomes a `pending` note carrying that row — the gray-not-red rule applied
+/// one level up (`docs/ui-v3.md` §3). It still blocks solving: unlike a
+/// missing initial condition, nothing has been assumed on the user's behalf.
+/// Anything else — a type mismatch, a wrong arity — is a genuine mistake and
+/// stays red.
+fn issue_for_eval_error(row: &Row, e: &EvalError, doc: &Document) -> Issue {
+    if let EvalError::Undefined(name) = e {
+        if let Some(fix) = propose_definition(name, doc) {
+            return row
+                .issue(Severity::Pending, format!("{} is not defined yet", name))
+                .with_fix(fix);
+        }
+    }
+    row.issue(Severity::Error, describe(e))
+}
+
+/// The definition we would write for a name nothing has defined — `k = 1`.
+///
+/// Nothing is proposed for a name the document already gives a meaning to. A
+/// state that failed to resolve is not waiting for a constant of the same
+/// spelling, and offering one would quietly create a second thing under that
+/// name — which is worse than the red row it replaced.
+fn propose_definition(name: &str, doc: &Document) -> Option<Fix> {
+    let unknown = !name.is_empty()
+        && !name.ends_with('\'')
+        && !doc.states.iter().any(|s| s == name)
+        && !doc.params.iter().any(|p| p == name)
+        && !doc.env.funcs.contains_key(name);
+    // `1` rather than `0`: the name is being used, and a parameter that is
+    // zero makes most of the rows reading it collapse to nothing, which looks
+    // like the fix did not work.
+    unknown.then(|| Fix::append(format!("{} = 1", name)))
+}
+
+/// One offer per proposal, on the earliest row that wants it.
+///
+/// A name used in three rows leaves three pending rows, but there is only one
+/// definition to write. Three identical buttons would invite two clicks and
+/// two copies of the same row, so the later ones keep the message and lose the
+/// offer. Run after the sort, so "earliest" means earliest in the document.
+fn offer_each_fix_once(issues: &mut [Issue]) {
+    let mut offered = std::collections::BTreeSet::new();
+    for issue in issues {
+        if let Some(fix) = &issue.fix {
+            if !offered.insert(fix.insert.clone()) {
+                issue.fix = None;
+            }
+        }
+    }
+}
+
+/// Give every zero-argument `rand()` / `randn()` the stream that belongs to
+/// its call site, and fold it to the number that stream draws.
+///
+/// `rand()` is already a *number*, not a draw from a generator — see
+/// `numpla_noise`, where determinism is what makes an adaptive solver able to
+/// integrate at all. The only thing missing was that every site in a document
+/// named the same stream, so two `rand()`s came out equal. The document layer
+/// is the only place that can tell two sites apart, so it names them here.
+///
+/// The answer is written straight into the tree as a literal because it cannot
+/// depend on `t` or on the state: leaving a call there would buy nothing and
+/// cost a hash on every right-hand-side evaluation.
+///
+/// # Why the site name is hashed rather than counted
+///
+/// A counter would number the sites in document order, so inserting a row
+/// above would slide every later site onto a different stream and re-roll
+/// numbers the user was already looking at. Hashing what the row *is* — the
+/// name it defines, else its text — together with the position of the call
+/// inside that row means a site changes only when its own row changes. The
+/// same document therefore gives the same numbers on every compile, and an
+/// edit elsewhere leaves them alone.
+fn resolve_random_sites(rows: &mut [Row], seed: u64) {
+    // Two rows can share a key — the same text twice, or a duplicate ODE row.
+    // They are not "unrelated rows", but they still must not share a stream.
+    let mut repeats: HashMap<String, u32> = HashMap::new();
+    for row in rows.iter_mut() {
+        let slot = repeats.entry(row.key.clone()).or_insert(0);
+        let repeat = *slot;
+        *slot += 1;
+        let mut nth = 0u32;
+        let site = Site {
+            key: row.key.clone(),
+            repeat,
+            seed,
+        };
+        match &mut row.stmt {
+            Stmt::Assign { rhs, .. } | Stmt::Ode { rhs, .. } => fold_random(rhs, &site, &mut nth),
+            Stmt::Equation { lhs, rhs } => {
+                fold_random(lhs, &site, &mut nth);
+                fold_random(rhs, &site, &mut nth);
+            }
+            Stmt::Expr(e) => fold_random(e, &site, &mut nth),
+        }
+    }
+}
+
+/// Everything a call site needs to name its stream, except its position in the
+/// row — which the traversal counts as it goes.
+struct Site {
+    key: String,
+    repeat: u32,
+    seed: u64,
+}
+
+/// Depth-first, left to right — the order the row reads in, so the first
+/// `rand()` on the line is site 0.
+fn fold_random(e: &mut Expr, site: &Site, nth: &mut u32) {
+    let drawn = match e {
+        Expr::Call { name, args } => {
+            for a in args.iter_mut() {
+                fold_random(a, site, nth);
+            }
+            // `rand(s)` names its own stream and is left exactly as written;
+            // only the bare form is ours to resolve.
+            let draw = match (args.is_empty(), name.as_str()) {
+                (true, "rand") => Some(numpla_noise::rand_at(site.seed, site.index(*nth))),
+                (true, "randn") => Some(numpla_noise::randn_at(site.seed, site.index(*nth))),
+                _ => None,
+            };
+            if draw.is_some() {
+                *nth += 1;
+            }
+            draw
+        }
+        Expr::Neg(a) => {
+            fold_random(a, site, nth);
+            None
+        }
+        Expr::Bin { lhs, rhs, .. } => {
+            fold_random(lhs, site, nth);
+            fold_random(rhs, site, nth);
+            None
+        }
+        Expr::List(items) => {
+            for it in items {
+                fold_random(it, site, nth);
+            }
+            None
+        }
+        Expr::Num(_) | Expr::Var(_) | Expr::Deriv { .. } | Expr::Hole => None,
+    };
+    if let Some(v) = drawn {
+        *e = Expr::Num(v);
+    }
+}
+
+impl Site {
+    /// The index this site draws at. FNV-1a over the row's handle, which copy
+    /// of that handle this is, and how many random calls came before it in the
+    /// row — written out here rather than pulled in, because it has to give
+    /// the same answer on `wasm32` and x86-64 forever.
+    fn index(&self, nth: u32) -> i64 {
+        const OFFSET: u64 = 0xCBF2_9CE4_8422_2325;
+        let h = fnv1a(OFFSET, self.key.as_bytes());
+        let h = fnv1a(h, &self.repeat.to_le_bytes());
+        fnv1a(h, &nth.to_le_bytes()) as i64
+    }
+}
+
+fn fnv1a(mut hash: u64, bytes: &[u8]) -> u64 {
+    for b in bytes {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01B3);
+    }
+    hash
+}
+
 impl Row {
     /// An issue covering the whole row. Expressions carry no spans once parsed,
     /// so anything found by evaluating underlines the line.
     fn issue(&self, severity: Severity, message: String) -> Issue {
-        Issue {
-            line: self.line,
-            severity,
-            message,
-            start: 0,
-            end: self.len,
-        }
+        Issue::new(self.line, severity, message, 0, self.len)
     }
 }
 

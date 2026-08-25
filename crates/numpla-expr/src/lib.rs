@@ -16,7 +16,7 @@ pub mod parser;
 
 pub use ast::{deriv_key, BinOp, Expr, Stmt};
 pub use eval::{eval, Env, EvalError, Value};
-pub use parser::{parse, ParseError};
+pub use parser::{parse, parse_with, FuncNames, ParseError};
 
 #[cfg(test)]
 mod integration {

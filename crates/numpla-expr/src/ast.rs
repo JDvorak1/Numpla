@@ -19,9 +19,15 @@ pub enum Expr {
     Var(String),
     /// `x'`, `x''` — a derivative referenced inside an expression.
     Deriv { name: String, order: u8 },
-    /// `f(a, b)`. Resolved at eval time: a builtin, a user function, or —
-    /// when `name` is a plain variable with one argument — implicit
-    /// multiplication, which is what `2(x+1)`-style notation demands.
+    /// `f(a, b)` — a builtin, a user function, or a definition head such as
+    /// `x(0)`.
+    ///
+    /// The parser only builds this when it *knows* the name is a function, so
+    /// `k(x+1)` with `k` a number is a `Bin { Mul, .. }` and carries
+    /// multiplication precedence. Eval still falls back to multiplying a
+    /// one-argument call by its argument, because a tree built by hand — or by
+    /// a parse that ran before the document was scanned — can still contain
+    /// one.
     Call { name: String, args: Vec<Expr> },
     Neg(Box<Expr>),
     Bin {

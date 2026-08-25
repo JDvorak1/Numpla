@@ -100,6 +100,13 @@ export const DEMOS = [
       x_4(0) = 0.6a
       x_5(0) = 0.4a
       x_6(0) = 0.2a
+      # Released from rest: every mass starts with zero velocity.
+      x_1'(0) = 0
+      x_2'(0) = 0
+      x_3'(0) = 0
+      x_4'(0) = 0
+      x_5'(0) = 0
+      x_6'(0) = 0
     `),
     tSpan: [0, 20],
     knobs: [
@@ -171,6 +178,8 @@ export const DEMOS = [
       q'' = -(g/l) sin q - c q'
 
       q(0) = a
+      # Released from rest at angle a.
+      q'(0) = 0
     `),
     tSpan: [0, 20],
     knobs: [
@@ -253,9 +262,11 @@ export const DEMOS = [
       x'' = -w^2 x + c(y - x)
       y'' = -w^2 y + c(x - y)
 
-      # one pulled aside, one hanging still.
+      # one pulled aside, one hanging still, both let go from rest.
       x(0) = 1
       y(0) = 0
+      x'(0) = 0
+      y'(0) = 0
     `),
     tSpan: [0, 60],
     knobs: [

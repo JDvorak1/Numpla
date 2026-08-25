@@ -249,3 +249,38 @@
 .mf-group-body { display: inline-block; }
 
 .mf-unknown { color: var(--mf-muted); }
+
+/* --- comment rows -------------------------------------------------------- */
+
+/* A row that begins with `#` is prose, not notation: upright, muted, in the UI
+   face rather than the math one, with every space exactly where it was typed.
+   One span per character, so the caret and click hit-testing keep working
+   character by character - a comment is a plain text field. */
+
+.mf-text {
+  font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  font-style: normal;
+  font-size: 0.86em;
+  letter-spacing: 0.005em;
+  color: var(--mf-muted);
+  white-space: pre;
+}
+
+.mf-text--hash {
+  color: #b3b8c0;
+  padding-right: 0.04em;
+}
+
+/* A whole-row comment recedes: it is the teaching material around the model,
+   not part of it. */
+.mf.is-comment {
+  background: #fcfcfd;
+  border-color: #edeff3;
+}
+
+.mf.is-comment .mf-pos { height: 0.95em; }
+
+.mf.is-comment.is-focused {
+  background: var(--mf-bg);
+  border-color: var(--mf-border-focus);
+}

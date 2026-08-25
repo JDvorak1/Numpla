@@ -2,9 +2,44 @@
 //! continuous extension.
 //!
 //! Numpla scrubs time, so a solution is a *function of `t`*, not a list of
-//! samples. Every step stores the stage derivatives its interpolant needs, and
-//! [`Solution::eval`] answers at arbitrary `t` by binary search plus
-//! interpolation. This is also what event detection will bracket against.
+//! samples. Every step stores whatever its interpolant needs — stage
+//! derivatives for a Runge-Kutta method, both endpoints and their slopes for a
+//! fixed-step symplectic one — and [`Solution::eval`] answers at arbitrary `t`
+//! by binary search plus interpolation. Which method produced a solution is
+//! invisible from the outside, which is what lets the mode slider swap
+//! integrators under a plot that keeps drawing. This is also what event
+//! detection will bracket against.
+
+/// How a step answers for the times strictly inside it.
+///
+/// An enum rather than a boxed `dyn Interpolant`: the set of continuous
+/// extensions is closed and small, `Step` stays `Clone + Debug` without a hand
+/// written impl, and a solution of a hundred thousand steps pays no per-step
+/// indirection. Adding a method means adding a variant here, which is the right
+/// amount of friction — a method arriving without an interpolant is exactly the
+/// thing this crate refuses to ship.
+#[derive(Debug, Clone)]
+pub(crate) enum Interp {
+    /// A Runge-Kutta continuous extension: the stage derivatives, flattened as
+    /// `k[stage * dim + i]`, weighted by polynomials in `theta`.
+    Rk { k: Vec<f64> },
+    /// Cubic Hermite from both endpoints of the step.
+    ///
+    /// This is what the fixed-step symplectic methods carry. They have no stage
+    /// tableau to interpolate, but they *do* have the state and its derivative
+    /// at both ends for free — for a second-order system the derivative of the
+    /// position half is the velocity, which is already part of the state. Two
+    /// values and two slopes is precisely the data a cubic Hermite wants, and
+    /// its `O(dt^4)` error matches Yoshida4's global order rather than
+    /// degrading it.
+    Hermite {
+        y_end: Vec<f64>,
+        /// `y'` at the start of the step.
+        f0: Vec<f64>,
+        /// `y'` at the end of the step.
+        f1: Vec<f64>,
+    },
+}
 
 /// One accepted step, plus everything its dense output needs.
 #[derive(Debug, Clone)]
@@ -15,11 +50,37 @@ pub struct Step {
     pub dt: f64,
     /// State at `t`.
     pub y: Vec<f64>,
-    /// Stage derivatives, flattened: `k[stage * dim + i]`.
-    pub(crate) k: Vec<f64>,
+    pub(crate) interp: Interp,
 }
 
 impl Step {
+    /// A step whose dense output is a Runge-Kutta continuous extension.
+    pub(crate) fn rk(t: f64, dt: f64, y: Vec<f64>, k: Vec<f64>) -> Step {
+        Step {
+            t,
+            dt,
+            y,
+            interp: Interp::Rk { k },
+        }
+    }
+
+    /// A step whose dense output is a cubic Hermite through both endpoints.
+    pub(crate) fn hermite(
+        t: f64,
+        dt: f64,
+        y: Vec<f64>,
+        y_end: Vec<f64>,
+        f0: Vec<f64>,
+        f1: Vec<f64>,
+    ) -> Step {
+        Step {
+            t,
+            dt,
+            y,
+            interp: Interp::Hermite { y_end, f0, f1 },
+        }
+    }
+
     pub fn t_end(&self) -> f64 {
         self.t + self.dt
     }
@@ -30,14 +91,36 @@ impl Step {
 
     /// Interpolate within this step. `theta` runs 0..=1 across `[t, t+dt]`.
     pub fn eval_theta_into(&self, theta: f64, out: &mut [f64]) {
-        let b = crate::tsit5::b_theta(theta);
         let n = self.dim();
-        for i in 0..n {
-            let mut acc = 0.0;
-            for (s, bs) in b.iter().enumerate() {
-                acc += bs * self.k[s * n + i];
+        match &self.interp {
+            Interp::Rk { k } => {
+                let b = crate::tsit5::b_theta(theta);
+                for i in 0..n {
+                    let mut acc = 0.0;
+                    for (s, bs) in b.iter().enumerate() {
+                        acc += bs * k[s * n + i];
+                    }
+                    out[i] = self.y[i] + self.dt * acc;
+                }
             }
-            out[i] = self.y[i] + self.dt * acc;
+            Interp::Hermite { y_end, f0, f1 } => {
+                // The standard cubic Hermite basis. Written out rather than
+                // folded into a Horner form because these four polynomials are
+                // recognisable on sight, and being able to check them against a
+                // textbook matters more here than four multiplies.
+                let th = theta;
+                let th2 = th * th;
+                let th3 = th2 * th;
+                let h00 = 2.0 * th3 - 3.0 * th2 + 1.0;
+                let h10 = th3 - 2.0 * th2 + th;
+                let h01 = -2.0 * th3 + 3.0 * th2;
+                let h11 = th3 - th2;
+                for i in 0..n {
+                    out[i] = h00 * self.y[i]
+                        + h01 * y_end[i]
+                        + self.dt * (h10 * f0[i] + h11 * f1[i]);
+                }
+            }
         }
     }
 

@@ -363,12 +363,7 @@ pub fn solve<S: System>(
 
         if accepted {
             telemetry.accepted += 1;
-            steps.push(Step {
-                t,
-                dt,
-                y: y.clone(),
-                k: k.clone(),
-            });
+            steps.push(Step::rk(t, dt, y.clone(), k.clone()));
             t += dt;
             y.copy_from_slice(&y_new);
             // FSAL: the last stage is the next step's first.

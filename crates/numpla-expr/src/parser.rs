@@ -2,8 +2,16 @@
 //! yields a tree containing `Expr::Hole` plus a list of errors, never a hard
 //! failure. That is what lets the UI keep drawing while you type.
 
+use std::collections::BTreeSet;
+
 use crate::ast::{deriv_key, BinOp, Expr, Stmt};
 use crate::lexer::{lex, Spanned, Tok};
+
+/// The names a document has defined as functions, beyond the builtins.
+///
+/// Empty means "builtins only", which is what a caller who has not scanned the
+/// document yet knows. See [`parse_with`] for why this has to be an input.
+pub type FuncNames = BTreeSet<String>;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParseError {
@@ -12,9 +20,12 @@ pub struct ParseError {
     pub end: usize,
 }
 
-pub struct Parser {
+pub struct Parser<'a> {
     toks: Vec<Spanned>,
     pos: usize,
+    /// Names this document defines as functions. A name that is *not* in here
+    /// and is followed by `(` is a coefficient, not a call — see [`parse_with`].
+    funcs: Option<&'a FuncNames>,
     pub errors: Vec<ParseError>,
 }
 
@@ -28,13 +39,30 @@ const BP_APPLY: u8 = 6;
 /// Right-associative: `2^3^2` is `2^(3^2)`.
 const BP_POW: (u8, u8) = (8, 7);
 
-impl Parser {
+impl<'a> Parser<'a> {
+    /// Parse knowing only the builtins. Every other name followed by `(` is
+    /// read as a coefficient.
     pub fn new(src: &str) -> Self {
         Parser {
             toks: lex(src),
             pos: 0,
+            funcs: None,
             errors: Vec::new(),
         }
+    }
+
+    /// Parse knowing which names the document defines as functions.
+    pub fn with_funcs(src: &str, funcs: &'a FuncNames) -> Self {
+        Parser {
+            toks: lex(src),
+            pos: 0,
+            funcs: Some(funcs),
+            errors: Vec::new(),
+        }
+    }
+
+    fn is_user_function(&self, name: &str) -> bool {
+        self.funcs.is_some_and(|f| f.contains(name))
     }
 
     fn peek(&self) -> Option<Tok> {
@@ -69,9 +97,68 @@ impl Parser {
         });
     }
 
+    /// Is the row a definition head — `f(x) = ...`, `x(0) = ...`, `x'(0) = ...`?
+    ///
+    /// The left of an `=` is the one place where `name(args)` always means a
+    /// call, whatever `name` turns out to be: `f(u) = ...` defines a function
+    /// and `x(0) = 1` sets an initial condition, and neither is a product.
+    /// Deciding it here, from the shape of the whole row, is what lets
+    /// [`Self::primary`] treat *every* other `name(` as a coefficient without
+    /// having to know which names are states.
+    fn at_definition_head(&self) -> bool {
+        let mut i = self.pos;
+        if !matches!(self.toks.get(i).map(|s| &s.tok), Some(Tok::Ident(_))) {
+            return false;
+        }
+        i += 1;
+        while matches!(self.toks.get(i).map(|s| &s.tok), Some(Tok::Prime)) {
+            i += 1;
+        }
+        if !matches!(self.toks.get(i).map(|s| &s.tok), Some(Tok::LParen)) {
+            return false;
+        }
+        let mut depth = 0usize;
+        while let Some(s) = self.toks.get(i) {
+            match s.tok {
+                Tok::LParen => depth += 1,
+                Tok::RParen => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return matches!(self.toks.get(i + 1).map(|s| &s.tok), Some(Tok::Eq));
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        false
+    }
+
+    /// The `f(x)` / `x'(0)` on the left of an `=`. Caller has checked the shape.
+    fn definition_head(&mut self) -> Expr {
+        let name = match self.bump() {
+            Some(Tok::Ident(n)) => n,
+            _ => unreachable!("at_definition_head checked this"),
+        };
+        let mut order = 0u8;
+        while self.at(&Tok::Prime) {
+            self.pos += 1;
+            order = order.saturating_add(1);
+        }
+        let args = self.args();
+        Expr::Call {
+            name: deriv_key(&name, order),
+            args,
+        }
+    }
+
     /// Parse one row of the expression list.
     pub fn stmt(&mut self) -> Stmt {
-        let lhs = self.expr(0);
+        let lhs = if self.at_definition_head() {
+            self.definition_head()
+        } else {
+            self.expr(0)
+        };
         let stmt = if self.at(&Tok::Eq) {
             self.pos += 1;
             let rhs = self.expr(0);
@@ -169,12 +256,14 @@ impl Parser {
                     self.pos += 1;
                     order = order.saturating_add(1);
                 }
-                if self.at(&Tok::LParen) {
-                    // A primed call is a call on the derivative, not `x'`
-                    // times a parenthesised group. Without this, `x'(0) = 1`
-                    // — the initial condition for a lowered velocity state —
-                    // would reach the model as a multiplication and could only
-                    // be recovered by pattern-matching the arithmetic.
+                // `g(...)` is a call only when `g` is known to be a function.
+                // Otherwise the paren is left for the implicit-multiplication
+                // rule in `expr`, which binds at multiplication strength — so
+                // `g (y - x)^3` cubes the group, not the product. Building a
+                // `Call` here and multiplying at eval time instead would put
+                // the exponent outside the product and silently integrate a
+                // different system; see the two-pass compile in `numpla-model`.
+                if self.at(&Tok::LParen) && self.is_user_function(&deriv_key(&name, order)) {
                     let args = self.args();
                     Expr::Call {
                         name: deriv_key(&name, order),
@@ -258,9 +347,33 @@ impl Parser {
     }
 }
 
-/// Parse one row. Returns the tree plus any errors; the tree is always usable.
+/// Parse one row knowing only the builtin functions.
+///
+/// Every other `name(` is read as a coefficient — `k(x+1)` is `k * (x+1)` —
+/// which is the right guess for a caller that has not scanned the document.
+/// A caller that *has* should use [`parse_with`].
 pub fn parse(src: &str) -> (Stmt, Vec<ParseError>) {
     let mut p = Parser::new(src);
+    let s = p.stmt();
+    let errs = std::mem::take(&mut p.errors);
+    (s, errs)
+}
+
+/// Parse one row knowing which names the document defines as functions.
+///
+/// `g (y - x)^3` and `f(y - x)^3` are the same token sequence, and they mean
+/// different things: one cubes a difference and scales it, the other cubes the
+/// result of a call. Nothing local to the row can tell them apart — only the
+/// rest of the document can, by saying whether `f` has an `f(u) = ...` row.
+/// So the function set is an *input* to parsing rather than something resolved
+/// afterwards at eval time, and a caller that owns the whole document (see
+/// `numpla_model::document::compile`) gathers it in a first pass and parses in
+/// a second.
+///
+/// The zero-argument [`parse`] stays the entry point for anyone holding a
+/// single row, and behaves as if the set were empty.
+pub fn parse_with(src: &str, funcs: &FuncNames) -> (Stmt, Vec<ParseError>) {
+    let mut p = Parser::with_funcs(src, funcs);
     let s = p.stmt();
     let errs = std::mem::take(&mut p.errors);
     (s, errs)
@@ -271,6 +384,7 @@ mod tests {
     use super::*;
 
     fn expr_of(src: &str) -> Expr {
+        // builtins only, which is what `parse` knows
         match parse(src).0 {
             Stmt::Expr(e) => e,
             other => panic!("expected a bare expression, got {:?}", other),
@@ -419,6 +533,76 @@ mod tests {
         let (s, errs) = parse("sin(x");
         assert!(!errs.is_empty());
         assert!(matches!(s, Stmt::Expr(_)));
+    }
+
+    /// The regression the two-pass compile exists for.
+    ///
+    /// `g (y - x)^3` at `g = 40, y - x = -1` is `-40`. Reading `g(...)` as a
+    /// call put the exponent outside the product and gave `-64000` — a
+    /// plausible curve of a different system, with nothing reported.
+    #[test]
+    fn a_coefficient_before_a_group_does_not_capture_the_exponent() {
+        use crate::eval::{eval, Env, Value};
+        let mut env = Env::new();
+        env.set("g", 40.0).set("y", 0.0).set("x", 1.0);
+        assert_eq!(eval(&expr_of("g (y - x)^3"), &env), Ok(Value::Scalar(-40.0)));
+        // and the parenthesised spelling has not changed meaning
+        assert_eq!(
+            eval(&expr_of("g ((y - x)^3)"), &env),
+            Ok(Value::Scalar(-40.0))
+        );
+        // the tree says the same thing: a product whose right half is the power
+        assert!(matches!(
+            expr_of("g (y - x)^3"),
+            Expr::Bin { op: BinOp::Mul, rhs, .. } if matches!(*rhs, Expr::Bin { op: BinOp::Pow, .. })
+        ));
+    }
+
+    /// The other half of the same ambiguity: a name the document *has* defined
+    /// as a function keeps call precedence, so `f(u)^3` cubes the result.
+    #[test]
+    fn a_known_function_before_a_group_is_still_a_call() {
+        let funcs: FuncNames = ["f".to_string()].into_iter().collect();
+        let e = match parse_with("f(y - x)^3", &funcs).0 {
+            Stmt::Expr(e) => e,
+            other => panic!("{:?}", other),
+        };
+        match e {
+            Expr::Bin { op: BinOp::Pow, lhs, .. } => {
+                assert!(matches!(*lhs, Expr::Call { .. }), "{:?}", lhs);
+            }
+            other => panic!("{:?}", other),
+        }
+        // The same text, without the function set, is a product.
+        assert!(matches!(
+            expr_of("f(y - x)^3"),
+            Expr::Bin { op: BinOp::Mul, .. }
+        ));
+    }
+
+    /// A builtin never needed the document's help: `sin` is in the lexer.
+    #[test]
+    fn a_builtin_call_keeps_call_precedence() {
+        assert!(matches!(
+            expr_of("sin(x)^2"),
+            Expr::Bin { op: BinOp::Pow, .. }
+        ));
+    }
+
+    /// Definition heads are decided by the shape of the row, not by the
+    /// function set — otherwise `x(0) = 1` would become `x * 0 = 1` for every
+    /// state, which is the notation the model reads initial conditions from.
+    #[test]
+    fn a_definition_head_is_a_call_whatever_the_function_set_says() {
+        let empty = FuncNames::new();
+        for src in ["x(0) = 1", "x'(0) = 2", "f(u) = u^2"] {
+            let head = match parse_with(src, &empty).0 {
+                Stmt::Assign { name, .. } => name,
+                Stmt::Equation { lhs: Expr::Call { name, .. }, .. } => name,
+                other => panic!("{}: {:?}", src, other),
+            };
+            assert!(!head.is_empty(), "{}", src);
+        }
     }
 
     #[test]

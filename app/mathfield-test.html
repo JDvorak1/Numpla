@@ -98,6 +98,12 @@
   <h2>Tall and nested</h2>
   <div class="grid" id="tall"></div>
 
+  <h2>Calls and coefficients (the same row, read two ways)</h2>
+  <div class="grid" id="calls"></div>
+
+  <h2>Comment rows (a row starting with # is prose, kept byte for byte)</h2>
+  <div class="grid" id="comments"></div>
+
   <h2>Diagnostics</h2>
   <div class="grid" id="diags"></div>
 
@@ -146,7 +152,7 @@ function mount(hostId, label, value, opts = {}) {
     srcEl.textContent = src === '' ? '(empty)' : src;
     texEl.textContent = f.latex === '' ? '(empty)' : f.latex;
     // Round-trip check: parse the emitted source back and re-emit it.
-    const again = new MathModel(src).source;
+    const again = new MathModel(src, f.functions).source;
     const stable = again === src;
     tripEl.textContent = stable ? 'stable' : 'DRIFT -> ' + JSON.stringify(again);
     tripEl.className = stable ? 'ok' : 'bad';
@@ -196,6 +202,33 @@ mount('tall', 'a tower', 'h = 2^(3^(2)) + ((x)/(y))^(2)');
 mount('tall', 'continued fraction', 'c = 1 + (1)/(1 + (1)/(1 + (1)/(2)))');
 mount('tall', 'everything at once',
   "w'' = -(k)/(m)*w - sqrt((c)/(m))*w' + f_0*cos(2pi*t)");
+
+// --- calls and coefficients -------------------------------------------------
+// `f(u)` is a call, `g (u)` is `g` times `u`, and only the whole document knows
+// which. The field is told the document's function names; watch the denominator
+// change when it is.
+mount('calls', "a helper function's arguments belong to the denominator (d declared)",
+  "x'' = -m x / d(x, y)", { functions: ['d'] });
+mount('calls', 'the same row with nothing declared - d is a coefficient',
+  "x'' = -m x / d(x, y)");
+mount('calls', 'the helper definition itself', 'd(p, q) = (p^2 + q^2)^1.5',
+  { functions: ['d'] });
+mount('calls', 'builtin calls are one primary too', 'y = 1/sin(2pit) + 2/exp(-t)');
+mount('calls', 'a bare function name applies to what follows', 'y = 1/sin t');
+
+// --- comments ---------------------------------------------------------------
+// Straight out of the demo gallery: these are the teaching material, so every
+// character - spacing and punctuation included - has to survive untouched.
+mount('comments', 'a heading', '# A PLUCKED STRING');
+mount('comments', 'a bare hash', '#');
+mount('comments', 'prose with mathematics inside it',
+  '# equation: k(x_{i+1} - 2x_i + x_{i-1}) is the curvature of the string');
+mount('comments', 'punctuation and spacing',
+  '# At a = 0.2 the period is 2.0 s. At a = 3.0 it is 5.0 s. Same pendulum.');
+mount('comments', 'words that would otherwise inflate',
+  '# sqrt sin cos pi xy 1/2 x^2 - none of this is mathematics here');
+mount('comments', 'a trailing comment on a real row', "y' = x   # this row still solves");
+mount('comments', 'type # here to convert an empty row', '');
 
 // --- diagnostics ------------------------------------------------------------
 mount('diags', 'clean', 'a = 1').setDiagnostic(null, '');

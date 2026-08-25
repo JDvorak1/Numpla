@@ -9,7 +9,15 @@
 //! Second rule: **the solver reports on itself.** Accepted and rejected steps,
 //! step sizes, and local error come back as data ([`Telemetry`]), because
 //! showing someone *where* their problem got hard is the fastest lesson in
-//! stiffness available.
+//! stiffness available. In the same spirit, [`measure`] evaluates any invariant
+//! along a solution and reports how far the method let it drift.
+//!
+//! Third rule: **the method is a choice, and the choice is visible.** No
+//! fixed-step integrator can preserve the symplectic form, momentum, and energy
+//! at once (Ge-Marsden); which of the three a method sacrifices is the most
+//! useful thing a long run can teach. So [`Method`] selects between an adaptive
+//! Runge-Kutta and two symplectic integrators over one state layout and one
+//! solution type, and swapping them is one enum value. See `docs/solvers.md`.
 //!
 //! ```
 //! use numpla_ode::{solve, Field, Opts};
@@ -31,10 +39,18 @@
 // zipped iterators obscures which vector each term comes from.
 #![allow(clippy::needless_range_loop)]
 
+pub mod conserve;
+pub mod method;
 pub mod solution;
+pub mod symplectic;
 pub mod system;
 pub mod tsit5;
 
+pub use conserve::{measure, Conservation};
+pub use method::{solve_with, Method};
 pub use solution::{Solution, Step, StepRecord, Telemetry};
-pub use system::{Field, System};
+pub use symplectic::{solve_verlet, solve_yoshida4};
+pub use system::{
+    Accel, AccelFn, Field, Lowered, Paired, SecondOrderSystem, StructureError, System,
+};
 pub use tsit5::{solve, Opts, SolveError};

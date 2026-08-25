@@ -61,16 +61,19 @@
     <aside class="pane pane--doc">
       <div class="pane__head">
         <h2 class="pane__title">System</h2>
-        <span class="pane__note" id="diag-count">clean</span>
       </div>
 
+      <!-- The row list. A blank row always sits at the end; there is no
+           "add row" button, because rows appear by typing. -->
       <div class="rows" id="rows" role="list"></div>
 
-      <div class="rows__foot">
-        <button id="add-row" class="ghostbtn" type="button">
-          <span aria-hidden="true">+</span> Add row
-        </button>
-        <span class="pane__hint">Enter · new row &nbsp;·&nbsp; ↑ ↓ · move</span>
+      <!-- The issue bar. Quiet when nothing is missing; a plain sentence plus a
+           one-click default when something is. Its height is fixed by
+           .rows__foot, so what it says can never resize the workspace. -->
+      <div class="rows__foot issuebar" id="issuebar">
+        <span class="issuebar__msg" id="issue-msg">clean</span>
+        <button class="issuebar__fix" id="issue-fix" type="button" hidden></button>
+        <span class="pane__hint" id="rows-hint">Enter · new row &nbsp;·&nbsp; ↑ ↓ · move</span>
       </div>
     </aside>
 
@@ -96,17 +99,16 @@
 
   </main>
 
-  <!-- one controls section: every slider, t included -->
+  <!-- Transport. `t` is the one knob with no row to live on - it is the
+       playhead, not a parameter - so it stays here with play/pause and the
+       readout. Every OTHER slider lives on the row that defines it. -->
   <footer class="controls">
-    <div class="controls__head">
-      <button id="play" class="playbtn" type="button" aria-label="Play" title="Play / pause (space)">
-        <svg class="icon icon--play" viewBox="0 0 16 16" aria-hidden="true"><path d="M4.5 2.8v10.4L13 8z"/></svg>
-        <svg class="icon icon--pause" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 2.6h3v10.8H4zM9 2.6h3v10.8H9z"/></svg>
-      </button>
-      <h2 class="pane__title">Controls</h2>
-      <div class="readout" id="readout"></div>
-    </div>
-    <div class="sliders" id="sliders"></div>
+    <button id="play" class="playbtn" type="button" aria-label="Play" title="Play / pause (space)">
+      <svg class="icon icon--play" viewBox="0 0 16 16" aria-hidden="true"><path d="M4.5 2.8v10.4L13 8z"/></svg>
+      <svg class="icon icon--pause" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 2.6h3v10.8H4zM9 2.6h3v10.8H9z"/></svg>
+    </button>
+    <div class="transport" id="transport"></div>
+    <div class="readout" id="readout"></div>
   </footer>
 
 </div>

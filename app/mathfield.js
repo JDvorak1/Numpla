@@ -32,6 +32,67 @@ export const FUNCS = [
 export const CONSTS = ['pi', 'tau', 'inf'];
 
 const WORDS = FUNCS.concat(CONSTS);
+
+/**
+ * User-defined function names, normalised.
+ *
+ * `f(u)` is a call; `g (u)` is `g` times `u`, and which one a row means is
+ * decided by the rest of the document: a name with an `f(u) = ...` row is a
+ * function, everything else followed by `(` is a coefficient (docs/wasm-api.md,
+ * "Calls and coefficients"). One row cannot answer that on its own, so the
+ * shell tells the field which names are functions and the field mirrors the
+ * grammar rather than guessing.
+ *
+ * @param {Iterable<string>|null} names e.g. ['d', 'k_1'] - braces and spaces in
+ *   a name are ignored, so `k_{1}` and `k_1` are the same function.
+ * @returns {Set<string>}
+ */
+export function normaliseFunctions(names) {
+  const out = new Set();
+  for (const n of names || []) {
+    const clean = String(n).replace(/[{}\s]/g, '');
+    if (clean) out.add(clean);
+  }
+  return out;
+}
+
+/**
+ * The function names a whole document defines: its `f(u) = ...` rows, where
+ * every argument is a plain identifier. `x(0) = 1` is an initial condition, not
+ * a definition, so it does not count - which is the same distinction the Rust
+ * side draws. Hand the result to setFunctions() on every row.
+ *
+ * @param {string} source the whole document, one row per line
+ * @returns {string[]}
+ */
+export function functionNamesIn(source) {
+  const NAME = String.raw`[A-Za-z](?:_[A-Za-z0-9]+|_\{[^}]*\})?`;
+  const head = new RegExp(String.raw`^\s*(${NAME})\s*\(([^)]*)\)\s*=`);
+  const arg = new RegExp(String.raw`^${NAME}$`);
+  const out = [];
+  for (const line of String(source == null ? '' : source).split(/\r?\n/)) {
+    const m = head.exec(line.split('#')[0]);
+    if (!m) continue;
+    const args = m[2].split(',').map((a) => a.trim());
+    if (!args.every((a) => arg.test(a))) continue;
+    out.push(m[1].replace(/[{}]/g, ''));
+  }
+  return out;
+}
+
+function setsEqual(a, b) {
+  if (a.size !== b.size) return false;
+  for (const x of a) if (!b.has(x)) return false;
+  return true;
+}
+
+/** The name a `var` atom would have in the document, e.g. `k_1`. */
+function varKey(atom) {
+  if (!atom || atom.type !== 'var') return null;
+  if (!atom.sub) return atom.name;
+  const sub = atom.sub.map((a) => a.ch || a.name || '').join('');
+  return sub ? atom.name + '_' + sub : atom.name;
+}
 const MAX_WORD = WORDS.reduce((m, w) => Math.max(m, w.length), 0);
 
 // ---------------------------------------------------------------------------
@@ -47,6 +108,13 @@ const MAX_WORD = WORDS.reduce((m, w) => Math.max(m, w.length), 0);
 //   sup    { body }               superscript riding on whatever precedes it
 //   sqrt   { body }               radical
 //   group  { open, close, body }  matched delimiters that grow
+//   text   { ch }                 one verbatim character of a `#` comment
+//
+// `text` atoms are the one exception to "everything here is mathematics": they
+// only ever appear as a suffix of the ROOT list, that suffix always starts with
+// the `#`, and every character is stored and emitted byte for byte. It mirrors
+// numpla-model, which reads each line up to its first `#` and discards the rest
+// (crates/numpla-model/src/document.rs).
 // ---------------------------------------------------------------------------
 
 export const A = {
@@ -62,7 +130,28 @@ export const A = {
   group: (open = '(', body = []) => ({
     type: 'group', open, close: open === '[' ? ']' : ')', body,
   }),
+  text: (ch) => ({ type: 'text', ch }),
 };
+
+/** Index of the `#` that opens the comment tail, or -1 if the row has none. */
+export function tailStart(list) {
+  for (let i = 0; i < list.length; i++) if (list[i].type === 'text') return i;
+  return -1;
+}
+
+/**
+ * A *comment row* carries nothing but a comment - its tail starts at the very
+ * beginning. These are the rows numpla-model discards wholesale, and the rows
+ * the field sets as prose rather than as mathematics.
+ */
+export function isCommentRow(list) {
+  return list.length > 0 && list[0].type === 'text';
+}
+
+/** One text atom per character. A row is a row, so newlines cannot survive. */
+function textAtoms(str) {
+  return Array.from(String(str).replace(/[\r\n]/g, '')).map((c) => A.text(c));
+}
 
 /** Child slots of an atom, in caret-traversal order. */
 export function slotKeys(a) {
@@ -95,8 +184,18 @@ export function cloneList(list) {
 // path resolves to (0 .. list.length, i.e. always *between* atoms).
 // ---------------------------------------------------------------------------
 
-export function newState(root = []) {
-  return { root, path: [], index: 0 };
+export function newState(root = [], funcs = null) {
+  return {
+    root,
+    path: [],
+    index: 0,
+    funcs: funcs instanceof Set ? funcs : normaliseFunctions(funcs),
+    // The text this row was last *given*, or null once the user has edited it.
+    // Emission parenthesises, so `(1)/(d)(x, y)` cannot be told apart from a
+    // row the user typed that way: the only faithful thing to re-read when the
+    // function set arrives late is the text as it was handed over.
+    pristine: null,
+  };
 }
 
 export function listAt(root, path) {
@@ -378,8 +477,26 @@ function closeGroup(st, close) {
 }
 
 /** Insert one typed character. Returns true when the model changed. */
+function inTail(st) {
+  if (st.path.length) return false;
+  const t = tailStart(st.root);
+  return t !== -1 && st.index > t;
+}
+
 export function typeChar(st, ch) {
+  st.pristine = null;
   if (ch === '\n' || ch === '\t') return false;
+  // Inside the comment tail every character is taken verbatim - spaces,
+  // punctuation, further `#`s and all. Plain text editing, nothing else.
+  if (inTail(st)) { insert(st, [A.text(ch)]); return true; }
+  // `#` opens a comment, but only at the end of a row: on an empty row that
+  // makes the whole row a comment, after mathematics it opens a trailing one,
+  // exactly as the document format reads it. It never converts content that is
+  // already there, and it keeps the tail a suffix of the row.
+  if (ch === '#' && !st.path.length && st.index === st.root.length) {
+    insert(st, [A.text('#')]);
+    return true;
+  }
   if (/\s/.test(ch)) return false;                    // spaces carry no meaning
   if (/[0-9.]/.test(ch)) { insert(st, [A.digit(ch)]); return true; }
   if (/[A-Za-z]/.test(ch)) {
@@ -417,8 +534,29 @@ export function typeString(st, text) {
  *     the first slot, COLLAPSE the structure - its contents are spliced into the
  *     surrounding list. Never deletes an invisible character.
  */
+/**
+ * The `#` at `at` is going away, so the row stops being a comment: whatever
+ * followed it is re-read as mathematics. `# k = 2` backspaces into `k = 2`;
+ * `## note` backspaces into `# note`, which is a comment once more.
+ */
+function dissolveTail(st, at) {
+  const rest = st.root.slice(at + 1).map((a) => a.ch).join('');
+  const reparsed = parseSource(rest, st.funcs);
+  st.root.splice(at, st.root.length - at, ...reparsed);
+  st.path = [];
+  st.index = at;
+  return true;
+}
+
 export function backspace(st) {
+  st.pristine = null;
   const L = curList(st);
+  if (!st.path.length && st.index > 0 && L[st.index - 1].type === 'text') {
+    if (st.index - 1 === tailStart(st.root)) return dissolveTail(st, st.index - 1);
+    L.splice(st.index - 1, 1);
+    st.index--;
+    return true;
+  }
   if (st.index > 0) {
     const a = L[st.index - 1];
     const ks = slotKeys(a);
@@ -467,7 +605,13 @@ export function backspace(st) {
 
 /** Forward delete - the mirror of backspace. */
 export function deleteForward(st) {
+  st.pristine = null;
   const L = curList(st);
+  if (!st.path.length && st.index < L.length && L[st.index].type === 'text') {
+    if (st.index === tailStart(st.root)) return dissolveTail(st, st.index);
+    L.splice(st.index, 1);
+    return true;
+  }
   if (st.index < L.length) {
     const a = L[st.index];
     const ks = slotKeys(a);
@@ -557,6 +701,12 @@ export function toSource(list, inSub = false) {
       case 'sup': out += '^(' + toSource(a.body) + ')'; break;
       case 'sqrt': out += 'sqrt(' + toSource(a.body) + ')'; break;
       case 'group': out += a.open + toSource(a.body) + a.close; break;
+      case 'text':
+        // Byte for byte. The only shaping anywhere near a comment is the single
+        // space that separates it from mathematics on the same row.
+        if (i > 0 && list[i - 1].type !== 'text' && !/\s$/.test(out)) out += ' ';
+        out += a.ch;
+        break;
       default: break;
     }
   }
@@ -568,10 +718,28 @@ const LATEX_FUNC = new Set([
   'exp', 'ln', 'log', 'min', 'max', 'sqrt',
 ]);
 
+/** Minimal standard escaping, so a comment survives into a LaTeX document. */
+function latexText(str) {
+  // One pass, so the braces this emits are never escaped a second time.
+  const NAMED = {
+    '\\': '\\textbackslash{}',
+    '~': '\\textasciitilde{}',
+    '^': '\\textasciicircum{}',
+  };
+  return str.replace(/[\\{}#$%&_~^]/g, (c) => NAMED[c] || '\\' + c);
+}
+
 export function toLatex(list) {
   let out = '';
   for (let i = 0; i < list.length; i++) {
     const a = list[i];
+    // The comment tail is one \text{} run, not a command per character.
+    if (a.type === 'text') {
+      const run = list.slice(i).map((t) => t.ch).join('');
+      if (out && !/\s$/.test(out)) out += ' ';
+      out += '\\text{' + latexText(run) + '}';
+      break;
+    }
     switch (a.type) {
       case 'digit': out += a.ch; break;
       case 'var':
@@ -614,8 +782,14 @@ function longestWord(rest, table) {
  * (with `(x)` unwrapped back to `x`), which is what makes the round trip stable
  * and what lets a document loaded from disk render as proper notation.
  */
-export function parseSource(text) {
-  const s = String(text == null ? '' : text);
+export function parseSource(text, funcs = null) {
+  const userFuncs = funcs instanceof Set ? funcs : normaliseFunctions(funcs);
+  const raw = String(text == null ? '' : text);
+  // Split where numpla-model splits: at the first `#`. What it discards, the
+  // field keeps - unparsed, unshaped, exactly as typed.
+  const hash = raw.indexOf('#');
+  const s = hash === -1 ? raw : raw.slice(0, hash);
+  const tail = hash === -1 ? [] : textAtoms(raw.slice(hash));
   let i = 0;
 
   const ws = () => { while (i < s.length && /\s/.test(s[i])) i++; };
@@ -686,7 +860,26 @@ export function parseSource(text) {
     out.push(A.group(open, body));
   }
 
-  /** One primary, plus any leading sign, trailing primes and superscript. */
+  /**
+   * Is `name(` a call, and therefore part of this one primary? Builtins always
+   * are; a plain name only when the document defines it as a function. A primed
+   * name always is - `x'(0)` is the initial condition for a lowered velocity
+   * state, which the Rust parser special-cases for the same reason.
+   */
+  function isCall(atom, primes) {
+    if (!atom) return false;
+    if (atom.type === 'func') return true;
+    if (atom.type !== 'var') return false;
+    if (primes > 0) return true;
+    return userFuncs.has(varKey(atom));
+  }
+
+  /**
+   * One primary, plus any leading sign, trailing primes and superscript. This
+   * is what `/` takes as its denominator and `^` as its exponent, so getting
+   * the extent of a primary right is what keeps `-m x / d(x, y)` meaning what
+   * it says.
+   */
   function parseOperand(stops) {
     const out = [];
     ws();
@@ -694,8 +887,18 @@ export function parseSource(text) {
     const c = s[i];
     if (c === undefined || stops.includes(c)) return out;
     if (isDigitStart(i)) readNumber(out);
-    else if (/[A-Za-z]/.test(c)) readWord(out);
-    else if (c === '(' || c === '[') readGroup(out);
+    else if (/[A-Za-z]/.test(c)) {
+      readWord(out);
+      const head = out[out.length - 1];
+      let primes = 0;
+      while (s[i] === "'") { out.push(A.prime()); i++; primes++; }
+      if (s[i] === '(' && isCall(head, primes)) {
+        readGroup(out);                    // f(u) is a single primary
+      } else if (head && head.type === 'func') {
+        // A bare function name applies to what follows: `1/sin x` is 1/sin(x).
+        for (const a of parseOperand(stops)) out.push(a);
+      }
+    } else if (c === '(' || c === '[') readGroup(out);
     else return out;
     while (s[i] === "'") { out.push(A.prime()); i++; }
     if (s[i] === '^') { i++; out.push(A.sup(unwrap(parseOperand(stops)))); }
@@ -728,7 +931,7 @@ export function parseSource(text) {
     return out;
   }
 
-  return parseList('');
+  return parseList('').concat(tail);
 }
 
 // ---------------------------------------------------------------------------
@@ -736,21 +939,49 @@ export function parseSource(text) {
 // ---------------------------------------------------------------------------
 
 export class MathModel {
-  constructor(src = '') {
-    this.st = newState(parseSource(src));
+  constructor(src = '', funcs = null) {
+    this.st = newState([], funcs);
+    this.st.root = parseSource(src, this.st.funcs);
+    this.st.pristine = String(src == null ? '' : src);
     moveEnd(this.st);
   }
 
   get root() { return this.st.root; }
   get source() { return toSource(this.st.root); }
   set source(text) {
-    this.st.root = parseSource(text);
+    this.st.root = parseSource(text, this.st.funcs);
+    this.st.pristine = String(text == null ? '' : text);
     this.st.path = [];
     this.st.index = this.st.root.length;
   }
 
+  /** The document's function names, as last given. Builtins are not listed. */
+  get functions() { return Array.from(this.st.funcs); }
+
+  /**
+   * Tell the row which names the document defines as functions. Re-reads the
+   * row when the answer changes how it parses; returns true if it did.
+   */
+  setFunctions(names) {
+    const next = normaliseFunctions(names);
+    if (setsEqual(next, this.st.funcs)) return false;
+    this.st.funcs = next;
+    // An untouched row re-reads what it was handed; an edited one re-reads what
+    // it now says, which is what the parser sees too.
+    const text = this.st.pristine == null ? toSource(this.st.root) : this.st.pristine;
+    const root = parseSource(text, next);
+    if (JSON.stringify(root) === JSON.stringify(this.st.root)) return false;
+    this.st.root = root;
+    this.st.path = [];
+    this.st.index = root.length;
+    return true;
+  }
+
   get latex() { return toLatex(this.st.root); }
   isEmpty() { return this.st.root.length === 0; }
+
+  /** True when this row is a comment rather than mathematics. */
+  isComment() { return isCommentRow(this.st.root); }
 
   type(text) { return typeString(this.st, text); }
   backspace() { return backspace(this.st); }
@@ -901,6 +1132,15 @@ function renderAtom(list, at, path, ctx) {
       e.appendChild(close);
       return e;
     }
+    case 'text': {
+      // Prose, not notation: upright, muted, one span per character so that
+      // every character keeps its own caret position, and `white-space: pre`
+      // so the spaces the author typed are the spaces on screen.
+      const e = el('span', 'mf-text');
+      if (at === tailStart(list)) e.classList.add('mf-text--hash');
+      e.textContent = a.ch;
+      return e;
+    }
     default: {
       const e = el('span', 'mf-unknown');
       e.textContent = '?';
@@ -913,6 +1153,8 @@ function renderAtom(list, at, path, ctx) {
  * An editable math field.
  *
  * @param host  element to mount into (the field replaces its contents)
+ * @param opts.functions  names the document defines as functions, so that
+ *                        `d(x, y)` reads as a call - see setFunctions()
  * @param opts  { value?: string, onChange?: (field) => void,
  *                onFocus?: (field) => void, onBlur?: (field) => void,
  *                onEnter?: (field) => void, onNavigate?: (field, dir) => void }
@@ -921,7 +1163,7 @@ export class MathField {
   constructor(host, opts = {}) {
     this.host = host;
     this.opts = opts;
-    this.model = new MathModel(opts.value || '');
+    this.model = new MathModel(opts.value || '', opts.functions);
     this.focused = false;
     this.diagnostic = null;
     this.diagnosticMessage = '';
@@ -963,9 +1205,28 @@ export class MathField {
   set source(text) { this.model.source = text; this.render(); }
   get latex() { return this.model.latex; }
 
+  /** The document's function names, as last given. */
+  get functions() { return this.model.functions; }
+
+  /**
+   * Tell the field which names the document defines as functions, so that
+   * `d(x, y)` is read as a call rather than as `d` times `(x, y)`. Returns true
+   * when the row had to be re-read, which moves the caret to the end and can
+   * change `source`; like the `source` setter it does not fire onChange, since
+   * the shell is the one making the change.
+   */
+  setFunctions(names) {
+    const changed = this.model.setFunctions(names);
+    if (changed) this.render();
+    return changed;
+  }
+
   focus() { this.el.focus(); }
   blur() { this.el.blur(); }
   isEmpty() { return this.model.isEmpty(); }
+
+  /** True when this row is a comment rather than mathematics. */
+  isComment() { return this.model.isComment(); }
 
   setDiagnostic(severity, message) {
     this.diagnostic = severity || null;
@@ -1004,6 +1265,7 @@ export class MathField {
     this.body.innerHTML = '';
     this.body.appendChild(tree);
     this.el.classList.toggle('is-empty', st.root.length === 0);
+    this.el.classList.toggle('is-comment', isCommentRow(st.root));
   }
 
   _changed() {
@@ -1056,8 +1318,9 @@ export class MathField {
     const text = e.clipboardData && e.clipboardData.getData('text/plain');
     e.preventDefault();
     if (!text) return;
-    const atoms = parseSource(text.replace(/\r?\n/g, ' '));
+    const atoms = parseSource(text.replace(/\r?\n/g, ' '), this.model.st.funcs);
     const st = this.model.st;
+    st.pristine = null;
     const L = curList(st);
     L.splice(st.index, 0, ...atoms);
     st.index += atoms.length;

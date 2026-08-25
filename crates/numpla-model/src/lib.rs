@@ -18,7 +18,7 @@ pub mod report;
 pub mod system;
 
 pub use document::{Document, StateRhs};
-pub use report::{Diagnostics, Issue, Severity, SolveReport, StepJson, TelemetryJson};
+pub use report::{Diagnostics, Fix, Issue, Severity, SolveReport, StepJson, TelemetryJson};
 pub use system::ModelSystem;
 
 use numpla_ode::{solve, Opts, SolveError, Solution};
@@ -86,9 +86,12 @@ impl Model {
             return fail("there are no ODE rows to integrate".to_string());
         }
         // Reported, but as a statement of fact rather than a complaint: the
-        // shell is expected to hold off on solving while rows are still pending.
-        if self.doc.is_pending() {
-            return fail("the model is still incomplete".to_string());
+        // shell is expected to hold off on solving while rows are still
+        // pending. Only the pending rows that actually block count — a state
+        // with no initial condition is reported *and* defaulted, so a document
+        // that has not said where everything starts still draws.
+        if let Some(blocker) = self.doc.first_blocker() {
+            return fail(format!("the model is still incomplete — {}", blocker));
         }
 
         let sys = ModelSystem::new(&self.doc);
@@ -253,6 +256,34 @@ mod tests {
         Model::new().set_source(src).issues
     }
 
+    fn errors_on(src: &str) -> Vec<Issue> {
+        issues_on(src)
+            .into_iter()
+            .filter(|i| i.severity == Severity::Error)
+            .collect()
+    }
+
+    /// The value a constant row settled on.
+    fn param(m: &Model, name: &str) -> f64 {
+        match m.document().env.vars.get(name) {
+            Some(numpla_expr::Value::Scalar(v)) => *v,
+            other => panic!("{} is {:?}", name, other),
+        }
+    }
+
+    /// The document with every offered row appended, which is what the issue
+    /// bar's button does.
+    fn with_fixes_applied(src: &str) -> String {
+        let mut out = src.to_string();
+        for i in issues_on(src) {
+            if let Some(f) = i.fix {
+                out.push('\n');
+                out.push_str(&f.insert);
+            }
+        }
+        out
+    }
+
     // --- the model itself -------------------------------------------------
 
     #[test]
@@ -367,7 +398,8 @@ mod tests {
 
     #[test]
     fn comments_and_blank_lines_are_ignored_without_shifting_line_numbers() {
-        let src = "# a harmonic oscillator\n\nx' = -y\ny' = x   # trailing comment\n\nx(0) = 1";
+        let src =
+            "# a harmonic oscillator\n\nx' = -y\ny' = x   # trailing comment\n\nx(0) = 1\ny(0) = 0";
         let mut m = Model::new();
         let d = m.set_source(src);
         assert_eq!(d.states, vec!["x".to_string(), "y".to_string()]);
@@ -378,14 +410,246 @@ mod tests {
 
     // --- gray, not red ----------------------------------------------------
 
+    /// A name you have not defined *yet* is the ordinary state of a document
+    /// being written, so it is pending and carries the definition we would
+    /// have written. It still stops the solve — nothing was assumed.
     #[test]
-    fn an_undefined_name_is_an_error() {
+    fn an_undefined_name_is_pending_and_comes_with_a_definition() {
         let issues = issues_on("x' = q\nx(0) = 1");
         assert_eq!(issues.len(), 1, "{:?}", issues);
-        assert_eq!(issues[0].severity, Severity::Error);
+        assert_eq!(issues[0].severity, Severity::Pending);
         assert_eq!(issues[0].line, 0);
         assert!(issues[0].message.contains('q'), "{:?}", issues[0]);
+        assert_eq!(
+            issues[0].fix,
+            Some(Fix {
+                label: "add q = 1".to_string(),
+                insert: "q = 1".to_string(),
+            })
+        );
+        // ...and accepting it leaves a document with nothing left to say.
+        assert!(
+            issues_on(&with_fixes_applied("x' = q\nx(0) = 1")).is_empty(),
+            "{:?}",
+            issues_on(&with_fixes_applied("x' = q\nx(0) = 1"))
+        );
     }
+
+    /// Only what the compiler can propose a row for turns gray. A wrong arity
+    /// or an unusable row is a mistake, and mistakes stay red.
+    #[test]
+    fn a_genuine_mistake_is_still_an_error() {
+        for src in ["x' = -y\ny' = sin(x", "x' = min(1)", "x^2 + y^2 = 1", "x''' = 1"] {
+            let errors = errors_on(src);
+            assert!(!errors.is_empty(), "{}: expected an error", src);
+            assert!(
+                errors.iter().all(|i| i.fix.is_none()),
+                "{}: {:?}",
+                src,
+                errors
+            );
+        }
+    }
+
+    // --- missing information, and the row that would supply it -------------
+
+    /// A state that starts at zero because nobody said otherwise is a guess
+    /// presented as a fact. It gets said out loud, pointed at the row that
+    /// introduced the state, and offered.
+    #[test]
+    fn a_state_with_no_initial_condition_says_so_and_offers_the_default() {
+        let issues = issues_on("k = 2\nx' = -k x");
+        assert_eq!(issues.len(), 1, "{:?}", issues);
+        let i = &issues[0];
+        assert_eq!(i.severity, Severity::Pending);
+        assert_eq!(i.message, "x has no starting point");
+        // the row that introduced the state, not the top of the document
+        assert_eq!(i.line, 1);
+        assert_eq!((i.start, i.end), (0, "x' = -k x".len()));
+        assert_eq!(
+            i.fix,
+            Some(Fix {
+                label: "add x(0) = 0".to_string(),
+                insert: "x(0) = 0".to_string(),
+            })
+        );
+    }
+
+    /// A lowered velocity is as real a state as its position, and gets its own
+    /// offer under its own name. Both point at the second-order row.
+    #[test]
+    fn a_lowered_velocity_gets_its_own_offer() {
+        let issues = issues_on("x'' = -x");
+        let names: Vec<&str> = issues.iter().map(|i| i.message.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["x has no starting point", "x' has no starting point"]
+        );
+        assert!(issues.iter().all(|i| i.line == 0), "{:?}", issues);
+        assert_eq!(
+            issues[1].fix.as_ref().map(|f| f.insert.as_str()),
+            Some("x'(0) = 0")
+        );
+    }
+
+    /// The point of the offer: the row it proposes is a real row, and taking
+    /// it up leaves nothing to report.
+    #[test]
+    fn every_offered_row_parses_and_settles_the_issue_it_answers() {
+        for src in ["x' = -y\ny' = x", "x'' = -x", "x' = k x", "y'' = -y\nx' = 1"] {
+            let fixed = with_fixes_applied(src);
+            assert!(
+                issues_on(&fixed).is_empty(),
+                "{} -> {:?}: {:?}",
+                src,
+                fixed,
+                issues_on(&fixed)
+            );
+        }
+    }
+
+    #[test]
+    fn a_state_that_already_has_a_starting_point_is_not_offered_another() {
+        let issues = issues_on("x' = -y\ny' = x\nx(0) = 1\ny(0) = 0");
+        assert!(issues.is_empty(), "{:?}", issues);
+        // even when the row that states it is itself broken: the person is
+        // plainly saying where x starts, and two complaints is one too many
+        let issues = issues_on("x' = -x\nx(0) = [1, 2]");
+        assert_eq!(issues.len(), 1, "{:?}", issues);
+        assert_eq!(issues[0].line, 1);
+    }
+
+    /// Reported, and defaulted in the same breath — so the document draws.
+    /// This is information, not an obstruction.
+    #[test]
+    fn a_missing_initial_condition_does_not_stop_the_document_solving() {
+        let mut m = Model::new();
+        let d = m.set_source("x' = 1");
+        assert_eq!(d.issues.len(), 1);
+        assert_eq!(d.issues[0].severity, Severity::Pending);
+        let r = m.solve(0.0, 2.0);
+        assert!(r.ok, "{:?}", r.error);
+        assert_eq!(m.eval(0.0)[0], 0.0);
+        assert!((m.eval(2.0)[0] - 2.0).abs() < 1e-9);
+    }
+
+    /// A missing *definition* is the other kind of pending: nothing has been
+    /// assumed on the user's behalf, so there is nothing to integrate.
+    #[test]
+    fn an_undefined_name_does_stop_the_solve_and_says_which_name() {
+        let mut m = Model::new();
+        m.set_source("x' = k x\nx(0) = 1");
+        let r = m.solve(0.0, 1.0);
+        assert!(!r.ok);
+        let e = r.error.unwrap();
+        assert!(e.contains('k'), "{}", e);
+    }
+
+    /// One name, one definition to write. Three rows waiting on `k` are three
+    /// pending rows but one offer, or two clicks would write `k = 1` twice.
+    #[test]
+    fn the_same_proposal_is_offered_once_on_the_earliest_row() {
+        let issues = issues_on("x' = k x\ny' = k y\nx(0) = 1\ny(0) = 1");
+        let waiting: Vec<&Issue> = issues.iter().filter(|i| i.message.contains('k')).collect();
+        assert_eq!(waiting.len(), 2, "{:?}", issues);
+        assert!(waiting[0].fix.is_some());
+        assert_eq!(waiting[0].line, 0);
+        assert!(waiting[1].fix.is_none(), "{:?}", waiting[1]);
+    }
+
+    /// Nothing is proposed for a name the document already gives a meaning to
+    /// — a constant called `x` would be a second thing under the state's name.
+    #[test]
+    fn no_definition_is_proposed_for_a_name_the_document_already_uses() {
+        let issues = issues_on("x' = 1\nk = x\nx(0) = 0");
+        assert_eq!(issues.len(), 1, "{:?}", issues);
+        assert_eq!(issues[0].severity, Severity::Error);
+        assert!(issues[0].fix.is_none(), "{:?}", issues[0]);
+    }
+
+    // --- implicit multiplication vs. function-call syntax -------------------
+
+    /// The regression the two-pass compile exists for. `g (y - x)^3` at
+    /// `g = 40, y - x = -1` is `-40`; reading `g(...)` as a call gave
+    /// `-64000` — a plausible curve of a different system, silently.
+    #[test]
+    fn a_coefficient_before_a_group_does_not_capture_the_exponent() {
+        let mut m = Model::new();
+        m.set_source("g = 40\ny = 0\nx = 1\nz = g (y - x)^3");
+        assert_eq!(param(&m, "z"), -40.0);
+        // the parenthesised workaround still agrees, so both spellings of the
+        // same physics now integrate the same system
+        m.set_source("g = 40\ny = 0\nx = 1\nz = g ((y - x)^3)");
+        assert_eq!(param(&m, "z"), -40.0);
+    }
+
+    /// ...and the same row shape means the other thing when the document has
+    /// said the name is a function. Only the document can tell these apart,
+    /// which is why the compile reads the rows twice.
+    #[test]
+    fn a_name_the_document_defines_as_a_function_keeps_call_precedence() {
+        let mut m = Model::new();
+        m.set_source("f(u) = c u\nc = 2\ny = 0\nx = 1\nz = f(y - x)^3\nw = c (y - x)^3");
+        assert_eq!(param(&m, "z"), -8.0); // (2 * -1)^3
+        assert_eq!(param(&m, "w"), -2.0); // 2 * (-1)^3
+    }
+
+    // --- rand() has a call site --------------------------------------------
+
+    /// Two `rand()`s are two numbers. They used to be the same one, because
+    /// nothing below the document knows where a call sits.
+    #[test]
+    fn two_random_call_sites_draw_different_numbers() {
+        let mut m = Model::new();
+        m.set_source("a = rand()\nb = rand()\nc = randn()\nd = randn()");
+        assert_ne!(param(&m, "a"), param(&m, "b"));
+        assert_ne!(param(&m, "c"), param(&m, "d"));
+        // two sites on one row are two sites as well
+        m.set_source("a = rand() - rand()");
+        assert_ne!(param(&m, "a"), 0.0);
+    }
+
+    /// The hard requirement. A hashed site name — rather than a counter over
+    /// the document — is what keeps an edit somewhere else from re-rolling
+    /// numbers the user is already looking at.
+    #[test]
+    fn random_call_sites_are_stable_across_compiles_and_unrelated_edits() {
+        let read = |src: &str| {
+            let mut m = Model::new();
+            m.set_source(src);
+            (param(&m, "a"), param(&m, "b"))
+        };
+        let base = read("a = rand()\nb = randn()\nx' = 0\nx(0) = 0");
+        // the same document, compiled again
+        assert_eq!(read("a = rand()\nb = randn()\nx' = 0\nx(0) = 0"), base);
+        // a row inserted above both of them
+        assert_eq!(read("k = 5\na = rand()\nb = randn()\nx' = 0\nx(0) = 0"), base);
+        // an unrelated row edited
+        assert_eq!(read("a = rand()\nb = randn()\nx' = 1\nx(0) = 0"), base);
+        // a row deleted from underneath them
+        assert_eq!(read("a = rand()\nb = randn()\nx' = 0"), base);
+    }
+
+    /// `rand(s)` names its own stream and is the user's business, not ours.
+    #[test]
+    fn an_explicitly_seeded_draw_is_left_exactly_as_written() {
+        let mut m = Model::new();
+        m.set_source("a = rand(3)\nb = rand(3)\nc = rand(4)");
+        assert_eq!(param(&m, "a"), param(&m, "b"));
+        assert_ne!(param(&m, "a"), param(&m, "c"));
+    }
+
+    /// A drawn number is a *constant*, so the solver sees the same right-hand
+    /// side at every stage of every step — which is the property that lets a
+    /// document containing randomness be integrated at all.
+    #[test]
+    fn a_random_coefficient_is_constant_through_a_solve() {
+        let m = solved("k = rand()\nx' = k\nx(0) = 0", 0.0, 1.0);
+        let k = param(&m, "k");
+        assert!(k > 0.0 && k < 1.0, "{}", k);
+        assert!((m.eval(1.0)[0] - k).abs() < 1e-9, "{:?}", m.eval(1.0));
+    }
+
 
     #[test]
     fn half_typed_input_is_pending_not_an_error() {
@@ -424,17 +688,16 @@ mod tests {
 
     #[test]
     fn a_duplicate_ode_row_is_an_error() {
-        let issues = issues_on("x' = 1\nx' = 2");
-        assert_eq!(issues.len(), 1, "{:?}", issues);
-        assert_eq!(issues[0].severity, Severity::Error);
-        assert_eq!(issues[0].line, 1);
+        let errors = errors_on("x' = 1\nx' = 2");
+        assert_eq!(errors.len(), 1, "{:?}", errors);
+        assert_eq!(errors[0].line, 1);
     }
 
     #[test]
     fn issues_carry_the_line_and_the_span_within_it() {
-        let issues = issues_on("x' = -y\ny' = sin(x");
-        assert_eq!(issues.len(), 1, "{:?}", issues);
-        let i = &issues[0];
+        let errors = errors_on("x' = -y\ny' = sin(x");
+        assert_eq!(errors.len(), 1, "{:?}", errors);
+        let i = &errors[0];
         assert_eq!(i.line, 1);
         assert_eq!(i.severity, Severity::Error);
         assert_eq!(i.message, "missing )");
@@ -553,6 +816,27 @@ mod tests {
         assert!(json.contains("\"line\":1"), "{}", json);
         assert!(json.contains("\"start\":10"), "{}", json);
         assert!(json.contains("\"end\":10"), "{}", json);
+    }
+
+    /// `fix` is an addition to v1, so it is absent — not null — unless the
+    /// compiler has something concrete to propose.
+    #[test]
+    fn a_proposed_row_reaches_the_wire_and_is_omitted_when_there_is_none() {
+        let json = Model::new().set_source_json("x' = -y\ny' = x\nx(0) = 1");
+        assert!(
+            json.contains(r#""message":"y has no starting point""#),
+            "{}",
+            json
+        );
+        assert!(
+            json.contains(r#""fix":{"label":"add y(0) = 0","insert":"y(0) = 0"}"#),
+            "{}",
+            json
+        );
+
+        let json = Model::new().set_source_json("x' = -y\ny' = sin(x\nx(0) = 0\ny(0) = 0");
+        assert!(json.contains(r#""severity":"error""#), "{}", json);
+        assert!(!json.contains("\"fix\""), "{}", json);
     }
 
     #[test]
