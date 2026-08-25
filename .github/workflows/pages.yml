@@ -52,15 +52,7 @@ jobs:
         run: node app/demos.test.mjs
       # Boots the real main.js against the real WASM from the real index.html.
       # Unit suites prove the parts; this is the only thing that proves the app.
-      #
-      # TEMPORARILY NON-BLOCKING. It passes locally, including under heavy CPU
-      # contention, and fails only on the runner - so the fault is very probably
-      # in the harness rather than the app, and the other four suites plus the
-      # whole Rust workspace still gate this deploy. It keeps running so its
-      # result stays visible; remove `continue-on-error` the moment the runner's
-      # failure is understood, because a gate nobody enforces is not a gate.
       - name: Integration test
-        continue-on-error: true
         run: node app/integration.test.mjs
 
   build:
