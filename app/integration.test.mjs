@@ -36,7 +36,26 @@ async function settle(n = 40) { for (let i = 0; i < n; i++) await tick(); }
 const click = (el) => dispatch(el, 'click', { type: 'click', target: el, preventDefault() {}, stopPropagation() {} });
 
 /** The window→span loop is debounced; give it longer than the debounce. */
-async function settleSolve() { await wait(260); await settle(40); }
+/**
+ * Wait for the app to be QUIET, not for a fixed number of milliseconds.
+ *
+ * Fixed waits measure the machine, not the app: they pass here and fail on a
+ * loaded CI runner, which is exactly what happened. `pending()` reports whether
+ * a debounced recompute, resolve or field query is still queued, so this waits
+ * for the work itself and only falls back to a timeout if something is stuck.
+ */
+async function settleSolve(timeoutMs = 8000) {
+  const I = globalThis.__numplaInspect;
+  const started = Date.now();
+  // Let the gesture that triggered the work schedule it first.
+  await settle(4);
+  while (I && typeof I.pending === 'function' && I.pending()) {
+    if (Date.now() - started > timeoutMs) break;
+    await wait(10);
+  }
+  await wait(30);        // the timer fires, then the work runs
+  await settle(40);
+}
 
 // ---------------------------------------------------------------------------
 // Boot

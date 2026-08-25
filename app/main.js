@@ -2710,6 +2710,8 @@ globalThis.__numplaInspect = {
   window: () => plot.getWindow(),
   span: () => ({ t0: state.t0, t1: state.t1, tEnd: state.tEnd }),
   /** Replace the whole document, the way loading a demo does. */
+  /** True while a debounced recompute, resolve or field query is still queued. */
+  pending: () => pendingWork.recompute || pendingWork.resolve || pendingWork.field,
   setDocument: (text) => {
     clearRows();
     buildRows(String(text).split(/\r?\n/));
@@ -2849,6 +2851,14 @@ globalThis.__numplaInspect = {
   },
 };
 
+// Is there scheduled work that has not run yet?
+//
+// The integration suite used to wait a fixed number of milliseconds for each
+// debounce, which passes on a fast machine and fails on a loaded CI runner -
+// a test that measures the runner rather than the app. Waiting on this instead
+// makes those assertions deterministic.
+const pendingWork = { recompute: false, resolve: false, field: false };
+
 let debounceTimer = 0;
 
 function runRecompute() {
@@ -2863,7 +2873,9 @@ function runRecompute() {
 function scheduleRecompute(delay = 160) {
   clearTimeout(debounceTimer);
   clearTimeout(resolveTimer);       // an edit subsumes a pending window solve
-  debounceTimer = setTimeout(runRecompute, delay);
+  pendingWork.resolve = false;
+  pendingWork.recompute = true;
+  debounceTimer = setTimeout(() => { pendingWork.recompute = false; runRecompute(); }, delay);
 }
 
 // ---------------------------------------------------------------------------
@@ -2892,7 +2904,9 @@ function spanUnchanged(a, b) {
 
 function scheduleResolve(delay = RESOLVE_MS) {
   clearTimeout(resolveTimer);
+  pendingWork.resolve = true;
   resolveTimer = setTimeout(() => {
+    pendingWork.resolve = false;
     const want = spanFromFrame();
     if (!isFinite(want.t0) || !isFinite(want.t1) || want.t1 <= want.t0) return;
     if (spanUnchanged(want, { t0: state.t0, t1: state.t1 })) return;
@@ -3008,7 +3022,8 @@ function computeField() {
 
 function scheduleField(delay = RESOLVE_MS) {
   clearTimeout(fieldTimer);
-  fieldTimer = setTimeout(computeField, Math.max(0, delay));
+  pendingWork.field = true;
+  fieldTimer = setTimeout(() => { pendingWork.field = false; computeField(); }, Math.max(0, delay));
 }
 
 // ---------------------------------------------------------------------------
