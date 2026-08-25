@@ -1100,17 +1100,26 @@ if (hearBtn) {
   ok('with the constants on the same row',
      vars.indexOf('π') >= 0 && vars.indexOf('e') >= 0, vars.join(' '));
 
-  // The constants have to be the constants THIS engine has. There is no `e`,
-  // so the key writes exp(1) rather than a variable nothing defines.
+  // The constants have to be the constants THIS engine has — and `e` is one
+  // of them (`constant()` in crates/numpla-expr/src/eval.rs, the same entry
+  // the reference panel inserts). This test used to assert the opposite: that
+  // the key must write exp(1) because "the engine has no `e`", which was
+  // false, and the key it certified contradicted the reference panel one
+  // overlay away. So the key writes the name, and the row it lands in has to
+  // SOLVE — which is the proof the engine defines it.
   {
     focusRow(rowEls().length - 1);
     await settle(6);
+    press('w'); press('eq');
     tapKey('euler');
-    await settle(10);
-    ok('the e key writes the number, not an undefined name',
-       /exp\(1\)/.test(inspect.source()),
+    await settleSolve();
+    ok('the e key writes the engine’s own constant',
+       /w = e$/.test(inspect.source()),
        JSON.stringify(inspect.source().split('\n').pop()));
-    for (let i = 0; i < 8; i++) press('backspace');
+    ok('and the engine really defines it — nothing is left waiting on a name',
+       /solved/.test($('stat-solve').textContent) && $('issue-msg').textContent === 'clean',
+       `status: ${$('stat-solve').textContent} · bar: ${$('issue-msg').textContent}`);
+    for (let i = 0; i < 3; i++) press('backspace');
     await settle(10);
     tapKey('pi');
     await settle(10);

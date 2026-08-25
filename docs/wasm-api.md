@@ -59,6 +59,14 @@ the names `conservation` accepts. They may be written in named pieces —
 every sample, so order does not matter here either. A typo inside one is
 reported when it is typed, like any other row.
 
+An ODE right-hand side may *read* a derived row — `x' = -E` with `E = 0.5x^2`
+is the substitution it looks like, and the cheapest spelling of a feedback
+loop there is. The named quantity is evaluated at the solver's own `(t, y)` on
+every call, through the same environment as everything else, so the solve
+agrees with the probe pass that accepted the row. A derived damping term
+(`x'' = -x - D`, `D = 0.4x'`) is still damping: it costs Verlet the iterated
+kick and the run its `symplectic` flag, exactly as the inline spelling does.
+
 Added after v1. Previously such a row was an `"error"` ("`x` is not defined"),
 so the change only ever turns red rows green.
 

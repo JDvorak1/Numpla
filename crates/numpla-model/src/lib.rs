@@ -1745,6 +1745,62 @@ mod tests {
         }
     }
 
+    /// A derived row is usable *from* an ODE row, not only watchable beside
+    /// one. The probe pass has always accepted `x' = -E` — it binds the
+    /// derived rows before probing — so a solver that then refused it gave two
+    /// answers to one document: a clean compile and a failed solve. Naming a
+    /// quantity and using it is also the cheapest feedback-loop spelling there
+    /// is (VISION.md), so the substitution has to actually integrate.
+    #[test]
+    fn an_ode_row_can_read_a_derived_row() {
+        let mut m = Model::new();
+        // E defined below its use, like any other row: rows are a set.
+        let d = m.set_source("x' = -E\nx(0) = 1\nE = 0.5x^2");
+        assert!(d.issues.is_empty(), "{:?}", d.issues);
+        assert_eq!(d.derived, vec!["E".to_string()]);
+        let r = m.solve(0.0, 6.0);
+        assert!(r.ok, "{:?}", r.error);
+        // x' = -x^2/2 from x(0) = 1 has the closed form 2/(t + 2).
+        for i in 0..=30 {
+            let t = 6.0 * (i as f64) / 30.0;
+            let got = m.eval(t)[0];
+            let want = 2.0 / (t + 2.0);
+            assert!((got - want).abs() < 1e-6, "at t={}: {} vs {}", t, got, want);
+        }
+        // The row is still a derived row: the monitor can watch the same E the
+        // solver is reading.
+        let c = m.conservation("E", 0);
+        assert!(c.ok, "{:?}", c.error);
+        assert!((c.initial - 0.5).abs() < 1e-12, "{:?}", c);
+    }
+
+    /// A derived row folded into an acceleration is still that acceleration:
+    /// `x'' = -x - D` with `D = 0.4x'` is damping, and both halves of the
+    /// answer have to see through the name — the run must not be reported as
+    /// symplectic, and the iterated kick must keep it second order.
+    #[test]
+    fn velocity_dependence_is_seen_through_a_derived_row() {
+        let mut m = Model::new();
+        let d = m.set_source("x'' = -x - D\nx(0) = 1\nx'(0) = 0\nD = 0.4x'");
+        assert!(d.issues.is_empty(), "{:?}", d.issues);
+        assert!(m.document().reads_velocity(), "the damping is behind a name");
+
+        let r = m.solve_with(0.0, 12.0, Method::Verlet);
+        assert!(r.ok, "{:?}", r.error);
+        assert!(!r.symplectic, "damping through a derived row is still damping");
+        for i in 0..=60 {
+            let t = 12.0 * (i as f64) / 60.0;
+            let got = m.eval(t)[0];
+            assert!(
+                (got - damped(t)).abs() < 1e-4,
+                "at t={}: {} vs {}",
+                t,
+                got,
+                damped(t)
+            );
+        }
+    }
+
     /// A first-order document has its invariants too — this one is exactly the
     /// unit circle — and the monitor does not care how the rows were written.
     #[test]

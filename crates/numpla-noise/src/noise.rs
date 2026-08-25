@@ -148,7 +148,7 @@ impl Kind {
             // beta = 1: ratio 1, sum = 6 over 6 octaves. Equal power per
             // octave, so nothing here converges — the octave count is a
             // decision about the slowest wobble the user should see, and six
-            // octaves puts it at 64 lattice cells.
+            // octaves puts it at 32 lattice cells.
             Kind::Pink => Spectrum {
                 octaves: 6,
                 ratio: 1.0,

@@ -2802,8 +2802,12 @@ globalThis.__numplaInspect = {
     open: kbOpen,
     page: kbPage,
     height: keyboardHeight(),
-    keys: el.kbGrid ? el.kbGrid.querySelectorAll('.kbkey').map((b) => b.dataset.k) : [],
-    vars: el.kbVars ? el.kbVars.querySelectorAll('.kbvar').map((b) => b.textContent) : [],
+    // Array.from first: a browser's querySelectorAll returns a NodeList, which
+    // has no .map — only the test shim's happens to. The suite runs on the
+    // shim, so without the wrap this would pass every test and throw in every
+    // real browser.
+    keys: el.kbGrid ? Array.from(el.kbGrid.querySelectorAll('.kbkey')).map((b) => b.dataset.k) : [],
+    vars: el.kbVars ? Array.from(el.kbVars.querySelectorAll('.kbvar')).map((b) => b.textContent) : [],
     keep: kbLastKeep,
     api: {
       insert: !!(lastActiveRow && typeof lastActiveRow.field.insert === 'function'),
@@ -4164,14 +4168,15 @@ function renderKeyboardVars() {
     ));
   }
   // π and e ride the same row: this is where a symbol you want by NAME lives.
-  // `e` is written exp(1), because the engine has exp and no `e` constant
-  // (docs/wasm-api.md) - so the key produces the number rather than a variable
-  // called e that nothing defines.
+  // Both are the engine's own constants (`constant()` in
+  // crates/numpla-expr/src/eval.rs) - the same `pi` and `e` the reference
+  // panel documents, so the key and the reference cannot disagree about what
+  // the letter means.
   el.kbVars.appendChild(kbChip(
     K('pi', 'π', { ins: 'pi', title: 'pi' }), 'kbvar kbvar--const'
   ));
   el.kbVars.appendChild(kbChip(
-    K('euler', 'e', { ins: 'exp1)', title: "Euler's number — exp(1)" }), 'kbvar kbvar--const'
+    K('euler', 'e', { ins: 'e', title: "Euler's number" }), 'kbvar kbvar--const'
   ));
 }
 

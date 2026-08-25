@@ -151,16 +151,78 @@ impl Document {
     /// pair is `x' = v` by construction and reads a velocity by definition;
     /// counting it would make the answer `true` for every second-order
     /// document there is.
+    ///
+    /// A derived row is followed like a user function: `x'' = -x - E` with
+    /// `E = 0.4x'` is the same damping as writing the term inline, and
+    /// answering `false` for it would report a damped run as symplectic.
     pub fn reads_velocity(&self) -> bool {
         let Ok(pairs) = self.pairs() else {
             return false;
         };
-        let velocities: BTreeSet<String> =
+        // The velocity names, plus every derived name that (transitively)
+        // reads one — relaxed to a fixed point, since derived rows may be
+        // written in terms of each other.
+        let mut names: BTreeSet<String> =
             pairs.iter().map(|&(_, v)| self.states[v].clone()).collect();
+        loop {
+            let mut changed = false;
+            for d in &self.derived {
+                if !names.contains(&d.name) && reads_any(&d.expr, &names, &self.env) {
+                    names.insert(d.name.clone());
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
         pairs.iter().any(|&(_, v)| match &self.rhs[v] {
-            StateRhs::Expr(e) => reads_any(e, &velocities, &self.env),
+            StateRhs::Expr(e) => reads_any(e, &names, &self.env),
             StateRhs::Velocity(_) => false,
         })
+    }
+
+    /// The derived rows an ODE right-hand side (transitively) reads.
+    ///
+    /// Usually empty: a derived row exists to be *measured*, not integrated.
+    /// But `x' = -E` with `E = 0.5x^2` is an ordinary way to name a quantity
+    /// and use it, the probe pass accepts it, and a solver that then refused
+    /// it would be two answers to one document. This is the subset
+    /// [`crate::ModelSystem`] has to evaluate per right-hand-side call — kept
+    /// minimal so a document that merely *monitors* an energy pays nothing for
+    /// it in the hot loop.
+    pub fn derived_for_rhs(&self) -> Vec<Derived> {
+        let mut needed: BTreeSet<String> = BTreeSet::new();
+        loop {
+            let mut changed = false;
+            for d in &self.derived {
+                if needed.contains(&d.name) {
+                    continue;
+                }
+                let name: BTreeSet<String> = [d.name.clone()].into();
+                let read = self
+                    .rhs
+                    .iter()
+                    .any(|r| matches!(r, StateRhs::Expr(e) if reads_any(e, &name, &self.env)))
+                    || self
+                        .derived
+                        .iter()
+                        .filter(|o| needed.contains(&o.name))
+                        .any(|o| reads_any(&o.expr, &name, &self.env));
+                if read {
+                    needed.insert(d.name.clone());
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        self.derived
+            .iter()
+            .filter(|d| needed.contains(&d.name))
+            .cloned()
+            .collect()
     }
 }
 
@@ -640,6 +702,17 @@ fn report_missing_initial_conditions(
 /// [`Value::Unevaluated`]: pending propagates, so a quantity written in terms
 /// of a broken one is reported as waiting rather than as wrong.
 pub fn bind_derived(derived: &[Derived], env: &mut Env) {
+    // Every name starts from scratch. These bindings are facts about *this*
+    // sample; a row that fails to evaluate here must read as pending, not as
+    // whatever it happened to be worth a sample ago.
+    for d in derived {
+        match env.vars.get_mut(&d.name) {
+            Some(slot) => *slot = Value::Unevaluated,
+            None => {
+                env.set_value(&d.name, Value::Unevaluated);
+            }
+        }
+    }
     let mut unresolved: Vec<usize> = (0..derived.len()).collect();
     loop {
         let before = unresolved.len();

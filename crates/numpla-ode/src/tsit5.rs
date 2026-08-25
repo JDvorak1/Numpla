@@ -4,8 +4,8 @@
 //! stability, but a leading error coefficient roughly an order of magnitude
 //! smaller. Free accuracy at identical cost.
 //!
-//! FSAL, so the seventh stage becomes the next step's first — six right-hand
-//! side evaluations per accepted step, seven per rejected one.
+//! FSAL, so an accepted step's seventh stage becomes the next step's first —
+//! six fresh right-hand side evaluations per attempt, accepted or not.
 //!
 //! Ships a fourth-order continuous extension. That is not a bonus feature here:
 //! Numpla scrubs time, so a method without dense output could not be used at
@@ -281,7 +281,7 @@ pub fn solve<S: System>(
             h
         }
     };
-    dt = dt.min(t1 - t0).max(opts.dt_min);
+    dt = dt.min(t1 - t0).min(opts.dt_max).max(opts.dt_min);
 
     // Previous accepted error, for the integral term. Starts at 1 so the first
     // step behaves like a plain elementary controller.
@@ -391,6 +391,24 @@ pub fn solve<S: System>(
         }
 
         let e = error_norm(&err, &y, &y_new, opts);
+        // A stage derivative can go NaN while the proposed state stays finite —
+        // only the FSAL stage ever sees `y_new` itself, so a right-hand side
+        // that is NaN there poisons the error estimate and nothing else. The
+        // PI formula on a NaN error would leave the step size exactly where it
+        // is and replay the same failing attempt until the whole step budget
+        // was burnt in place; the only safe answer is a smaller step, taken
+        // directly. The attempt is not recorded in the telemetry — its error
+        // norm is not a height the strip can draw, the same rule as the
+        // non-finite state above.
+        if !e.is_finite() {
+            telemetry.rejected += 1;
+            dt *= opts.min_factor;
+            if t < t1 && dt < opts.dt_min {
+                stopped = Some(StopReason::StepTooSmall { dt });
+                break;
+            }
+            continue;
+        }
         let accepted = e <= 1.0;
         telemetry.steps.push(StepRecord {
             t,
@@ -745,6 +763,36 @@ mod tests {
         assert!(sol.t_end <= 1.0, "stopped at {}", sol.t_end);
         assert!(sol.y_end.iter().all(|v| v.is_finite()));
         assert!(sol.sample(200).iter().all(|y| y[0].is_finite()));
+    }
+
+    /// A stage derivative can be NaN while the proposed state stays finite:
+    /// only the FSAL stage evaluates at `y_new` itself, so a right-hand side
+    /// that misbehaves exactly there poisons the error estimate and nothing
+    /// else. Fed to the PI formula, a NaN error froze the step size —
+    /// `NaN.clamp` is NaN and `NaN.min(1.0)` is 1 — and the driver replayed
+    /// the same failing attempt until `max_steps` ran out. The guard shrinks
+    /// the step instead, so the very next attempt evaluates elsewhere and the
+    /// run completes. Call 8 is that stage: one initial evaluation, one for
+    /// the automatic step size, then six stages of the first attempt.
+    #[test]
+    fn a_nan_error_estimate_shrinks_the_step_instead_of_freezing_it() {
+        use std::cell::Cell;
+        let calls = Cell::new(0u32);
+        let sys = Field::new(1, |_t, y: &[f64], dy: &mut [f64]| {
+            let n = calls.get() + 1;
+            calls.set(n);
+            dy[0] = if n == 8 { f64::NAN } else { -y[0] };
+        });
+        let sol = solve(&sys, (0.0, 1.0), &[1.0], &Opts::default()).unwrap();
+        assert_eq!(sol.stopped, None, "one poisoned stage must not end the run");
+        assert!(
+            (sol.y_end[0] - (-1.0f64).exp()).abs() < 1e-4,
+            "got {}",
+            sol.y_end[0]
+        );
+        assert!(sol.telemetry.rejected >= 1, "the attempt counts as rejected");
+        // The strip can draw every recorded height; the NaN attempt is not one.
+        assert!(sol.telemetry.steps.iter().all(|s| s.error.is_finite()));
     }
 
     /// Step-size collapse without a blowup: the state stays small and bounded,

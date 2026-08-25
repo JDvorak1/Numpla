@@ -36,8 +36,8 @@ Thirteen worked demos, from a plucked string to colliding strings to Lorenz.
 
 ## Status
 
-The vertical slice works end to end and is tested at every layer: 234 Rust
-tests, 912 math-field assertions, 93 demo assertions with real physics checks,
+The vertical slice works end to end and is tested at every layer: 237 Rust
+tests, 1128 math-field assertions, 93 demo assertions with real physics checks,
 35 audio assertions, and an integration suite that boots the real app against
 the real WebAssembly. See [ROADMAP.md](ROADMAP.md) for what is done and what is
 next.

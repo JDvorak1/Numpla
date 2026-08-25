@@ -5,7 +5,7 @@ use std::cell::RefCell;
 use numpla_expr::{eval, Env, Value};
 use numpla_ode::System;
 
-use crate::document::{describe, Document, StateRhs};
+use crate::document::{bind_derived, describe, Derived, Document, StateRhs};
 
 /// A [`Document`] the solver can integrate.
 ///
@@ -22,6 +22,12 @@ pub struct ModelSystem {
     /// against — so one binding serves both the state and `x'` written by hand.
     keys: Vec<String>,
     rhs: Vec<StateRhs>,
+    /// The derived rows some right-hand side actually reads — `x' = -E` with
+    /// `E = 0.5x^2` is ordinary — bound before each evaluation so the solver
+    /// sees the same document the probe pass approved. Almost always empty: a
+    /// derived row usually exists to be measured, not integrated, and an empty
+    /// list costs the hot loop nothing.
+    derived: Vec<Derived>,
     env: RefCell<Env>,
     /// The first thing that went wrong inside a right-hand side.
     ///
@@ -44,6 +50,7 @@ impl ModelSystem {
         ModelSystem {
             keys: doc.states.clone(),
             rhs: doc.rhs.clone(),
+            derived: doc.derived_for_rhs(),
             env: RefCell::new(env),
             failure: RefCell::new(None),
         }
@@ -72,6 +79,9 @@ impl System for ModelSystem {
         bind(&mut env, "t", t);
         for (key, value) in self.keys.iter().zip(y) {
             bind(&mut env, key, *value);
+        }
+        if !self.derived.is_empty() {
+            bind_derived(&self.derived, &mut env);
         }
 
         for (i, source) in self.rhs.iter().enumerate() {

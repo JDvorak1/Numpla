@@ -155,6 +155,20 @@ None outstanding.
 
 Fixed:
 
+- **An ODE row reading a derived row compiled clean and refused to solve.**
+  The probe pass binds derived rows before probing, so `x' = -E` with
+  `E = 0.5x^2` reported no issues — and then `ModelSystem` never bound them,
+  so the same document failed at solve time with "the model is still
+  incomplete". `ModelSystem` now evaluates the derived rows the right-hand
+  sides actually read (usually none, so the hot loop pays nothing), and
+  `reads_velocity` follows derived rows too, so damping hidden behind a name
+  is still reported as damping.
+- **A NaN error estimate froze the adaptive step in place.** Only the FSAL
+  stage evaluates at `y_new` itself, so a right-hand side that goes NaN
+  exactly there poisons the error estimate while the state stays finite —
+  and the PI formula on NaN left `dt` unchanged, replaying the same failing
+  attempt until `max_steps` burned out. A non-finite estimate now rejects the
+  attempt and shrinks the step directly.
 - **Implicit multiplication lost to function-call syntax on `^`.** `g (y - x)^3`
   parsed as `(g*(y-x))^3`, silently integrating a different system. Resolved by
   the two-pass compile in `numpla-model`: gather the `f(u) = ...` definitions,
