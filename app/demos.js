@@ -187,6 +187,30 @@ export const DEMOS = [
   },
 
   {
+    id: 'energy-drift',
+    title: 'Does your integrator lie?',
+    blurb:
+      'An orbit with its energy written as a row. Energy should never change — so any change you see is the method, not the physics. Open the reference and switch the integrator: an adaptive method drifts away forever, a symplectic one wanders inside a band and stays there.',
+    source: doc(`
+      # E should be flat. Whatever it does instead is the integrator's doing.
+      w = 1
+
+      x'' = -w^2 x
+      x(0) = 1
+      x'(0) = 0
+
+      # a derived row: a function of the solution, drawn dashed
+      E = 0.5(x'^2 + w^2 x^2)
+    `),
+    tSpan: [0, 400],
+    knobs: [
+      { name: 'w', min: 0.5, max: 4, step: 0.01, value: 1, label: 'frequency' },
+    ],
+    audio: false,
+    tags: ['conservation', 'integrator', 'derived'],
+  },
+
+  {
     id: 'pendulum',
     title: 'Pendulum, swung hard',
     blurb:

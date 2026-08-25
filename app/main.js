@@ -229,6 +229,7 @@ let funcNames = () => []; // MathField's functionNamesIn, bound at boot
 const state = {
   names: [],       // state variable names, in solver order
   params: [],      // named constants reported by the compiler
+  derived: [],     // rows that are functions of the solution (energy, ...)
   frame: null,     // last GOOD frame; an error never clears this
   t0: 0,
   t1: 20,
@@ -829,8 +830,11 @@ async function toggleHear() {
     if (rendered && rendered.silent) setHearing(false);
   } catch (err) {
     setHearing(false);
-    note(String((err && err.message) || err));
-    console.error('[numpla] hear failed', err);
+    const msg = String((err && err.message) || err);
+    note(msg);
+    // An absent AudioContext is an environment fact, not a fault; saying so in
+    // the panel is the whole handling. Anything else is worth a console entry.
+    if (!/not available/i.test(msg)) console.error('[numpla] hear failed', err);
   }
 }
 
@@ -1300,6 +1304,35 @@ function renderReadout(names, values) {
     const v = document.createElement('span');
     v.className = 'chip__val';
     v.textContent = have && i < values.length ? fmtValue(values[i]) : '—';
+    chip.append(dot, n, v);
+    el.readout.appendChild(chip);
+  });
+
+  // Derived rows report their drift rather than a value at the playhead: the
+  // point of an energy row is not what it reads now but whether it is holding.
+  // secularRatio compares the band over the last tenth of the run against the
+  // first — around 1 is a band, well above 1 is a genuine drift.
+  const extra = (state.frame && state.frame.extra) || [];
+  extra.forEach((ex, e) => {
+    const chip = document.createElement('span');
+    chip.className = 'chip chip--derived';
+    const dot = document.createElement('span');
+    dot.className = 'chip__dot';
+    dot.style.background = seriesColor(names.length + e);
+    const n = document.createElement('span');
+    n.className = 'chip__name';
+    n.textContent = ex.name;
+    const v = document.createElement('span');
+    v.className = 'chip__val';
+    const r = ex.drift && Number(ex.drift.secularRatio);
+    const rel = ex.drift && Number(ex.drift.relativeDrift);
+    if (isFinite(r)) {
+      v.textContent = r < 1.5 ? 'holding' : `drifting ${r.toFixed(1)}x`;
+      chip.title = `${ex.name}: relative drift ${isFinite(rel) ? rel.toExponential(1) : '?'}`
+        + `, secular ratio ${r.toFixed(3)} (about 1 means a bounded band)`;
+    } else {
+      v.textContent = '—';
+    }
     chip.append(dot, n, v);
     el.readout.appendChild(chip);
   });
@@ -2003,11 +2036,15 @@ function recompute() {
   const issues = Array.isArray(diag.issues) ? diag.issues : [];
   const names = Array.isArray(diag.states) ? diag.states : [];
   const params = Array.isArray(diag.params) ? diag.params : [];
+  // Rows that are functions of the solution rather than constants. They carry
+  // no value until there is a curve, which is why they are not parameters.
+  const derived = Array.isArray(diag.derived) ? diag.derived : [];
 
   applyDiagnostics(issues);
 
   state.names = names;
   state.params = params;
+  state.derived = derived;
   refreshDocumentNames();   // Tab now completes the document's own vocabulary
 
   const hasError = issues.some((i) => i.severity === 'error');
@@ -2093,6 +2130,8 @@ function recompute() {
 
   if (String(reportNames) !== String(names)) updateCapabilities(reportNames);
 
+  const extra = derivedSeries(state.derived, got);
+
   state.frame = {
     names: reportNames,
     dim,
@@ -2103,11 +2142,48 @@ function recompute() {
     playT: state.t,
     playY: new Float64Array(0),
     polar: polarMapFor(reportNames),
+    extra,
   };
 
   // A re-solve draws inside the frame the user left. It is never moved here.
   syncFrameButtons();
   updatePlayhead();
+}
+
+/**
+ * Evaluate the document's derived rows along the solution.
+ *
+ * A derived row (`E = 0.5(x'^2 + x^2)`) is a function of the solution rather
+ * than a parameter, so it has no value until there is a curve. Drawing it beside
+ * the states is the conservation monitor: with a symplectic method the line sits
+ * in a band forever, and with an adaptive one it walks away. `secularRatio` is
+ * the number that says which — around 1 is a band, well above 1 is a drift.
+ *
+ * The sample count is a request, not a promise: the compiler raises it to at
+ * least one per accepted step, because too few samples per oscillation alias a
+ * conserved quantity into a drifting one. It reports back what it really took.
+ */
+function derivedSeries(names, n) {
+  if (!M || !names || !names.length) return null;
+  const out = [];
+  for (const name of names) {
+    try {
+      const rep = parseJson(M.conservation(name, n), 'ConservationReport');
+      if (!rep || rep.ok !== true) continue;
+      const pairs = toF64(M.conservationSeries());
+      if (pairs.length < 4) continue;
+      out.push({
+        name,
+        pairs,                       // flat [t, value] * samples
+        n: Math.floor(pairs.length / 2),
+        initial: rep.initial,
+        drift: rep.drift || null,
+      });
+    } catch (err) {
+      console.error('[numpla] conservation failed for ' + name, err);
+    }
+  }
+  return out.length ? out : null;
 }
 
 let debounceTimer = 0;
@@ -2879,6 +2955,8 @@ async function boot() {
       solve:     bindMethod(model, 'solve'),
       sample:    bindMethod(model, 'sample'),
       eval:      bindMethod(model, 'eval'),
+      conservation:       bindMethod(model, 'conservation'),
+      conservationSeries: bindMethod(model, 'conservation_series'),
     };
     // Probed, never assumed: app/pkg/ can be older than the crate.
     methodApi = probeMethodApi(model, mod.Model);

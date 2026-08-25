@@ -113,6 +113,40 @@ idea-generation engine.
 
 ---
 
+## M8 — Instrumentation  (in progress)
+
+- [x] Derived rows: `E = 0.5(x'^2 + x^2)` is a function of the solution, not an
+      error. Drawn dashed beside the states.
+- [x] Conservation monitor: drift measured against the initial value, reported
+      as a secular ratio (band over the last tenth of the run against the
+      first). Around 1 is a bounded band; well above 1 is a real drift.
+- [x] Integrator selection reaches the browser, and a symplectic method asked of
+      a document with no second-order structure is refused by name rather than
+      silently falling back.
+- [x] `energy-drift` demo, whose physics check asserts the contrast itself:
+      Verlet and Yoshida4 under 1.5, Tsit5 above 2.
+- [ ] Step telemetry strip (accepted/rejected/local error along the run)
+- [ ] Save-file format for telemetry and results
+
+## Testing
+
+Four suites, and the fourth is the one that matters most:
+
+| suite | proves |
+|---|---|
+| `cargo test` | the Rust core |
+| `app/mathfield.test.mjs` | the editor's model and serialisation |
+| `app/demos.test.mjs` | every demo against the real WASM, with physics |
+| `app/audio.test.mjs` | rendering produces the actual signal |
+| `app/integration.test.mjs` | **the app** — boots `main.js` against the real WASM from the real `index.html` |
+
+The integration suite exists because every bug reported from outside so far —
+the demo loader doing nothing, the `t` slider being inert — was invisible to the
+unit suites. Each part worked; the seam between them did not. It builds its DOM
+by reading `index.html` rather than by hand-mounting elements, so it cannot
+quietly go stale, and a `getElementById` with no matching id fails there instead
+of in a browser.
+
 ---
 
 ## Known bugs

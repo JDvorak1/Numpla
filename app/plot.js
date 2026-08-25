@@ -383,6 +383,10 @@ export class Plot {
         const t = data[i * stride];
         for (let d = 0; d < dim; d++) take(t, data[i * stride + 1 + d]);
       }
+      // Derived rows share the time axis, so fitting must see them too.
+      for (const ex of sol.extra || []) {
+        for (let i = 0; i < ex.n; i++) take(ex.pairs[i * 2], ex.pairs[i * 2 + 1]);
+      }
     } else if (view === 'phase') {
       if (dim !== 2) return null;
       for (let i = 0; i < n; i++) take(data[i * stride + 1], data[i * stride + 2]);
@@ -636,6 +640,27 @@ export class Plot {
    * past it, which is what makes travelled and ahead two different strokes of
    * the same curve.
    */
+  /**
+   * Stroke a flat [t, value] series. Derived rows are sampled on their own
+   * grid — the compiler raises the count to at least one per accepted step, so
+   * a conserved quantity is not aliased into a drifting one — which is why they
+   * cannot share the state array's stride.
+   */
+  _strokePairs(ctx, ex, sx, sy, upTo) {
+    ctx.beginPath();
+    let pen = false;
+    for (let i = 0; i < ex.n; i++) {
+      const x = ex.pairs[i * 2];
+      if (x > upTo) break;
+      const y = ex.pairs[i * 2 + 1];
+      if (!isFinite(x) || !isFinite(y)) { pen = false; continue; }
+      const px = sx(x);
+      const py = sy(y);
+      if (!pen) { ctx.moveTo(px, py); pen = true; } else { ctx.lineTo(px, py); }
+    }
+    ctx.stroke();
+  }
+
   _stroke(ctx, sol, xOf, yOf, sx, sy, upTo) {
     const stride = sol.dim + 1;
     ctx.beginPath();
@@ -696,6 +721,21 @@ export class Plot {
       ctx.globalAlpha = 1;
       this._stroke(ctx, sol, xOf, yOf, sx, sy, pt);
     }
+
+    // Derived rows, dashed so they read as measurements of the solution rather
+    // than as more of it. This is the conservation monitor: a symplectic method
+    // holds this line in a band, an adaptive one lets it walk away.
+    const extra = sol.extra || [];
+    for (let e = 0; e < extra.length; e++) {
+      ctx.strokeStyle = seriesColor(dim + e);
+      ctx.setLineDash([5, 4]);
+      ctx.globalAlpha = AHEAD_ALPHA;
+      this._strokePairs(ctx, extra[e], sx, sy, Infinity);
+      ctx.globalAlpha = 1;
+      this._strokePairs(ctx, extra[e], sx, sy, pt);
+    }
+    ctx.setLineDash([]);
+
     ctx.restore();
 
     if (!isFinite(pt)) return;

@@ -328,6 +328,33 @@ const PHYSICS = {
     ok(drift(total) < 2e-3, `the colliding pair lost energy: drift ${drift(total)}`);
   },
 
+  'energy-drift': (demo) => {
+    // The demo's claim is about METHODS, not about the model: the same exact
+    // energy is held by a symplectic integrator and let go by an adaptive one.
+    // So the check has to compare integrators, not just look at one curve.
+    const m = new wasm.Model();
+    const d = JSON.parse(m.set_source(demo.source));
+    ok(Array.isArray(d.derived) && d.derived.includes('E'),
+       `E should be a derived row, got ${JSON.stringify(d.derived)}`);
+
+    const ratio = (method) => {
+      const r = JSON.parse(m.solve_with(demo.tSpan[0], demo.tSpan[1], method));
+      ok(r.ok === true, `${method} refused this document: ${r.error}`);
+      const c = JSON.parse(m.conservation('E', 2000));
+      ok(c.ok === true, `conservation failed under ${method}: ${c.error}`);
+      return c.drift.secularRatio;
+    };
+
+    // Around 1 is a bounded band; well above 1 is a genuine secular drift.
+    const verlet = ratio('Verlet');
+    const yoshida = ratio('Yoshida4');
+    const tsit5 = ratio('Tsit5');
+    ok(verlet < 1.5, `Verlet should hold energy in a band, ratio ${verlet}`);
+    ok(yoshida < 1.5, `Yoshida4 should hold energy in a band, ratio ${yoshida}`);
+    ok(tsit5 > 2, `the adaptive method should visibly drift, ratio ${tsit5}`);
+    ok(tsit5 > 2 * verlet, `the contrast is the demo: ${tsit5} vs ${verlet}`);
+  },
+
   'harmonic-oscillator': (demo) => {
     // Undamped by default, so energy is exactly conserved. Anything that
     // drifts here is the integrator leaking, not the model.

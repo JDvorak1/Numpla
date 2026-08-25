@@ -1331,3 +1331,11 @@ body.is-resizing { cursor: col-resize; user-select: none; }
 }
 .hearpanel__play:hover { background: var(--paper-2); }
 .hearpanel__play:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/* A derived row is a measurement of the solution, not more of it — dashed on
+   the plot, and here it reports whether it is holding rather than a value. */
+.chip--derived { font-style: italic; }
+.chip--derived .chip__dot {
+  border-radius: 2px;
+  opacity: .75;
+}
