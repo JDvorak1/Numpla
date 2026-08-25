@@ -56,6 +56,15 @@ pub enum Stmt {
     Expr(Expr),
 }
 
+/// The environment key a derivative binds under: `x'`, `x''`.
+///
+/// The parser, the evaluator and any solver that binds a lowered velocity
+/// state all have to agree on this spelling, so it is written once here rather
+/// than being re-derived at each site.
+pub fn deriv_key(name: &str, order: u8) -> String {
+    format!("{}{}", name, "'".repeat(order as usize))
+}
+
 impl Expr {
     /// Names this expression reads. Drives recompute order and the
     /// hover-to-highlight dependency view.

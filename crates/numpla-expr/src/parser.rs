@@ -2,7 +2,7 @@
 //! yields a tree containing `Expr::Hole` plus a list of errors, never a hard
 //! failure. That is what lets the UI keep drawing while you type.
 
-use crate::ast::{BinOp, Expr, Stmt};
+use crate::ast::{deriv_key, BinOp, Expr, Stmt};
 use crate::lexer::{lex, Spanned, Tok};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -169,11 +169,19 @@ impl Parser {
                     self.pos += 1;
                     order = order.saturating_add(1);
                 }
-                if order > 0 {
-                    Expr::Deriv { name, order }
-                } else if self.at(&Tok::LParen) {
+                if self.at(&Tok::LParen) {
+                    // A primed call is a call on the derivative, not `x'`
+                    // times a parenthesised group. Without this, `x'(0) = 1`
+                    // — the initial condition for a lowered velocity state —
+                    // would reach the model as a multiplication and could only
+                    // be recovered by pattern-matching the arithmetic.
                     let args = self.args();
-                    Expr::Call { name, args }
+                    Expr::Call {
+                        name: deriv_key(&name, order),
+                        args,
+                    }
+                } else if order > 0 {
+                    Expr::Deriv { name, order }
                 } else {
                     Expr::Var(name)
                 }
@@ -332,6 +340,46 @@ mod tests {
             }
             other => panic!("{:?}", other),
         }
+    }
+
+    #[test]
+    fn derivative_initial_condition_is_a_call_on_the_derivative() {
+        // `x'(0) = 1` is the initial condition of a lowered velocity state.
+        match parse("x'(0) = 1").0 {
+            Stmt::Equation {
+                lhs: Expr::Call { name, args },
+                rhs,
+            } => {
+                assert_eq!(name, "x'");
+                assert_eq!(args, vec![Expr::Num(0.0)]);
+                assert_eq!(rhs, Expr::Num(1.0));
+            }
+            other => panic!("{:?}", other),
+        }
+    }
+
+    #[test]
+    fn a_primed_call_still_reads_as_a_product_when_the_derivative_is_bound() {
+        // The notation is ambiguous; the value must not change. `x'(t)` means
+        // `x' * t` whenever `x'` is a number rather than a function.
+        use crate::eval::{eval, Env, Value};
+        let mut env = Env::new();
+        env.set("x'", 3.0);
+        let e = match parse("x'(2)").0 {
+            Stmt::Expr(e) => e,
+            other => panic!("{:?}", other),
+        };
+        assert_eq!(eval(&e, &env), Ok(Value::Scalar(6.0)));
+    }
+
+    #[test]
+    fn an_unbound_primed_call_is_pending_not_undefined() {
+        use crate::eval::{eval, Env, Value};
+        let e = match parse("x'(2)").0 {
+            Stmt::Expr(e) => e,
+            other => panic!("{:?}", other),
+        };
+        assert_eq!(eval(&e, &Env::new()), Ok(Value::Unevaluated));
     }
 
     #[test]

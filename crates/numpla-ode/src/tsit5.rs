@@ -382,7 +382,11 @@ pub fn solve<S: System>(
         }
 
         dt = dt.min(opts.dt_max);
-        if dt < opts.dt_min {
+        // Only report a collapsed step while there is still span left to cover.
+        // Reaching `t1` in a whole number of capped steps leaves a final gap of
+        // a few ulps, and the next proposed step inherits that width — which is
+        // arithmetic, not stiffness, and must not be reported as a failure.
+        if t < t1 && dt < opts.dt_min {
             return Err(SolveError::StepTooSmall { t, dt });
         }
     }
@@ -567,6 +571,22 @@ mod tests {
             uncapped.y_end[0]
         );
         assert!(caught < 1e-6, "capped run should resolve it, got {}", caught);
+    }
+
+    /// Regression: a capped step size that divides the span evenly used to end
+    /// the run with a `StepTooSmall` error raised *after* `t1` was reached.
+    /// `dt_max` is set from the time window on every solve the product makes,
+    /// so this was reachable from a plain `x' = 1`.
+    #[test]
+    fn reaching_the_end_in_whole_capped_steps_is_not_reported_as_stiffness() {
+        let sys = Field::new(1, |_t, _y: &[f64], dy: &mut [f64]| dy[0] = 1.0);
+        let opts = Opts {
+            dt_max: 0.03,
+            ..Default::default()
+        };
+        let sol = solve(&sys, (0.0, 3.0), &[0.0], &opts).expect("integration failed");
+        assert!((sol.t_end - 3.0).abs() < 1e-12);
+        assert!((sol.y_end[0] - 3.0).abs() < 1e-9);
     }
 
     #[test]

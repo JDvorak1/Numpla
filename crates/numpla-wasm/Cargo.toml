@@ -10,5 +10,5 @@ description = "Numpla: wasm-bindgen boundary. Thin by policy - no logic lives he
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-numpla-expr.workspace = true
+numpla-model.workspace = true
 wasm-bindgen = "0.2"

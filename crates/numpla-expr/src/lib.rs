@@ -14,7 +14,7 @@ pub mod eval;
 pub mod lexer;
 pub mod parser;
 
-pub use ast::{BinOp, Expr, Stmt};
+pub use ast::{deriv_key, BinOp, Expr, Stmt};
 pub use eval::{eval, Env, EvalError, Value};
 pub use parser::{parse, ParseError};
 

@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use crate::ast::{BinOp, Expr};
+use crate::ast::{deriv_key, BinOp, Expr};
 use crate::lexer::FUNCS;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -91,7 +91,7 @@ pub fn eval(e: &Expr, env: &Env) -> Result<Value, EvalError> {
         // A derivative referenced as a value only means something once a solver
         // has bound it; until then the row is pending, not broken.
         Expr::Deriv { name, order } => {
-            let key = format!("{}{}", name, "'".repeat(*order as usize));
+            let key = deriv_key(name, *order);
             match env.vars.get(&key) {
                 Some(v) => Ok(v.clone()),
                 None => Ok(Value::Unevaluated),
@@ -203,6 +203,12 @@ fn call(name: &str, args: &[Expr], env: &Env) -> Result<Value, EvalError> {
         if let Some(c) = constant(name) {
             return binary(BinOp::Mul, Value::Scalar(c), vals.into_iter().next().unwrap());
         }
+    }
+
+    // `x'(0)` before a solver has bound `x'`. Same rule as a bare `x'`: a
+    // derivative that nothing has supplied yet is pending, not wrong.
+    if name.ends_with('\'') {
+        return Ok(Value::Unevaluated);
     }
 
     Err(EvalError::Undefined(name.to_string()))

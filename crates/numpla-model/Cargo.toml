@@ -1,0 +1,13 @@
+[package]
+name = "numpla-model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Numpla: model - text rows to an integrated solution"
+
+[dependencies]
+numpla-expr.workspace = true
+numpla-ode.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

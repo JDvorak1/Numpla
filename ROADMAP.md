@@ -14,8 +14,8 @@ Nothing else ships until that works, because that loop *is* Numpla.
 
 - [x] Repo, git, docs (VISION.md, ROADMAP.md)
 - [x] Cargo workspace + crate split
-- [x] `cargo test` green — 42 tests, clippy clean
-- [ ] TS app shell (Vite), WASM build wired
+- [x] `cargo test` green — 76 tests, clippy clean
+- [x] Browser shell + WASM build wired
 
 ## M1 — Expression core  (`numpla-expr`)  — done
 
@@ -51,10 +51,19 @@ Selection and rationale in `docs/solvers.md`.
 - Trajectory polylines, vector fields, implicit curves (marching squares)
 - Camera: pan/zoom that never drops a frame; LOD on field density
 
-## M4 — The slice
+## M4 — The slice  — done, runs in the browser
 
-Wire M1+M2+M3 through `numpla-wasm` to a minimal TS shell. Plain-text input at
-this stage. This is the milestone that either feels right or doesn't.
+Wired M1+M2 through `numpla-model` and `numpla-wasm` to a plain ES-module
+shell in `app/`. Type a system, watch it integrate, drag time.
+
+- [x] `numpla-model` — text document to `System`, diagnostics, JSON wire shapes
+- [x] `numpla-wasm` — thin marshalling layer, contract in `docs/wasm-api.md`
+- [x] Eased loading screen; failures reported on it rather than hanging
+- [x] Canvas time plot + phase plane, HiDPI
+- [x] Scrubber dock with play/pause, driven by `Solution::eval`
+- [x] Gray-not-red diagnostics carried all the way from the evaluator to the UI
+- [ ] Replace the plain textarea with the real editor (M5)
+
 
 ## M5 — Editing UX
 

@@ -1,0 +1,112 @@
+//! The compiled document, presented to the solver as a first-order system.
+
+use std::cell::RefCell;
+
+use numpla_expr::{eval, Env, Value};
+use numpla_ode::System;
+
+use crate::document::{describe, Document, StateRhs};
+
+/// A [`Document`] the solver can integrate.
+///
+/// `System::rhs` takes `&self` because a right-hand side is mathematically a
+/// pure function, but interpreting one means writing the current state into an
+/// environment. The environment therefore lives behind a `RefCell` and is
+/// **mutated in place**: `rhs` runs six or seven times per step and Numpla
+/// re-integrates on every keystroke, so cloning an `Env` here would cost more
+/// than the arithmetic it exists to support. Wasm is single-threaded, so the
+/// borrow is never contended.
+pub struct ModelSystem {
+    /// Env key per state, in state-vector order. Lowered velocities are named
+    /// `x'`, which is exactly the key the evaluator resolves `Expr::Deriv`
+    /// against — so one binding serves both the state and `x'` written by hand.
+    keys: Vec<String>,
+    rhs: Vec<StateRhs>,
+    env: RefCell<Env>,
+    /// The first thing that went wrong inside a right-hand side.
+    ///
+    /// Nothing can be thrown out of `rhs`, and returning NaN would surface as
+    /// an incomprehensible solver failure. Instead the failure is recorded, the
+    /// derivative is written as zero so the integrator stays well-behaved, and
+    /// the caller turns the recorded message into the report.
+    failure: RefCell<Option<String>>,
+}
+
+impl ModelSystem {
+    pub fn new(doc: &Document) -> Self {
+        let mut env = doc.env.clone();
+        // Pre-seed every key that `rhs` writes, so the per-call binding is a
+        // slot overwrite rather than a hash-map insert with a fresh `String`.
+        env.set("t", 0.0);
+        for (name, v) in doc.states.iter().zip(&doc.y0) {
+            env.set(name, *v);
+        }
+        ModelSystem {
+            keys: doc.states.clone(),
+            rhs: doc.rhs.clone(),
+            env: RefCell::new(env),
+            failure: RefCell::new(None),
+        }
+    }
+
+    /// What went wrong while integrating, if anything.
+    pub fn failure(&self) -> Option<String> {
+        self.failure.borrow().clone()
+    }
+
+    fn fail(&self, message: String) {
+        let mut slot = self.failure.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(message);
+        }
+    }
+}
+
+impl System for ModelSystem {
+    fn dim(&self) -> usize {
+        self.rhs.len()
+    }
+
+    fn rhs(&self, t: f64, y: &[f64], dy: &mut [f64]) {
+        let mut env = self.env.borrow_mut();
+        bind(&mut env, "t", t);
+        for (key, value) in self.keys.iter().zip(y) {
+            bind(&mut env, key, *value);
+        }
+
+        for (i, source) in self.rhs.iter().enumerate() {
+            dy[i] = match source {
+                StateRhs::Velocity(j) => y[*j],
+                StateRhs::Expr(e) => match eval(e, &env) {
+                    Ok(Value::Scalar(v)) => v,
+                    Ok(Value::Unevaluated) => {
+                        self.fail("the model is still incomplete".to_string());
+                        0.0
+                    }
+                    Ok(Value::List(_)) => {
+                        self.fail(
+                            "an ODE right-hand side must be a single number".to_string(),
+                        );
+                        0.0
+                    }
+                    Err(e) => {
+                        self.fail(describe(&e));
+                        0.0
+                    }
+                },
+            };
+        }
+    }
+}
+
+/// Overwrite in place when the key already exists — which, after `new`, it
+/// always does. `HashMap::insert` would take ownership of a freshly allocated
+/// key on every one of the millions of calls a single solve makes.
+fn bind(env: &mut Env, name: &str, value: f64) {
+    match env.vars.get_mut(name) {
+        Some(slot) => *slot = Value::Scalar(value),
+        None => {
+            env.set(name, value);
+        }
+    }
+}

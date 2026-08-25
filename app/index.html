@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Numpla</title>
+<meta name="color-scheme" content="dark">
+<link rel="stylesheet" href="./styles.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%230e1116'/%3E%3Cpath d='M5 21C10 21 10 11 16 11S22 21 27 21' fill='none' stroke='%2360e0c8' stroke-width='2.5' stroke-linecap='round'/%3E%3C/svg%3E">
+</head>
+<body>
+
+<!-- ── loading screen ───────────────────────────────────────────────── -->
+<div id="loader" class="loader" role="status" aria-live="polite">
+  <div class="loader__inner">
+    <svg class="loader__mark" viewBox="0 0 120 120" aria-hidden="true">
+      <circle class="loader__ring" cx="60" cy="60" r="47"/>
+      <path class="loader__spiral" pathLength="1" d="M63.0 60.0L63.4 60.4L63.7 60.9L63.9 61.4L64.0 62.0L64.0 62.6L64.0 63.2L63.8 63.9L63.5 64.6L63.1 65.2L62.6 65.8L62.0 66.3L61.4 66.8L60.6 67.2L59.7 67.5L58.8 67.8L57.9 67.8L56.9 67.8L55.9 67.7L54.9 67.4L53.9 67.0L52.9 66.4L52.0 65.7L51.2 64.9L50.4 64.0L49.7 62.9L49.2 61.8L48.8 60.5L48.5 59.2L48.4 57.9L48.5 56.5L48.7 55.1L49.1 53.7L49.7 52.3L50.4 51.0L51.4 49.8L52.4 48.7L53.7 47.6L55.0 46.7L56.5 46.0L58.1 45.4L59.8 45.0L61.5 44.9L63.3 44.9L65.1 45.1L66.9 45.5L68.6 46.2L70.3 47.1L71.9 48.2L73.4 49.4L74.7 50.9L75.9 52.5L76.9 54.3L77.7 56.2L78.2 58.2L78.6 60.3L78.7 62.5L78.5 64.7L78.1 66.9L77.4 69.0L76.5 71.1L75.3 73.0L73.9 74.9L72.2 76.6L70.4 78.1L68.3 79.4L66.1 80.4L63.8 81.3L61.4 81.8L58.9 82.1L56.3 82.0L53.7 81.7L51.2 81.1L48.7 80.2L46.4 78.9L44.1 77.4L42.0 75.7L40.2 73.6L38.5 71.4L37.1 69.0L36.0 66.3L35.2 63.6L34.7 60.7L34.5 57.8L34.7 54.9L35.2 52.0L36.1 49.1L37.3 46.3L38.8 43.6L40.7 41.1L42.8 38.9L45.2 36.8L47.8 35.1L50.7 33.6L53.7 32.5L56.8 31.7L60.1 31.3L63.4 31.3L66.7 31.6L70.0 32.3L73.2 33.4L76.3 34.9L79.2 36.8L81.9 39.0L84.4 41.5L86.5 44.2L88.4 47.3L89.9 50.5L91.0 54.0L91.7 57.5L92.0 61.2L91.9 64.9L91.4 68.6L90.4 72.2L89.0 75.7L87.3 79.0L85.1 82.2L82.5 85.1L79.7 87.7L76.5 90.0L73.0 91.9L69.4 93.4L65.5 94.5L61.6 95.1L57.5 95.3L53.5 95.0L49.4 94.2L45.5 93.0L41.7 91.4L38.1 89.2L34.7 86.7L31.7 83.8L28.9 80.5L26.6 77.0L24.6 73.1L23.1 69.0L22.1 64.8L21.6 60.4L21.6 56.0L22.0 51.6L23.0 47.2L24.5 43.0L26.5 38.9L29.0 35.1L31.8 31.5L35.1 28.3L38.8 25.5L42.8 23.1L47.1 21.1L51.5 19.7L56.2 18.8L60.9 18.4L65.7 18.5L70.5 19.2L75.1 20.5L79.7 22.3L84.0 24.6L88.0 27.4L91.8 30.6L95.1 34.3L98.0 38.4L100.4 42.8L102.4 47.4L103.7 52.3L104.6 57.4L104.8 62.5L104.4 67.6L103.5 72.7L102.0 77.7L99.9 82.5L97.2 87.0"/>
+      <circle class="loader__seed" cx="60" cy="60" r="2.6"/>
+    </svg>
+    <h1 class="loader__word">numpla</h1>
+    <p class="loader__tag">Maple-class math with Desmos-class feel</p>
+    <div class="loader__track" aria-hidden="true"><div class="loader__bar"></div></div>
+    <p class="loader__status" id="loader-status">Loading compute core…</p>
+    <pre class="loader__detail" id="loader-detail" hidden></pre>
+  </div>
+</div>
+
+<!-- ── app ──────────────────────────────────────────────────────────── -->
+<div id="app" class="app" aria-hidden="true">
+
+  <header class="topbar">
+    <div class="brand">
+      <svg class="brand__mark" viewBox="0 0 32 32" aria-hidden="true">
+        <path d="M4 22C10 22 10 10 16 10S22 22 28 22" fill="none" stroke="currentColor"
+              stroke-width="2.4" stroke-linecap="round"/>
+      </svg>
+      <span class="brand__name">numpla</span>
+      <span class="brand__slice">vertical slice</span>
+    </div>
+    <div class="telemetry" id="telemetry">
+      <span class="stat" title="Accepted steps"><i>acc</i><b id="stat-accepted">—</b></span>
+      <span class="stat" title="Rejected steps"><i>rej</i><b id="stat-rejected">—</b></span>
+      <span class="stat" title="Right-hand-side evaluations"><i>rhs</i><b id="stat-rhs">—</b></span>
+      <span class="stat stat--solve" id="stat-solve">idle</span>
+    </div>
+  </header>
+
+  <main class="workspace">
+
+    <aside class="pane pane--editor">
+      <div class="pane__head">
+        <h2 class="pane__title">System</h2>
+        <span class="pane__hint">one row per line · <code>x' = -y</code></span>
+      </div>
+
+      <div class="editor">
+        <div class="editor__gutter" id="gutter" aria-hidden="true"></div>
+        <textarea id="source" class="editor__area" spellcheck="false" autocomplete="off"
+                  autocapitalize="off" autocorrect="off" wrap="off"
+                  aria-label="System source"># harmonic oscillator
+x' = -y
+y' = x
+x(0) = 1
+y(0) = 0</textarea>
+      </div>
+
+      <div class="pane__head pane__head--sub">
+        <h2 class="pane__title">Diagnostics</h2>
+        <span class="pane__hint" id="diag-count">clean</span>
+      </div>
+      <ul class="diags" id="diags"></ul>
+
+      <div class="pane__head pane__head--sub">
+        <h2 class="pane__title">Span</h2>
+      </div>
+      <div class="span">
+        <label class="field"><span>t₀</span><input id="t0" type="number" step="0.5" value="0"></label>
+        <label class="field"><span>t₁</span><input id="t1" type="number" step="0.5" value="20"></label>
+      </div>
+    </aside>
+
+    <section class="pane pane--plots">
+      <div class="plot plot--time">
+        <div class="plot__head">
+          <h2 class="pane__title">State vs time</h2>
+          <div class="legend" id="legend"></div>
+        </div>
+        <div class="plot__canvas"><canvas id="canvas-time"></canvas></div>
+      </div>
+
+      <div class="plot plot--phase" id="phase-wrap" hidden>
+        <div class="plot__head">
+          <h2 class="pane__title">Phase plane</h2>
+          <span class="pane__hint" id="phase-axes"></span>
+        </div>
+        <div class="plot__canvas"><canvas id="canvas-phase"></canvas></div>
+      </div>
+    </section>
+
+  </main>
+
+  <footer class="dock">
+    <button id="play" class="playbtn" type="button" aria-label="Play" title="Play / pause (space)">
+      <svg class="icon icon--play" viewBox="0 0 16 16" aria-hidden="true"><path d="M4.5 2.8v10.4L13 8z"/></svg>
+      <svg class="icon icon--pause" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 2.6h3v10.8H4zM9 2.6h3v10.8H9z"/></svg>
+    </button>
+
+    <div class="scrub">
+      <input id="scrub" class="scrub__input" type="range" min="0" max="1000" value="0" step="1"
+             aria-label="Time scrubber">
+      <div class="scrub__time"><span class="scrub__label">t</span><b id="tval">0.000</b></div>
+    </div>
+
+    <div class="readout" id="readout"></div>
+  </footer>
+
+</div>
+
+<script type="module" src="./main.js"></script>
+</body>
+</html>
