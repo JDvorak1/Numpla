@@ -11,6 +11,10 @@ Design rules:
 - **Nothing throws across the boundary.** Every call returns a value; problems
   are reported as diagnostics data. Half-typed input is a normal state, not an
   error — that is the gray-not-red rule, enforced at the API level.
+- **A solve always answers.** An integration that gives up part-way returns the
+  part it managed, not an error. `x' = x^2` blowing up at `t = 1` is the reason
+  someone typed it; a blank plot is never the right answer to it. See
+  "Runs that stop early".
 - **`numpla-wasm` holds no logic.** It marshals, and that is all.
 
 ## Document source format (v1)
@@ -104,6 +108,8 @@ impl Model {
     /// Integrate over [t0, t1] with the default method (Tsit5).
     /// Returns SolveReport as a JSON string.
     /// Safe to call when the document is invalid — reports ok: false.
+    /// A run that gives up part-way reports ok: true with tEnd < t1
+    /// and a `stopped` object — see "Runs that stop early".
     pub fn solve(&mut self, t0: f64, t1: f64) -> String;
 
     /// Integrate with a named method: "Tsit5" | "Verlet" | "Yoshida4",
@@ -117,10 +123,12 @@ impl Model {
 
     /// Uniformly sample the last solution: n points, flattened row-major as
     /// [t, y_0, .., y_{d-1}] repeated n times. Length = n * (dim + 1).
+    /// Spans [t0, tEnd] — what was integrated, not what was asked for.
     /// Empty if there is no solution.
     pub fn sample(&self, n: usize) -> Vec<f64>;
 
-    /// State at one time, length = dim. Clamped to the integrated span.
+    /// State at one time, length = dim. Clamped to the integrated span:
+    /// past tEnd it holds the last state reached, it never extrapolates.
     /// Empty if there is no solution.
     pub fn eval(&self, t: f64) -> Vec<f64>;
 
@@ -220,7 +228,9 @@ for — stays `"error"` and carries no `fix`.
 // SolveReport — returned by solve and solve_with
 {
   "ok": true,
-  "t0": 0.0, "t1": 20.0,
+  "t0": 0.0, "t1": 20.0,         // the window that was *asked for*
+  "tEnd": 20.0,                  // the window that was *integrated*
+                                 // `stopped` absent => tEnd === t1
   "dim": 2,
   "states": ["x", "y"],
   "accepted": 84, "rejected": 3, "rhsEvals": 522,
@@ -229,6 +239,78 @@ for — stays `"error"` and carries no `fix`.
   "error": null                  // else a human-readable string, ok: false
 }
 ```
+
+### Runs that stop early
+
+Added after v1. Backwards compatible in shape — `tEnd` is a new key and
+`stopped` is **absent entirely** on a run that reached `t1`, never `null` —
+but *not* in meaning: solves that used to come back `ok: false` on a blowup now
+come back `ok: true` with a shorter curve.
+
+```jsonc
+// x' = x^2, x(0) = 1, asked for [0, 5]. It exists only up to t = 1.
+{
+  "ok": true,                    // there is a curve, and it is the right curve
+  "t0": 0.0, "t1": 5.0,
+  "tEnd": 1.0000003,             // where it actually got
+  "stopped": {
+    "reason": "stepTooSmall",    // "stepTooSmall" | "nonFinite" | "tooManySteps"
+    "message": "stopped at t = 1 — the step size collapsed there; the system is
+                probably stiff, or heading for a singularity"
+  },
+  "dim": 1, "states": ["x"],
+  "accepted": 141, "rejected": 126, "rhsEvals": 1863,
+  "method": "Tsit5", "symplectic": false,
+  "error": null                  // `stopped` is not an error
+}
+```
+
+**What `ok` means.** *Is there a solution to draw* — not *did everything go
+well*. A run that blew up at `t = 1` produced a correct curve on `[0, 1]`, and
+that curve is the most interesting thing Numpla can put on screen, so it is
+`ok: true`. `ok: false` means **nothing was integrated at all** and
+`sample`/`eval` are empty: a document that will not compile, no ODE rows, a
+symplectic method asked of a first-order document, an unknown method name.
+
+| | `ok` | `error` | `stopped` | `tEnd` | `sample`/`eval` |
+|---|---|---|---|---|---|
+| covered the whole span | `true` | `null` | absent | `= t1` | the full curve |
+| gave up part-way | `true` | `null` | present | `< t1` | the curve so far |
+| never started | `false` | a sentence | absent | `= t0` | empty |
+
+| `reason` | what happened |
+|---|---|
+| `stepTooSmall` | the step size collapsed — stiffness, or a finite-time singularity |
+| `nonFinite` | the state stopped being a number — a blowup, or a NaN out of a row |
+| `tooManySteps` | the step budget ran out before the end of the window |
+
+**How a shell must present a partial run.**
+
+- **Draw it.** `sample(n)` spans `[t0, tEnd]`, so the curve simply ends where
+  the run did. Its last `t` equals `tEnd`; use that, not `t1`, for the plot's
+  right-hand edge or for a "how far along" readout.
+- **Never present it as complete.** The window the user asked for is `t1` and
+  the window they got is `tEnd`. Show the difference — the honest reading is a
+  marker at `tEnd` with the rest of the window left visibly empty, so the gap
+  between the curve's end and the window's end is the thing that says what
+  happened. Filling that gap, or rescaling the axis to `tEnd` so the curve
+  looks full-width, is exactly the lie this contract exists to prevent.
+- **Show `message` as a caption, not as an error.** It is a fact about the
+  model, phrased for a person and always naming where. Style it like the muted
+  `"pending"` severity rather than the red `"error"` one: nothing is broken, and
+  for `x' = x^2` the blowup is the answer.
+- **Do not blank anything on it.** The telemetry strip, the conservation
+  monitor and the scrubber all work on a partial solution, over the shorter
+  span. The rejected steps piling up near `tEnd` are the picture of the run
+  running out of road, which is the most instructive thing on screen.
+- **`eval(t)` past `tEnd` holds** the last state reached, for the whole
+  remainder of the window — it does not extrapolate. Dragging the scrubber into
+  the empty region is safe and gives a flat, finite reading, which reads
+  correctly as "nothing is known here".
+
+A caller that genuinely needs the whole span — a batch export, a convergence
+check — compares `stopped` against absent. There is no separate strict entry
+point; the distinction is a field, not a second API.
 
 ```jsonc
 // telemetry
@@ -390,6 +472,10 @@ For a well-resolved run they agree to several figures.
 | no row by that name | "there is no row called `Q` — write one, such as ..." |
 | the row cannot be evaluated | "`E` cannot be measured: ..." |
 
+A partial run is measurable like any other: the series spans `[t0, tEnd]`, so
+watching the energy of something on its way to blowing up is exactly the useful
+thing it looks like. Nothing here needs to know that the run stopped early.
+
 `conservation_series()` is empty whenever the last call failed, and any
 `set_source` or `solve` drops it — a drift curve outliving the trajectory it was
 measured on is the same bug as a stale sample.
@@ -406,6 +492,11 @@ measured on is the same bug as a stale sample.
 - `dt_max` is set internally from `t1 - t0` so a narrow feature cannot be
   stepped over — see `docs/solvers.md`.
 - `sample` is for drawing the whole curve; `eval` is for the scrubber playhead.
+  Both span `[t0, tEnd]`. Read `tEnd` from the report rather than assuming `t1`,
+  or a run that stopped early will be drawn as if it covered the window.
+- A `stopped` run is not a failed one. Draw its curve, caption it with
+  `stopped.message` in the muted style, and leave the rest of the window empty
+  so the shortfall is visible.
 - Build the mode slider from `Model.methods()` rather than from a hard-coded
   list, so a method added to `numpla-ode` reaches the UI without a second edit.
 - Dragging the slider is `solve_with` again over the same window, then a

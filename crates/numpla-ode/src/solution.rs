@@ -154,6 +154,47 @@ pub struct Telemetry {
     pub steps: Vec<StepRecord>,
 }
 
+/// Why the numerics gave up before reaching the requested end time.
+///
+/// These are *not* errors, and that is the product decision this type exists to
+/// encode. `x' = x^2` from `x(0) = 1` escapes to infinity at `t = 1`; the rise
+/// up to that point is correct, it is the most interesting thing on the screen,
+/// and throwing it away to return an error would leave someone exploring a
+/// blowup staring at a blank plot. So a stopped integration still yields a
+/// [`Solution`] — one that simply covers less time than was asked for — and
+/// this says why. [`Solution::t_end`] says how far it got.
+///
+/// What is *not* here is as important as what is: a dimension mismatch or a
+/// nonsensical step request is a programming error with no partial answer to
+/// keep, and stays a [`crate::SolveError`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum StopReason {
+    /// The step size fell below `Opts::dt_min`. Almost always stiffness, or the
+    /// approach to a finite-time singularity. The telemetry says where the
+    /// steps started shrinking, which is the interesting part.
+    StepTooSmall {
+        /// The step the controller was asking for when it gave up.
+        dt: f64,
+    },
+    /// The state stopped being a number. A true blowup, or a right-hand side
+    /// that produced NaN — division by zero, a square root of a negative.
+    NonFinite,
+    /// `Opts::max_steps` attempts were spent without reaching the end.
+    TooManySteps,
+}
+
+impl std::fmt::Display for StopReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StopReason::StepTooSmall { dt } => {
+                write!(f, "the step size collapsed to {}", dt)
+            }
+            StopReason::NonFinite => f.write_str("the state stopped being finite"),
+            StopReason::TooManySteps => f.write_str("the step budget ran out"),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Solution {
     pub steps: Vec<Step>,
@@ -161,12 +202,41 @@ pub struct Solution {
     /// State at the final time. Kept explicitly so the last step's endpoint is
     /// exact rather than interpolated.
     pub y_end: Vec<f64>,
+    /// How far the integration actually got. Equal to the requested `t1` when
+    /// [`Solution::stopped`] is `None`, and short of it otherwise.
     pub t_end: f64,
+    /// `None` when the whole requested span was covered; otherwise why the
+    /// integration ended at [`Solution::t_end`] instead.
+    ///
+    /// A field rather than a wrapper type because every consumer downstream —
+    /// the plotter, the scrubber, the conservation monitor — wants the curve
+    /// either way and only the reporting layer needs the distinction. What the
+    /// field must never do is go unnoticed by *that* layer, which is what
+    /// [`Solution::require_complete`] is for.
+    pub stopped: Option<StopReason>,
 }
 
 impl Solution {
     pub fn t_start(&self) -> f64 {
         self.steps.first().map(|s| s.t).unwrap_or(self.t_end)
+    }
+
+    /// Did the integration cover the whole span it was asked for?
+    pub fn is_complete(&self) -> bool {
+        self.stopped.is_none()
+    }
+
+    /// The strict path, for a caller that genuinely needs the whole span —
+    /// a convergence study, a batch job, a test pinning an exact endpoint.
+    ///
+    /// Exploration wants the partial curve; verification wants an error. Both
+    /// are legitimate, so the distinction is kept and made cheap to act on
+    /// rather than erased in favour of either one.
+    pub fn require_complete(self) -> Result<Solution, StopReason> {
+        match self.stopped {
+            Some(reason) => Err(reason),
+            None => Ok(self),
+        }
     }
 
     pub fn dim(&self) -> usize {
@@ -176,6 +246,14 @@ impl Solution {
     /// Evaluate at any `t`. Outside the integrated span the nearest endpoint is
     /// returned rather than extrapolating — a scrubber dragged past the end
     /// should hold, not fly off.
+    ///
+    /// This matters most for a run that [`stopped`](Solution::stopped) early.
+    /// The span here is what was *integrated*, not what was asked for, so a
+    /// blowup at `t = 1` over a window of `[0, 5]` holds its last finite value
+    /// across the remaining four units rather than extrapolating a fifth-order
+    /// polynomial out of a singularity — which would draw a confident, huge and
+    /// entirely fictional curve. Holding is visibly flat, which reads correctly
+    /// as "nothing is known here".
     pub fn eval_into(&self, t: f64, out: &mut [f64]) {
         if self.steps.is_empty() {
             out.copy_from_slice(&self.y_end);

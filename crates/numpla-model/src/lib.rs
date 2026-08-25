@@ -12,7 +12,15 @@
 //!    muted; only genuinely broken rows go red.
 //! 3. **A solution is a function of `t`.** Sampling and scrubbing both read the
 //!    dense output rather than a stored point list.
-//! 4. **The method is the user's choice, and the report says which one ran.**
+//! 4. **A run that gives up still draws.** `x' = x^2` escapes to infinity at
+//!    `t = 1`; the rise into that is the interesting part of the model and not
+//!    a reason for a blank screen. So an integration the numerics abandoned
+//!    reports [`ok: true`](SolveReport::ok) with a curve over the span it
+//!    managed, plus [`stopped`](SolveReport::stopped) saying how far it got and
+//!    why it went no further. `ok: false` is reserved for having produced
+//!    *nothing*. Partial is never presented as complete, and incomplete is
+//!    never presented as nothing.
+//! 5. **The method is the user's choice, and the report says which one ran.**
 //!    No fixed-step integrator preserves the symplectic form, momentum and
 //!    energy at once (Ge–Marsden, `docs/solvers.md`); which one a method gives
 //!    up is the most useful thing a long run can teach, so swapping integrators
@@ -26,14 +34,16 @@ pub mod system;
 pub use document::{Derived, Document, StateRhs};
 pub use report::{
     ConservationReport, Diagnostics, Drift, Fix, Issue, MethodJson, MethodsJson, Severity,
-    SolveReport, StepJson, TelemetryJson,
+    SolveReport, StepJson, StopKind, Stopped, TelemetryJson,
 };
 pub use system::ModelSystem;
 
 /// Re-exported so that choosing a method costs a caller nothing but this crate.
 pub use numpla_ode::Method;
 
-use numpla_ode::{solve, solve_with as solve_second_order, Opts, Paired, SolveError, Solution};
+use numpla_ode::{
+    solve, solve_with as solve_second_order, Opts, Paired, SolveError, Solution, StopReason,
+};
 
 /// How many steps the solver is forced to take, at minimum, across the
 /// requested span.
@@ -106,7 +116,9 @@ impl Model {
 
     /// Integrate over `[t0, t1]` with the default method. Safe to call on a
     /// document that cannot be integrated — that comes back as `ok: false` with
-    /// a sentence saying why.
+    /// a sentence saying why — and safe to call on one that *misbehaves*, which
+    /// comes back as `ok: true` over a shorter window with
+    /// [`SolveReport::stopped`] saying where it gave up.
     pub fn solve(&mut self, t0: f64, t1: f64) -> SolveReport {
         self.solve_with(t0, t1, Method::Tsit5)
     }
@@ -129,6 +141,19 @@ impl Model {
     /// be checked by the type system on the Rust side. One argument, one
     /// answer, and the report echoes what ran.
     ///
+    /// # When the numerics give up part-way
+    ///
+    /// That is not a failure of this call. The steps that were taken are kept,
+    /// [`SolveReport::t_end`] says how far they reached, and
+    /// [`SolveReport::stopped`] says why they stopped — `ok` stays true,
+    /// because there is a curve to draw and it is the curve the person asked
+    /// for, just shorter. The blowup is usually the thing they were looking at.
+    ///
+    /// A right-hand side that could not be *evaluated* is different and still
+    /// fails the whole solve: the integrator carried on past it with a
+    /// substituted zero, so everything after that point is fiction rather than
+    /// a shorter truth, and there is no honest place to cut the curve.
+    ///
     /// # When the document has no second-order structure
     ///
     /// A symplectic method needs to know which states are positions and which
@@ -150,6 +175,10 @@ impl Model {
             ok: false,
             t0,
             t1,
+            // Nothing ran, so the integrated window is empty. Reporting `t1`
+            // here would claim a span that was never touched.
+            t_end: t0,
+            stopped: None,
             dim,
             states: states.clone(),
             accepted: 0,
@@ -232,12 +261,25 @@ impl Model {
                     return fail(message);
                 }
                 let telemetry = solution.telemetry.clone();
+                // A run that gave up part-way is still `ok`. It produced a real
+                // curve over `[t0, t_end]`, and for `x' = x^2` that curve *is*
+                // the answer — the rise into the singularity is what someone
+                // typed the model to see. `ok` therefore means "there is
+                // something to draw", and `stopped` carries the rest, so the
+                // shell can render the curve and the sentence together instead
+                // of choosing between a plot and an explanation.
+                let stopped = solution
+                    .stopped
+                    .map(|reason| describe_stop(reason, solution.t_end));
+                let t_end = solution.t_end;
                 self.solution = Some(solution);
                 self.method = Some(method);
                 SolveReport {
                     ok: true,
                     t0,
                     t1,
+                    t_end,
+                    stopped,
                     dim,
                     states,
                     accepted: telemetry.accepted,
@@ -268,6 +310,8 @@ impl Model {
                 ok: false,
                 t0,
                 t1,
+                t_end: t0,
+                stopped: None,
                 dim: self.doc.dim(),
                 states: self.doc.states.clone(),
                 accepted: 0,
@@ -301,6 +345,11 @@ impl Model {
     /// Uniformly sample the last solution: `n` points, flattened row-major as
     /// `[t, y_0, .., y_{d-1}]`. Empty when there is nothing solved.
     ///
+    /// The samples span what was **integrated**, not what was requested, so a
+    /// run that stopped early draws a curve that ends where the run did rather
+    /// than a flat tail across the rest of the window pretending to be physics.
+    /// The last `t` here equals [`SolveReport::t_end`].
+    ///
     /// Flat and preallocated because this crosses into JS as one
     /// `Float64Array`; a point-per-allocation shape would dominate the cost of
     /// drawing a curve.
@@ -330,6 +379,11 @@ impl Model {
 
     /// State at one time — the scrubber playhead. Clamped to the integrated
     /// span rather than extrapolated.
+    ///
+    /// After a run that stopped early this holds the last state it reached for
+    /// the whole remainder of the requested window. Holding reads as "nothing
+    /// is known here"; extrapolating a fifth-order polynomial out of a
+    /// singularity would read as a confident answer and be fiction.
     pub fn eval(&self, t: f64) -> Vec<f64> {
         match &self.solution {
             Some(sol) => sol.eval(t),
@@ -481,25 +535,70 @@ fn step_cap(t0: f64, t1: f64) -> f64 {
     }
 }
 
-/// Solver failures, phrased as what happened to the model rather than as what
-/// happened to the integrator. Stiffness is the usual cause and saying so is
-/// more use than reporting a step size.
+/// An early stop, phrased as what happened to the *model* rather than to the
+/// integrator, and always naming where — because "it blew up" is only half an
+/// answer and "it blew up at t = 1" is the whole one.
+///
+/// These sentences sit beside a curve that is still on screen, so they read as
+/// a caption for it, not as an apology. The diagnosis goes here rather than in
+/// [`StopKind`] so that a shell never has to translate a machine token into
+/// English of its own.
+fn describe_stop(reason: StopReason, t_end: f64) -> Stopped {
+    let (kind, message) = match reason {
+        StopReason::StepTooSmall { .. } => (
+            StopKind::StepTooSmall,
+            format!(
+                "stopped at t = {} — the step size collapsed there; the system is probably stiff, or heading for a singularity",
+                fmt_t(t_end)
+            ),
+        ),
+        StopReason::NonFinite => (
+            StopKind::NonFinite,
+            format!(
+                "stopped at t = {} — the solution stopped being a number there; it blew up",
+                fmt_t(t_end)
+            ),
+        ),
+        StopReason::TooManySteps => (
+            StopKind::TooManySteps,
+            format!(
+                "stopped at t = {} — the step budget ran out before the end of the window",
+                fmt_t(t_end)
+            ),
+        ),
+    };
+    Stopped {
+        reason: kind,
+        message,
+    }
+}
+
+/// A time as a person would read it in a sentence. Six significant figures is
+/// more than enough to point at a feature on a plot, and the full seventeen
+/// digits of an `f64` in the middle of a caption is noise.
+fn fmt_t(t: f64) -> String {
+    let s = format!("{:.6}", t);
+    let s = s.trim_end_matches('0').trim_end_matches('.');
+    if s.is_empty() || s == "-" {
+        "0".to_string()
+    } else {
+        s.to_string()
+    }
+}
+
+/// The failures that leave nothing to draw. Both are programming errors — this
+/// crate builds the system and the initial vector itself, so reaching either
+/// one means something upstream is wrong, and saying so is more useful than
+/// pretending it is a modelling mistake.
 fn describe_solve_error(e: &SolveError) -> String {
     match e {
-        SolveError::StepTooSmall { t, .. } => format!(
-            "the step size collapsed near t = {} — the system is probably stiff there",
-            t
-        ),
-        SolveError::TooManySteps { t } => {
-            format!("gave up after too many steps near t = {}", t)
-        }
-        SolveError::NonFinite { t } => {
-            format!("the solution stopped being finite near t = {} — it blew up", t)
-        }
         SolveError::DimensionMismatch { expected, got } => format!(
             "internal error: the system has {} states but {} initial values",
             expected, got
         ),
+        SolveError::InvalidStep { dt } => {
+            format!("internal error: {} is not a usable step size", dt)
+        }
     }
 }
 
@@ -1034,14 +1133,136 @@ mod tests {
         assert!(r.error.unwrap().contains("no ODE rows"));
     }
 
+    /// The change this whole contract exists for. `x' = x^2` from `x(0) = 1`
+    /// has the closed form `1 / (1 - t)` and escapes at `t = 1`; asked for five
+    /// units of time it can only give one, and the one it gives is the curve
+    /// somebody typed the model to see.
     #[test]
-    fn a_blow_up_is_reported_not_returned_as_numbers() {
-        // x' = x^2 escapes to infinity at t = 1.
+    fn a_blow_up_still_draws_the_part_that_worked() {
         let mut m = Model::new();
         m.set_source("x' = x^2\nx(0) = 1");
-        let r = m.solve(0.0, 2.0);
+        let r = m.solve(0.0, 5.0);
+
+        // There is a solution, so `ok`. It is not the whole span, so `stopped`.
+        assert!(r.ok, "{:?}", r.error);
+        assert!(r.error.is_none());
+        let stopped = r.stopped.as_ref().expect("a blowup must say it stopped");
+        assert_eq!(stopped.reason, StopKind::StepTooSmall);
+        assert!(
+            stopped.message.contains("stopped at t = 1"),
+            "{}",
+            stopped.message
+        );
+
+        assert_eq!(r.t1, 5.0, "the window asked for is reported unchanged");
+        assert!((r.t_end - 1.0).abs() < 1e-3, "reached t = {}", r.t_end);
+
+        // And there is a real curve, right to the closed form.
+        let s = m.sample(200);
+        assert_eq!(s.len(), 400);
+        for row in s.chunks(2) {
+            let (t, x) = (row[0], row[1]);
+            if t > 0.99 {
+                continue; // the last hundredth is where the pole is
+            }
+            let want = 1.0 / (1.0 - t);
+            assert!(
+                (x - want).abs() < 1e-3 * want,
+                "at t = {}: {} vs {}",
+                t,
+                x,
+                want
+            );
+        }
+        // The samples stop where the integration did, so the plot's right-hand
+        // edge and `tEnd` are the same fact.
+        assert!((s[s.len() - 2] - r.t_end).abs() < 1e-12);
+    }
+
+    /// Past the point it reached, the scrubber holds. Extrapolating out of a
+    /// singularity would draw four units of confident fiction.
+    #[test]
+    fn scrubbing_past_a_blow_up_holds_the_last_real_state() {
+        let mut m = Model::new();
+        m.set_source("x' = x^2\nx(0) = 1");
+        let r = m.solve(0.0, 5.0);
+        let last = m.eval(r.t_end)[0];
+        assert!(last.is_finite());
+        for t in [r.t_end + 1e-9, 2.0, 5.0, 1e6] {
+            assert_eq!(m.eval(t)[0], last, "at t = {}", t);
+        }
+    }
+
+    /// A row that stops being a number part-way. `sqrt(x)` is fine while `x`
+    /// is positive and NaN the moment it is not, and `x` is falling.
+    #[test]
+    fn a_nan_right_hand_side_is_a_short_run_not_a_blank_screen() {
+        let mut m = Model::new();
+        m.set_source("x' = -1\nx(0) = 1\ny' = sqrt(x)\ny(0) = 0");
+        let r = m.solve(0.0, 3.0);
+        assert!(r.ok, "{:?}", r.error);
+        let stopped = r.stopped.as_ref().expect("NaN must be reported");
+        assert_eq!(stopped.reason, StopKind::NonFinite);
+        assert!(stopped.message.contains("blew up"), "{}", stopped.message);
+        assert!(r.t_end > 0.5 && r.t_end <= 1.0, "reached t = {}", r.t_end);
+        // Nothing that reaches the plotter is NaN.
+        assert!(m.sample(300).iter().all(|v| v.is_finite()));
+    }
+
+    /// A run that could not start at all is a different answer from a run that
+    /// started and stopped, and the two must not be confused: `ok: false` means
+    /// there is nothing to draw, and it never carries a `stopped`.
+    #[test]
+    fn a_refused_solve_reports_no_span_and_no_stop_reason() {
+        let mut m = Model::new();
+        m.set_source("x' = q");
+        let r = m.solve(2.0, 9.0);
         assert!(!r.ok);
-        assert!(r.error.is_some());
+        assert!(r.stopped.is_none());
+        assert_eq!(r.t_end, 2.0, "nothing was integrated, so no span was covered");
+        assert!(m.sample(10).is_empty());
+    }
+
+    /// Every stop gets a sentence that names where it happened, because "it
+    /// blew up" is half an answer and "it blew up at t = 1" is the whole one.
+    #[test]
+    fn every_stop_reason_gets_a_sentence_that_says_where() {
+        let cases = [
+            (
+                StopReason::StepTooSmall { dt: 1e-14 },
+                StopKind::StepTooSmall,
+                "stiff",
+            ),
+            (StopReason::NonFinite, StopKind::NonFinite, "blew up"),
+            (StopReason::TooManySteps, StopKind::TooManySteps, "budget"),
+        ];
+        for (reason, kind, needle) in cases {
+            let s = describe_stop(reason, 1.9997);
+            assert_eq!(s.reason, kind);
+            assert!(s.message.contains(needle), "{:?}: {}", kind, s.message);
+            assert!(
+                s.message.contains("t = 1.9997"),
+                "{:?} must say where: {}",
+                kind,
+                s.message
+            );
+        }
+        // Six figures is enough to point at a feature; seventeen is noise.
+        assert_eq!(fmt_t(1.000_000_346_123_815_8), "1");
+        assert_eq!(fmt_t(0.0), "0");
+        assert_eq!(fmt_t(-2.5), "-2.5");
+    }
+
+    /// The strict distinction survives the trip through the model: a complete
+    /// run and a partial one are told apart by a field, not by inference from
+    /// `t_end` against a float comparison.
+    #[test]
+    fn a_complete_run_carries_no_stop_reason() {
+        let mut m = Model::new();
+        m.set_source("x' = -x\nx(0) = 1");
+        let r = m.solve(0.0, 5.0);
+        assert!(r.ok && r.stopped.is_none());
+        assert_eq!(r.t_end, r.t1);
     }
 
     #[test]
@@ -1485,10 +1706,39 @@ mod tests {
         assert!(json.contains("\"ok\":true"), "{}", json);
         assert!(json.contains("\"t0\":0.0"), "{}", json);
         assert!(json.contains("\"t1\":20.0"), "{}", json);
+        assert!(json.contains("\"tEnd\":20.0"), "{}", json);
         assert!(json.contains("\"dim\":2"), "{}", json);
         assert!(json.contains("\"states\":[\"x\",\"y\"]"), "{}", json);
         assert!(json.contains("\"rhsEvals\":"), "{}", json);
         assert!(json.contains("\"error\":null"), "{}", json);
+        // A run that reached the end says nothing about stopping — the key is
+        // absent, not null, so `if (report.stopped)` is the whole check.
+        assert!(!json.contains("\"stopped\""), "{}", json);
+    }
+
+    /// The partial run, on the wire. This is what a shell draws a curve and a
+    /// caption from.
+    #[test]
+    fn a_partial_run_reaches_the_wire_as_ok_with_a_reason() {
+        let mut m = Model::new();
+        m.set_source("x' = x^2\nx(0) = 1");
+        let json = m.solve_json(0.0, 5.0);
+        assert!(json.contains("\"ok\":true"), "{}", json);
+        assert!(json.contains("\"t1\":5.0"), "{}", json);
+        assert!(json.contains("\"error\":null"), "{}", json);
+        assert!(json.contains("\"tEnd\":1.000"), "{}", json);
+        assert!(
+            json.contains("\"stopped\":{\"reason\":\"stepTooSmall\",\"message\":\"stopped at t = 1"),
+            "{}",
+            json
+        );
+
+        // And a refused solve carries neither.
+        m.set_source("x' = q");
+        let json = m.solve_json(0.0, 5.0);
+        assert!(json.contains("\"ok\":false"), "{}", json);
+        assert!(!json.contains("\"stopped\""), "{}", json);
+        assert!(json.contains("\"tEnd\":0.0"), "{}", json);
     }
 
     #[test]

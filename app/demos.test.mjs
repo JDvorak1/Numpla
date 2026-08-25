@@ -355,6 +355,59 @@ const PHYSICS = {
     ok(tsit5 > 2 * verlet, `the contrast is the demo: ${tsit5} vs ${verlet}`);
   },
 
+  'stiff-string': (demo) => {
+    // The claim is about the SPECTRUM, so measure the spectrum. For a linear
+    // chain the modes are independent, so starting it in a single mode shape
+    // makes the motion a single frequency, which zero-crossings measure
+    // directly. Mode m of a simply-supported chain of six is sin(pi*m*i/7).
+    const shape = (m) => [1, 2, 3, 4, 5, 6].map((i) => Math.sin((Math.PI * m * i) / 7));
+
+    // Rewrite every position IC in one pass. Matching row by row was fragile;
+    // one multiline pass over `x_i(0) = ...` cannot half-apply.
+    const inMode = (src, m) => {
+      const v = shape(m);
+      return setParam(src, 'c', 0).replace(
+        /^(\s*)x_(\d)\(0\) = .*$/gm,
+        (_line, pad, i) => `${pad}x_${i}(0) = ${v[Number(i) - 1].toFixed(6)}`
+      );
+    };
+
+    // Frequency from zero crossings of the middle bead over a fixed window.
+    const freq = (src) => {
+      const { t, col } = run(src, [0, 12], 12000);
+      const y = col('x_3');
+      let crossings = 0;
+      for (let i = 1; i < y.length; i++) if ((y[i - 1] < 0) !== (y[i] < 0)) crossings++;
+      return crossings / (2 * (t[t.length - 1] - t[0]));
+    };
+
+    const ratioAt = (stiffness) => {
+      const src = setParam(demo.source, 's', stiffness);
+      const f1 = freq(inMode(src, 1));
+      const f2 = freq(inMode(src, 2));
+      ok(f1 > 0 && f2 > 0, `no oscillation at s=${stiffness}: ${f1}, ${f2}`);
+      return f2 / f1;
+    };
+
+    // With no bending stiffness the chain is an ordinary string: its overtones
+    // are (near enough) whole multiples of the fundamental.
+    const harmonic = ratioAt(0);
+    ok(Math.abs(harmonic - 2) < 0.12,
+       `without stiffness the second partial should be about twice the first, got ${harmonic}`);
+
+    // Add stiffness and the partials spread. This is the whole demo, and it
+    // comes out of the equation rather than being dialled in.
+    const stiff = ratioAt(40);
+    ok(stiff > harmonic + 0.15,
+       `stiffness should stretch the partials: ${harmonic} -> ${stiff}`);
+
+    // And it is a real string, not a blow-up: bounded, and it rings.
+    const { col } = run(demo.source, demo.tSpan);
+    const mid = col('x_3');
+    ok(mid.every((v) => Number.isFinite(v) && Math.abs(v) < 10), 'the string must stay bounded');
+    ok(maxAbs(slice(mid, 0.6, 1)) > 0.05, 'it should still be ringing late in the window');
+  },
+
   'harmonic-oscillator': (demo) => {
     // Undamped by default, so energy is exactly conserved. Anything that
     // drifts here is the integrator leaking, not the model.

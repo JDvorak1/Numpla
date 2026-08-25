@@ -116,13 +116,71 @@ pub struct Diagnostics {
     pub issues: Vec<Issue>,
 }
 
+/// Why an integration ended before it reached `t1`.
+///
+/// The spelling mirrors [`numpla_ode::StopReason`] exactly so the two cannot
+/// drift apart; the diagnosis ("probably stiff") lives in
+/// [`Stopped::message`], where a person reads it, rather than in a machine
+/// token a shell would have to interpret.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum StopKind {
+    /// The step size collapsed. Stiffness, or a finite-time singularity.
+    StepTooSmall,
+    /// The state stopped being a number — a blowup, or a NaN out of a row.
+    NonFinite,
+    /// The step budget ran out before the end of the window.
+    TooManySteps,
+}
+
+/// A run that produced a curve but not the whole one.
+///
+/// Present on a report whose `ok` is **true**: the solution is real and
+/// drawable, it just covers `[t0, tEnd]` instead of `[t0, t1]`. Absent entirely
+/// when the run reached `t1`, so a shell that checks for it cannot be told a
+/// half-run is whole.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Stopped {
+    pub reason: StopKind,
+    /// A sentence a person can act on, phrased as what happened to *their
+    /// model* rather than to the integrator: "it blew up", not "NonFinite".
+    pub message: String,
+}
+
 /// What `solve` answers with.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SolveReport {
+    /// Is there a solution to draw?
+    ///
+    /// **Not** "did everything go well". A run that blew up at `t = 1` over a
+    /// window of `[0, 5]` produced a correct curve on `[0, 1]`, and that curve
+    /// is the most interesting thing Numpla could put on the screen — so it is
+    /// `ok: true`, with `stopped` saying it went no further. `ok: false` means
+    /// something else: **nothing was integrated at all** and `sample`/`eval`
+    /// are empty. A document that will not compile, no ODE rows, a symplectic
+    /// method asked of a first-order document, an unknown method name.
+    ///
+    /// The rule the two fields enforce together: partial is never presented as
+    /// complete, and incomplete is never presented as nothing.
     pub ok: bool,
     pub t0: f64,
+    /// The end of the window that was *asked for*.
     pub t1: f64,
+    /// The end of the window that was actually *integrated*.
+    ///
+    /// Equal to `t1` when `stopped` is absent, and short of it otherwise. This
+    /// is the "where" of an early stop, and it is the right-hand edge of every
+    /// curve `sample` returns. Equal to `t0` in the rare case where the very
+    /// first step failed — a real answer, about a span of zero width.
+    pub t_end: f64,
+    /// Why the run ended early, or absent if it did not.
+    ///
+    /// Omitted rather than `null` when the run completed, matching how `fix`
+    /// works on an [`Issue`]: a key that is only ever present when it has
+    /// something to say.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stopped: Option<Stopped>,
     pub dim: usize,
     pub states: Vec<String>,
     pub accepted: usize,
@@ -133,7 +191,9 @@ pub struct SolveReport {
     /// On the wire so that a UI showing a method name can never show one the
     /// run did not use. When `ok` is false nothing was integrated and this
     /// echoes the method that was asked for — including a name that is not a
-    /// method at all, which is exactly the case the shell needs to see.
+    /// method at all, which is exactly the case the shell needs to see. A run
+    /// that stopped early still names the method that produced the part of the
+    /// curve there is.
     pub method: String,
     /// Did this run actually preserve the symplectic form?
     ///
@@ -146,7 +206,9 @@ pub struct SolveReport {
     /// mentions `x'`. The conservation monitor uses this to say what to expect
     /// before the drift has had time to show.
     pub symplectic: bool,
-    /// `None` when `ok`; otherwise a sentence a person can act on.
+    /// `None` when there is a solution; otherwise a sentence a person can act
+    /// on. Never set for a run that merely stopped early — that is `stopped`,
+    /// and conflating the two would turn a usable curve into a red row.
     pub error: Option<String>,
 }
 

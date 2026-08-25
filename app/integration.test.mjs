@@ -147,6 +147,42 @@ ok('zooming in narrows it',
 ok('the model really integrated the new span', !/error|failed/i.test($('stat-solve').textContent),
    `status: ${$('stat-solve').textContent}`);
 
+// Zooming in must redraw at full resolution IMMEDIATELY, not after the
+// re-solve. `sample(n)` spreads its points over the whole solved span, so a
+// tenfold zoom leaves a tenth of them on screen stretched across the full
+// width, which draws a visibly polygonal line. The dense output already
+// answers inside the solved span, so the curve is re-sampled per pixel on
+// every frame change and only a window reaching OUTSIDE it needs a re-solve.
+{
+  const inspect = globalThis.__numplaInspect;
+  const drawnSpan = () => {
+    const f = inspect && inspect.frame();
+    if (!f || !f.n || !f.dim) return null;
+    const stride = f.dim + 1;
+    return [f.data[0], f.data[(f.n - 1) * stride]];
+  };
+  const drawnCount = () => {
+    const f = inspect && inspect.frame();
+    return f && f.n ? f.n : 0;
+  };
+
+  click($('frame-reset'));
+  await settleSolve();
+  const wideSpan = spanOf();
+
+  wheel(200, 30, -900);          // a hard zoom on the horizontal axis
+  await settle(3);               // deliberately LESS than the 180ms debounce
+  const drawn = drawnSpan();
+  ok('the curve is redrawn across the new window before any re-solve',
+     drawn !== null && (drawn[1] - drawn[0]) < 0.6 * (wideSpan[1] - wideSpan[0]),
+     `window ${JSON.stringify(spanOf())} but curve covers ${JSON.stringify(drawn)}`);
+  ok('and at full sample density', drawnCount() >= 240,
+     `${drawnCount()} samples`);
+
+  click($('frame-reset'));
+  await settleSolve();
+}
+
 // A y-axis gesture is not a statement about time: no re-solve.
 const spanBeforeY = spanOf();
 wheel(20, 10, -300);             // over the y labels
@@ -424,6 +460,36 @@ if ($('info-btn')) {
 // ---------------------------------------------------------------------------
 // Hear — the least-tested seam, and it must degrade gracefully with no audio
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// A blowup is a curve, not a failure
+// ---------------------------------------------------------------------------
+
+{
+  // x' = x^2 with x(0) = 1 has an exact singularity at t = 1. Asking for [0, 5]
+  // used to leave a blank plot; it should draw the part that exists and say
+  // where it stopped.
+  const inspect = globalThis.__numplaInspect;
+  click($('frame-reset'));
+  await settleSolve();
+  inspect.setDocument(["x' = x^2", 'x(0) = 1'].join('\n'));
+  await settleSolve();
+
+  const badge = $('stat-solve');
+  const f = inspect.frame();
+  const drewSomething = !!(f && f.n > 1);
+  ok('a blowup still draws the part that worked', drewSomething,
+     `frame: ${f ? f.n + ' samples' : 'null'} · badge: ${badge.textContent}`);
+  if (drewSomething) {
+    ok('the curve stops where the integration did, short of the window',
+       f.t1 < inspect.window().x1 - 1e-9,
+       `curve ends ${f.t1}, window ends ${inspect.window().x1}`);
+    ok('and it says where it stopped', /stopped at t/.test(badge.textContent + badge.title),
+       `badge: ${badge.textContent}`);
+    ok('a partial run is not styled as an error', !badge.classList.contains('is-bad'),
+       badge.classList.value);
+  }
+}
 
 const hearBtn = $('hear-btn');
 ok('the hear control exists', !!hearBtn);

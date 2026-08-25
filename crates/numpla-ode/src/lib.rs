@@ -12,7 +12,15 @@
 //! stiffness available. In the same spirit, [`measure`] evaluates any invariant
 //! along a solution and reports how far the method let it drift.
 //!
-//! Third rule: **the method is a choice, and the choice is visible.** No
+//! Third rule: **a solve always answers.** Numpla is an exploration tool, and
+//! `x' = x^2` blowing up at `t = 1` is the interesting part of that model, not a
+//! reason to show a blank screen. So an integration that gives up part-way
+//! returns the steps it did take, with [`Solution::t_end`] saying how far it got
+//! and [`Solution::stopped`] saying why; [`SolveError`] is reserved for a call
+//! that never made sense, and [`Solution::require_complete`] is there for a
+//! caller that genuinely needs the whole span.
+//!
+//! Fourth rule: **the method is a choice, and the choice is visible.** No
 //! fixed-step integrator can preserve the symplectic form, momentum, and energy
 //! at once (Ge-Marsden); which of the three a method sacrifices is the most
 //! useful thing a long run can teach. So [`Method`] selects between an adaptive
@@ -48,7 +56,7 @@ pub mod tsit5;
 
 pub use conserve::{measure, Conservation};
 pub use method::{solve_with, Method};
-pub use solution::{Solution, Step, StepRecord, Telemetry};
+pub use solution::{Solution, StopReason, Step, StepRecord, Telemetry};
 pub use symplectic::{solve_verlet, solve_yoshida4};
 pub use system::{
     Accel, AccelFn, Field, Lowered, Paired, SecondOrderSystem, StructureError, System,

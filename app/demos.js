@@ -97,6 +97,50 @@ export const DEMOS = [
   },
 
   {
+    id: 'stiff-string',
+    title: 'Stiff string, or a bell',
+    // Six beads is one string; watch the one in the middle.
+    show: ['x_3'],
+    blurb:
+      'A real string resists being bent, and that one extra term is why a piano is stretch-tuned. At s = 0 the overtones are whole multiples of the fundamental and it sounds like a string; wind s up and they spread apart, the partials stop lining up, and it turns into a bell. Nothing here adds overtones by hand — they are whatever the equation says they are.',
+    source: doc(`
+      k = 60
+      s = 0
+      c = 0.05
+      q = 1
+
+      x_1'' = k(x_2 - 2x_1) - s(5x_1 - 4x_2 + x_3) - c x_1'
+      x_2'' = k(x_3 - 2x_2 + x_1) - s(-4x_1 + 6x_2 - 4x_3 + x_4) - c x_2'
+      x_3'' = k(x_4 - 2x_3 + x_2) - s(x_1 - 4x_2 + 6x_3 - 4x_4 + x_5) - c x_3'
+      x_4'' = k(x_5 - 2x_4 + x_3) - s(x_2 - 4x_3 + 6x_4 - 4x_5 + x_6) - c x_4'
+      x_5'' = k(x_6 - 2x_5 + x_4) - s(x_3 - 4x_4 + 6x_5 - 4x_6) - c x_5'
+      x_6'' = k(-2x_6 + x_5) - s(x_4 - 4x_5 + 5x_6) - c x_6'
+
+      x_1(0) = 0.33q
+      x_2(0) = 0.67q
+      x_3(0) = q
+      x_4(0) = 0.8q
+      x_5(0) = 0.53q
+      x_6(0) = 0.27q
+
+      x_1'(0) = 0
+      x_2'(0) = 0
+      x_3'(0) = 0
+      x_4'(0) = 0
+      x_5'(0) = 0
+      x_6'(0) = 0
+    `),
+    tSpan: [0, 12],
+    knobs: [
+      { name: 's', min: 0, max: 40, step: 0.1, value: 0, label: 'bending stiffness' },
+      { name: 'k', min: 10, max: 200, step: 1, value: 60, label: 'tension' },
+      { name: 'c', min: 0, max: 1, step: 0.01, value: 0.05, label: 'damping' },
+    ],
+    audio: true,
+    tags: ['waves', 'inharmonic', 'timbre', 'coupling'],
+  },
+
+  {
     id: 'colliding-strings',
     // Twelve states, but the thing being shown is two strings. Draw the middle
     // bead of each; the rest are still solved, they are just not the picture.

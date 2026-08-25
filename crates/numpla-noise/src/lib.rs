@@ -234,7 +234,7 @@ mod distribution {
 #[cfg(test)]
 mod integration {
     use super::*;
-    use numpla_ode::{solve, Field, Opts, SolveError};
+    use numpla_ode::{solve, Field, Opts, StopReason};
 
     /// `x' = -x + 0.5*smooth(t)`: a first-order lag driven by noise, the
     /// smallest model anyone would actually write. It has to integrate the way
@@ -294,9 +294,11 @@ mod integration {
     /// a rule. Same equation, same tolerances, but the forcing is drawn fresh
     /// on every call instead of being a function of `t`. The error estimator
     /// now measures the disagreement between calls rather than the truncation
-    /// error, so no step size is ever small enough and the solve dies — with
-    /// `StepTooSmall` if it collapses fast, or `TooManySteps` after the
-    /// controller settles on a step far below anything the problem needs.
+    /// error, so no step size is ever small enough and the solve gives up —
+    /// with `StepTooSmall` if it collapses fast, or `TooManySteps` after the
+    /// controller settles on a step far below anything the problem needs. It
+    /// still hands back the sliver it managed, which is how every give-up
+    /// works now; what it never does is reach the end of the window.
     ///
     /// This is not a hypothetical hazard being documented; it is the failure
     /// mode a `rand()` builtin would ship.
@@ -312,15 +314,18 @@ mod integration {
             // only difference is that it is a function of the call, not of t.
             dy[0] = -y[0] + 0.5 * (2.0 * rand_at(7, n) - 1.0);
         });
-        let err = solve(&sys, (0.0, 50.0), &[0.0], &Opts::default()).unwrap_err();
+        // The solve still answers — a run that gives up hands back the part it
+        // managed — but it never reaches `t = 50`, and it says why.
+        let sol = solve(&sys, (0.0, 50.0), &[0.0], &Opts::default()).unwrap();
         assert!(
             matches!(
-                err,
-                SolveError::StepTooSmall { .. } | SolveError::TooManySteps { .. }
+                sol.stopped,
+                Some(StopReason::StepTooSmall { .. }) | Some(StopReason::TooManySteps)
             ),
             "expected the solve to collapse, got {:?}",
-            err
+            sol.stopped
         );
+        assert!(sol.t_end < 50.0, "reached t = {}", sol.t_end);
     }
 
     /// Every kind is integrable, not just the recommended one — including

@@ -54,7 +54,7 @@
 //! method. Both conditions are asserted as tests below, because a mistyped
 //! digit in `w1` shows up as order 2 and nowhere else.
 
-use crate::solution::{Solution, Step, StepRecord, Telemetry};
+use crate::solution::{Solution, StopReason, Step, StepRecord, Telemetry};
 use crate::system::SecondOrderSystem;
 use crate::tsit5::{Opts, SolveError};
 
@@ -190,6 +190,7 @@ fn solve_composition<S: SecondOrderSystem>(
             telemetry,
             y_end: y0.to_vec(),
             t_end: t0,
+            stopped: None,
         });
     }
 
@@ -198,11 +199,11 @@ fn solve_composition<S: SecondOrderSystem>(
         .unwrap_or((t1 - t0) / DEFAULT_STEPS_PER_SPAN)
         .min(opts.dt_max)
         .min(t1 - t0);
+    // A hard error rather than a stop: the step was unusable before the first
+    // evaluation, so unlike a step that *collapses* mid-run there is no partial
+    // trajectory to hand back. Somebody passed `dt0: Some(0.0)`.
     if !dt_fixed.is_finite() || dt_fixed <= 0.0 {
-        return Err(SolveError::StepTooSmall {
-            t: t0,
-            dt: dt_fixed,
-        });
+        return Err(SolveError::InvalidStep { dt: dt_fixed });
     }
 
     let mut w = Work {
@@ -236,9 +237,20 @@ fn solve_composition<S: SecondOrderSystem>(
     } else {
         raw.ceil()
     } as usize;
-    if n_steps > opts.max_steps {
-        return Err(SolveError::TooManySteps { t: t0 });
-    }
+
+    // A budget too small for the span is not a refusal to run: take as many
+    // steps as the budget allows and report where that left off. Same rule as
+    // a blowup — an answer that covers less time beats no answer at all. The
+    // step itself is *not* enlarged to fit the budget, because a symplectic
+    // method's guarantee is about one map applied repeatedly and silently
+    // coarsening it would trade a short honest run for a long misleading one.
+    let mut stopped: Option<StopReason> = None;
+    let n_run = if n_steps > opts.max_steps {
+        stopped = Some(StopReason::TooManySteps);
+        opts.max_steps
+    } else {
+        n_steps
+    };
 
     // Then the step actually used is the span divided by that count: the
     // largest step no bigger than the one asked for that divides the span
@@ -250,12 +262,20 @@ fn solve_composition<S: SecondOrderSystem>(
     // slightly instead keeps the run uniform and still lands exactly on `t1`.
     let dt = (t1 - t0) / n_steps as f64;
 
-    for step in 0..n_steps {
+    // Where the run actually reached. Advanced only by a step that completed,
+    // so a step that produces a non-finite state leaves this at the last time
+    // the state was still a number.
+    let mut t_reached = t0;
+
+    for step in 0..n_run {
         let t = t0 + step as f64 * dt;
         // The last step is stretched by a few ulps so that `t + dt` is exactly
         // `t1`: a scrubber dragged to the right-hand edge must find something
         // there, and an interpolant whose domain stops a hair short of the end
         // would leave a gap for the binary search to fall into.
+        // `n_steps`, not `n_run`: a run cut short by the step budget never
+        // reaches its last step, and stretching some earlier step to land on
+        // `t1` would claim a span it did not integrate.
         let dt = if step + 1 == n_steps { t1 - t } else { dt };
 
         let mut t_sub = t;
@@ -266,7 +286,10 @@ fn solve_composition<S: SecondOrderSystem>(
         }
 
         if w.q.iter().chain(w.v.iter()).any(|x| !x.is_finite()) {
-            return Err(SolveError::NonFinite { t });
+            // `y` is still the state at the start of this step — the last one
+            // that was finite — and it has not been moved into a `Step` yet.
+            stopped = Some(StopReason::NonFinite);
+            break;
         }
 
         let mut y_end = vec![0.0; dim];
@@ -298,15 +321,18 @@ fn solve_composition<S: SecondOrderSystem>(
 
         y = y_end;
         f = f_end;
+        t_reached = t + dt;
     }
 
     Ok(Solution {
         steps,
         telemetry,
         y_end: y,
-        // `dt_fixed` is capped at the span, so there is always at least one
-        // step and the loop always finished on `t1` exactly.
-        t_end: t1,
+        // `dt_fixed` is capped at the span, so a run that took all its steps
+        // finished on `t1` exactly — the last step is stretched by a few ulps
+        // above to guarantee it. A run that stopped short reports where it got.
+        t_end: if stopped.is_none() { t1 } else { t_reached },
+        stopped,
     })
 }
 
@@ -314,6 +340,7 @@ fn solve_composition<S: SecondOrderSystem>(
 mod tests {
     use super::*;
     use crate::conserve::measure;
+    use crate::solution::StopReason;
     use crate::system::{Accel, AccelFn, Lowered, Paired, System};
     use crate::tsit5;
     use std::f64::consts::TAU;
@@ -736,25 +763,54 @@ mod tests {
         assert_eq!(sol.eval(2.0), vec![1.0, 0.0]);
     }
 
+    /// A fixed-step method has no error estimate to warn it, so it walks into a
+    /// finite-time escape and only finds out when the numbers stop being
+    /// numbers. It must still hand back everything up to that point.
     #[test]
-    fn a_blown_up_trajectory_is_reported_rather_than_returned() {
-        // Escaping to infinity in finite time, taken with a fixed step that
-        // cannot notice until the numbers stop being numbers.
+    fn a_blown_up_trajectory_still_returns_the_part_that_was_finite() {
         let runaway: AccelFn = |_t, q, _v, a| a[0] = q[0] * q[0] * q[0] * 1e6;
         let sys = Accel::new(1, runaway);
-        let r = solve_verlet(&sys, (0.0, 10.0), &[1.0, 0.0], &fixed(0.01));
-        assert!(matches!(r, Err(SolveError::NonFinite { .. })));
+        let sol = solve_verlet(&sys, (0.0, 10.0), &[1.0, 0.0], &fixed(0.01)).unwrap();
+        assert_eq!(sol.stopped, Some(StopReason::NonFinite));
+        assert!(sol.t_end > 0.0 && sol.t_end < 10.0, "{}", sol.t_end);
+        assert!(sol.y_end.iter().all(|v| v.is_finite()));
+        // The scrubber can be dragged anywhere in the requested window and
+        // always lands on a real number.
+        assert!(sol.sample(300).iter().all(|y| y.iter().all(|v| v.is_finite())));
     }
 
+    /// A step budget smaller than the span the fixed step needs. The step is
+    /// *not* coarsened to fit — a symplectic method's guarantee is about one map
+    /// applied repeatedly — so the run covers less time and says so.
     #[test]
-    fn too_many_steps_is_reported() {
+    fn a_spent_step_budget_shortens_the_run_rather_than_failing_it() {
         let opts = Opts {
             dt0: Some(1e-3),
             max_steps: 10,
             ..Default::default()
         };
-        let r = solve_verlet(&spring(), (0.0, 1.0), &[1.0, 0.0], &opts);
-        assert!(matches!(r, Err(SolveError::TooManySteps { .. })));
+        let sol = solve_verlet(&spring(), (0.0, 1.0), &[1.0, 0.0], &opts).unwrap();
+        assert_eq!(sol.stopped, Some(StopReason::TooManySteps));
+        assert_eq!(sol.steps.len(), 10);
+        assert!((sol.t_end - 0.01).abs() < 1e-12, "{}", sol.t_end);
+        // Ten Verlet steps of a millisecond each are still an accurate cosine.
+        assert!((sol.y_end[0] - 0.01f64.cos()).abs() < 1e-8);
+        assert!(sol.require_complete().is_err());
+    }
+
+    /// Not a stop but a hard error: a step of zero was never going to integrate
+    /// anything, so there is no partial trajectory to keep.
+    #[test]
+    fn an_unusable_fixed_step_is_a_hard_error() {
+        let r = solve_verlet(&spring(), (0.0, 1.0), &[1.0, 0.0], &fixed(0.0));
+        assert_eq!(r.unwrap_err(), SolveError::InvalidStep { dt: 0.0 });
+    }
+
+    #[test]
+    fn an_ordinary_fixed_step_run_reports_no_stop_reason() {
+        let sol = solve_yoshida4(&spring(), (0.0, 3.0), &[1.0, 0.0], &fixed(0.01)).unwrap();
+        assert!(sol.is_complete());
+        assert_eq!(sol.t_end, 3.0);
     }
 
     // --- reaching the methods from a lowered document ---------------------

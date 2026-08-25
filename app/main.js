@@ -242,6 +242,8 @@ const state = {
   // where it began does not re-solve, and so the shell can say what is drawn.
   t0: -5,
   t1: 5,
+  tEnd: 5,         // how far the last integration actually got: t1 unless it
+                   // gave up early, in which case the curve stops there
   // What the loaded document says is worth drawing (`show`), or null for
   // everything. A display choice: the states left out are still solved.
   show: null,
@@ -1626,8 +1628,59 @@ function syncFrameButtons() {
 /** Every gesture ends here: repaint now, re-solve shortly. */
 function frameChanged(delay) {
   syncFrameButtons();
+  resampleForFrame();
   scheduleDraw();
   scheduleResolve(delay);
+}
+
+/**
+ * Re-sample the CURRENT solution across the visible window, before any
+ * re-solve.
+ *
+ * `sample(n)` spreads its points evenly over the whole integrated span, so
+ * after solving [0, 20] and zooming to [9, 11] only a tenth of them land on
+ * screen — stretched across the full width, which draws a visibly polygonal
+ * line until the debounced re-solve lands. The line was not wrong about the
+ * data; it was drawing a tenth of it.
+ *
+ * The solver's dense output already answers at any `t` inside the solved span,
+ * so zooming *in* never needs a re-solve at all: ask it once per pixel over the
+ * part of the window it can answer for. Roughly 900 evaluations, about a
+ * quarter of a millisecond — far cheaper than an integration, and correct
+ * immediately rather than 180 ms later.
+ *
+ * Only a window reaching outside the solved span still needs the real re-solve,
+ * which is exactly what `scheduleResolve` is for.
+ */
+function resampleForFrame() {
+  const f = state.sol;
+  if (!M || !f || !f.dim || !f.n) return;
+
+  const w = plot.getWindow();
+  const a = Math.max(state.t0, Math.min(w.x0, w.x1));
+  const b = Math.min(state.tEnd, Math.max(w.x0, w.x1));
+  if (!(b > a)) return;                      // nothing of the solution is in view
+
+  const n = sampleCount();
+  const stride = f.dim + 1;
+  const data = new Float64Array(n * stride);
+  for (let i = 0; i < n; i++) {
+    const t = a + ((b - a) * i) / (n - 1);
+    let y;
+    try {
+      y = toF64(M.eval(t));
+    } catch (err) {
+      return;                                // leave the last good curve alone
+    }
+    if (y.length < f.dim) return;
+    data[i * stride] = t;
+    for (let d = 0; d < f.dim; d++) data[i * stride + 1 + d] = y[d];
+  }
+
+  f.data = data;
+  f.n = n;
+  f.t0 = a;
+  f.t1 = b;
 }
 
 function resetFrames() {
@@ -2235,13 +2288,26 @@ function recompute() {
 
   state.t0 = isFinite(report.t0) ? report.t0 : t0;
   state.t1 = isFinite(report.t1) ? report.t1 : t1;
+  // How far the integration ACTUALLY got. On a blowup this falls short of t1,
+  // and it is the right edge of the curve - the window keeps its own width, so
+  // the rest of it stays visibly empty rather than being back-filled with a
+  // flat line or rescaled to make a partial run look complete.
+  state.tEnd = isFinite(report.tEnd) ? report.tEnd : state.t1;
 
   // The report echoes the method it actually used, so the badge can never name
-  // one that did not run.
-  setSolveBadge(report.method ? 'solved · ' + report.method : 'solved', 'ok');
+  // one that did not run. A run that gave up part-way still produced a usable
+  // curve, so it reads as an observation in the muted style - not a failure.
+  const stopped = report.stopped && report.stopped.message ? report.stopped : null;
+  if (stopped) {
+    setSolveBadge(stopped.message, 'wait');
+  } else {
+    setSolveBadge(report.method ? 'solved · ' + report.method : 'solved', 'ok');
+  }
   el.statSolve.title = (report.method ? report.method + ' · ' : '')
-    + 't ∈ [' + fmtValue(state.t0) + ', ' + fmtValue(state.t1) + ']'
-    + ' · ' + got + ' samples';
+    + 't ∈ [' + fmtValue(state.t0) + ', ' + fmtValue(state.tEnd) + ']'
+    + (stopped ? ' of [' + fmtValue(state.t0) + ', ' + fmtValue(state.t1) + ']' : '')
+    + ' · ' + got + ' samples'
+    + (stopped ? ' · ' + stopped.message : '');
   lastMethodError = null;
   renderMethods();
 
@@ -2262,7 +2328,10 @@ function recompute() {
     n: got,
     data,
     t0: state.t0,
-    t1: state.t1,
+    // Where the CURVE ends, which is where the integration got to — not where
+    // the window ends. On a partial run the rest of the window stays visibly
+    // empty, so a blowup reads as a blowup rather than as a full-width answer.
+    t1: state.tEnd,
     polar: polarMapFor(reportNames),
     extra,
     showStates: sel.states,
@@ -2325,6 +2394,24 @@ function derivedSeries(names, n) {
   }
   return out.length ? out : null;
 }
+
+// A deliberate inspection hook. The integration suite has to be able to ask
+// what is actually on screen - which samples, over which span - because that is
+// the difference between "the curve is right" and "the curve is a tenth of the
+// data stretched across the width". Read-only, and named so nobody mistakes it
+// for API.
+globalThis.__numplaInspect = {
+  frame: () => state.sol,
+  window: () => plot.getWindow(),
+  span: () => ({ t0: state.t0, t1: state.t1, tEnd: state.tEnd }),
+  /** Replace the whole document, the way loading a demo does. */
+  setDocument: (text) => {
+    clearRows();
+    buildRows(String(text).split(/\r?\n/));
+    ensureTail();
+    scheduleRecompute(0);
+  },
+};
 
 let debounceTimer = 0;
 

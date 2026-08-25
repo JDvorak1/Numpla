@@ -11,7 +11,7 @@
 //! Numpla scrubs time, so a method without dense output could not be used at
 //! all. See `docs/solvers.md`.
 
-use crate::solution::{Solution, Step, StepRecord, Telemetry};
+use crate::solution::{Solution, StopReason, Step, StepRecord, Telemetry};
 use crate::system::System;
 
 pub const STAGES: usize = 7;
@@ -129,15 +129,40 @@ impl Default for Opts {
     }
 }
 
+/// The only things a solve can refuse to do.
+///
+/// Everything here is a **programming error**: the call itself does not make
+/// sense, and there is no partial answer worth keeping because no integration
+/// was ever possible. Numerical give-up — stiffness, blowup, a spent step
+/// budget — is deliberately *not* in this enum. That is
+/// [`StopReason`], it arrives attached to a real
+/// [`Solution`], and the reasoning is written out there.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SolveError {
-    /// The step size fell below `dt_min` — almost always stiffness. The
-    /// telemetry says where, which is the point.
-    StepTooSmall { t: f64, dt: f64 },
-    TooManySteps { t: f64 },
-    NonFinite { t: f64 },
+    /// The initial state is not the width the system says it is.
     DimensionMismatch { expected: usize, got: usize },
+    /// A fixed-step method was handed a step it cannot use — zero, negative,
+    /// or not a number. Unlike a step that *collapses* during a run, this one
+    /// was wrong before the first evaluation, so there is nothing to return.
+    InvalidStep { dt: f64 },
 }
+
+impl std::fmt::Display for SolveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SolveError::DimensionMismatch { expected, got } => write!(
+                f,
+                "the system has {} states but was given {} initial values",
+                expected, got
+            ),
+            SolveError::InvalidStep { dt } => {
+                write!(f, "{} is not a usable step size", dt)
+            }
+        }
+    }
+}
+
+impl std::error::Error for SolveError {}
 
 /// PI step-size controller (Hairer/Wanner). The integral term damps the
 /// oscillation a pure elementary controller shows near a stability boundary.
@@ -198,6 +223,13 @@ fn initial_step<S: System>(sys: &S, t0: f64, y0: &[f64], f0: &[f64], opts: &Opts
 }
 
 /// Integrate `sys` from `t_span.0` to `t_span.1`.
+///
+/// **Always produces a solution.** If the numerics give up — the step size
+/// collapses, the state stops being finite, the step budget runs out — the
+/// steps taken so far come back anyway, with [`Solution::t_end`] short of
+/// `t_span.1` and [`Solution::stopped`] saying why. `Err` is reserved for a
+/// call that never made sense. See [`StopReason`] for the product rule behind
+/// that split, and [`Solution::require_complete`] for the strict path.
 pub fn solve<S: System>(
     sys: &S,
     t_span: (f64, f64),
@@ -225,6 +257,9 @@ pub fn solve<S: System>(
             telemetry,
             y_end: y,
             t_end: t0,
+            // A span of zero width was asked for and a span of zero width was
+            // delivered. Nothing gave up.
+            stopped: None,
         });
     }
 
@@ -253,9 +288,15 @@ pub fn solve<S: System>(
     let mut err_prev: f64 = 1.0;
     let mut attempts = 0usize;
 
+    // Why the loop stopped short, if it did. Every exit below is a `break` and
+    // not a `return`: the steps taken so far are the answer, and the product
+    // rule is that a run that gave up still draws. See [`StopReason`].
+    let mut stopped: Option<StopReason> = None;
+
     while t < t1 {
         if attempts >= opts.max_steps {
-            return Err(SolveError::TooManySteps { t });
+            stopped = Some(StopReason::TooManySteps);
+            break;
         }
         attempts += 1;
 
@@ -341,7 +382,12 @@ pub fn solve<S: System>(
         }
 
         if y_new.iter().any(|v| !v.is_finite()) {
-            return Err(SolveError::NonFinite { t });
+            // `y` and `t` still hold the last accepted state, so the solution
+            // ends cleanly at the last point that was a number. The bad step is
+            // not recorded in the telemetry either — its error norm is NaN,
+            // which is not a height the strip can draw.
+            stopped = Some(StopReason::NonFinite);
+            break;
         }
 
         let e = error_norm(&err, &y, &y_new, opts);
@@ -382,7 +428,8 @@ pub fn solve<S: System>(
         // a few ulps, and the next proposed step inherits that width — which is
         // arithmetic, not stiffness, and must not be reported as a failure.
         if t < t1 && dt < opts.dt_min {
-            return Err(SolveError::StepTooSmall { t, dt });
+            stopped = Some(StopReason::StepTooSmall { dt });
+            break;
         }
     }
 
@@ -391,12 +438,14 @@ pub fn solve<S: System>(
         telemetry,
         y_end: y,
         t_end: t,
+        stopped,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::solution::StopReason;
     use crate::system::Field;
 
     /// The sharpest possible check on the interpolation constants: at the end
@@ -621,23 +670,139 @@ mod tests {
         assert!(err_at(1e-10) < err_at(1e-5));
     }
 
-    #[test]
-    fn blowup_is_reported_not_silently_returned() {
-        // y' = y^2 escapes to infinity at t = 1.
-        let sys = Field::new(1, |_t, y: &[f64], dy: &mut [f64]| dy[0] = y[0] * y[0]);
-        let opts = Opts {
-            dt_min: 1e-10,
-            ..Default::default()
-        };
-        let r = solve(&sys, (0.0, 2.0), &[1.0], &opts);
-        assert!(matches!(
-            r,
-            Err(SolveError::StepTooSmall { .. })
-                | Err(SolveError::NonFinite { .. })
-                | Err(SolveError::TooManySteps { .. })
-        ));
+    /// `y' = y^2` from `y(0) = 1` has the closed form `1 / (1 - t)` and escapes
+    /// to infinity at `t = 1` exactly. Someone typing that into Numpla is
+    /// entitled to watch the curve rise and stop — the blowup is the point of
+    /// the model, and an `Err` that threw away the rise would leave them
+    /// staring at nothing.
+    fn blowup() -> Field<impl Fn(f64, &[f64], &mut [f64])> {
+        Field::new(1, |_t, y: &[f64], dy: &mut [f64]| dy[0] = y[0] * y[0])
     }
 
+    #[test]
+    fn a_blowup_still_returns_the_curve_up_to_where_it_blew() {
+        // The span asked for is five times longer than the solution exists for.
+        let sol = solve(&blowup(), (0.0, 5.0), &[1.0], &Opts::default())
+            .expect("a blowup must not be an error");
+
+        assert!(sol.stopped.is_some(), "the run cannot claim to be complete");
+        assert!(!sol.is_complete());
+        // It got essentially all the way to the singularity, and no further.
+        // Not *exactly* to `t = 1`: near the pole the state is around 1e11 and
+        // the step is around 1e-12, so the last few steps land a handful of
+        // ulps either side of it. Where the pole is to twelve digits is not a
+        // question a stepper can answer, and not one anyone is asking.
+        assert!(
+            (sol.t_end - 1.0).abs() < 1e-3,
+            "stopped at t = {}, expected essentially 1",
+            sol.t_end
+        );
+        assert!(sol.t_end < 5.0);
+        assert!(sol.steps.len() > 10, "only {} steps", sol.steps.len());
+
+        // And the part it did integrate is right. Checked against the closed
+        // form, not merely against itself.
+        for i in 0..=100 {
+            let t = 0.99 * (i as f64) / 100.0;
+            let got = sol.eval(t)[0];
+            let want = 1.0 / (1.0 - t);
+            assert!(
+                (got - want).abs() < 1e-4 * want,
+                "at t = {}: got {}, want {}",
+                t,
+                got,
+                want
+            );
+        }
+    }
+
+    /// The other half of the same contract: past the point where integration
+    /// stopped, dense output must hold rather than extrapolate. Extrapolating a
+    /// fifth-order polynomial out of a singularity would draw a confident,
+    /// enormous, entirely fictional curve across the rest of the window.
+    #[test]
+    fn dense_output_past_a_blowup_holds_instead_of_extrapolating() {
+        let sol = solve(&blowup(), (0.0, 5.0), &[1.0], &Opts::default()).unwrap();
+        let last = sol.y_end[0];
+        assert!(last.is_finite());
+        for t in [sol.t_end, 1.5, 3.0, 5.0, 1e6] {
+            assert_eq!(sol.eval(t)[0], last, "at t = {}", t);
+        }
+        // Every sample is finite, which is what the plotter needs.
+        assert!(sol.sample(500).iter().all(|y| y[0].is_finite()));
+    }
+
+    /// A right-hand side that simply hands back NaN. Nothing overflows on the
+    /// way — the state stops being a number in one step — so this exercises the
+    /// non-finite guard on its own rather than through a blowup.
+    #[test]
+    fn a_nan_right_hand_side_stops_the_run_at_the_last_real_state() {
+        let sys = Field::new(1, |t: f64, y: &[f64], dy: &mut [f64]| {
+            dy[0] = if t < 1.0 { -y[0] } else { f64::NAN };
+        });
+        let sol = solve(&sys, (0.0, 5.0), &[1.0], &Opts::default()).unwrap();
+        assert_eq!(sol.stopped, Some(StopReason::NonFinite));
+        assert!(sol.t_end <= 1.0, "stopped at {}", sol.t_end);
+        assert!(sol.y_end.iter().all(|v| v.is_finite()));
+        assert!(sol.sample(200).iter().all(|y| y[0].is_finite()));
+    }
+
+    /// Step-size collapse without a blowup: the state stays small and bounded,
+    /// but no step is ever small enough to be accepted, because the right-hand
+    /// side changes between calls. `dt_min` is what stops this running forever.
+    #[test]
+    fn a_step_size_collapse_returns_what_it_managed() {
+        use std::cell::Cell;
+        let calls = Cell::new(0u32);
+        let sys = Field::new(1, |_t: f64, y: &[f64], dy: &mut [f64]| {
+            let n = calls.get();
+            calls.set(n.wrapping_add(1));
+            // Bounded, but inconsistent from one evaluation to the next, so the
+            // error estimator measures the disagreement and never converges.
+            dy[0] = -y[0] + 0.5 * ((n % 7) as f64 - 3.0);
+        });
+        let sol = solve(&sys, (0.0, 50.0), &[0.0], &Opts::default()).unwrap();
+        assert!(
+            matches!(
+                sol.stopped,
+                Some(StopReason::StepTooSmall { .. }) | Some(StopReason::TooManySteps)
+            ),
+            "expected a collapse, got {:?}",
+            sol.stopped
+        );
+        assert!(sol.t_end < 50.0);
+        assert!(sol.y_end.iter().all(|v| v.is_finite()));
+    }
+
+    /// A budget too small for the span. The run still answers; it just answers
+    /// about less time than was asked for.
+    #[test]
+    fn exhausting_the_step_budget_is_a_short_run_not_a_failed_one() {
+        let opts = Opts {
+            dt_max: 0.01,
+            max_steps: 25,
+            ..Default::default()
+        };
+        let sol = solve(&decay(), (0.0, 5.0), &[1.0], &opts).unwrap();
+        assert_eq!(sol.stopped, Some(StopReason::TooManySteps));
+        assert!(sol.t_end > 0.0 && sol.t_end < 5.0, "{}", sol.t_end);
+        assert!((sol.y_end[0] - (-sol.t_end).exp()).abs() < 1e-6);
+    }
+
+    /// The strict path. A caller pinning an endpoint — a convergence study, a
+    /// batch job — must not be handed a short run that looks like a good one.
+    #[test]
+    fn strictness_still_tells_a_partial_run_from_a_complete_one() {
+        let whole = solve(&decay(), (0.0, 5.0), &[1.0], &Opts::default()).unwrap();
+        assert!(whole.is_complete());
+        assert!(whole.require_complete().is_ok());
+
+        let partial = solve(&blowup(), (0.0, 5.0), &[1.0], &Opts::default()).unwrap();
+        assert!(partial.require_complete().is_err());
+    }
+
+    /// Still a hard error: nothing about this call can be salvaged, so there is
+    /// no partial answer to keep.
     #[test]
     fn dimension_mismatch_is_caught() {
         let r = solve(&decay(), (0.0, 1.0), &[1.0, 2.0], &Opts::default());
@@ -648,6 +813,15 @@ mod tests {
                 got: 2
             }
         );
+    }
+
+    /// Every solve that ran to `t1` says so, so `stopped` cannot quietly become
+    /// noise that a caller learns to ignore.
+    #[test]
+    fn an_ordinary_run_reports_no_stop_reason() {
+        let sol = solve(&decay(), (0.0, 5.0), &[1.0], &Opts::default()).unwrap();
+        assert_eq!(sol.stopped, None);
+        assert!((sol.t_end - 5.0).abs() < 1e-12);
     }
 
     #[test]

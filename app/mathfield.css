@@ -30,8 +30,14 @@
   background: var(--mf-bg);
   border: 1px solid var(--mf-border);
   border-radius: 6px;
-  padding: 0.42em 0.6em;
-  min-height: 1.9em;
+  /* Room for what sits above and below the baseline. A superscript is raised
+     0.62em and a fraction's denominator drops below it, and `overflow-y` can
+     not be `visible` while `overflow-x` is `auto` — CSS promotes it to `auto`
+     too, which would put a second scrollbar on every row. So the box is made
+     tall enough to contain them instead, and the padding is what does it.
+     Trimming this is what clips exponents. */
+  padding: 0.72em 0.6em 0.62em;
+  min-height: 2.5em;
   display: flex;
   align-items: center;
   overflow-x: auto;

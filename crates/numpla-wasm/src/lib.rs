@@ -6,7 +6,9 @@
 //!
 //! - **Nothing throws across it.** Every call returns a value; problems come
 //!   back as diagnostics data, because half-typed input is a normal state and
-//!   an exception per keystroke is not.
+//!   an exception per keystroke is not. A model that blows up is the same kind
+//!   of normal state: `solve` answers with the curve up to the blowup and a
+//!   sentence, not with nothing.
 //! - **JSON for structure, `Float64Array` for bulk numbers.** Trajectory
 //!   samples cross as flat `f64` arrays with no per-point allocation.
 
@@ -42,6 +44,10 @@ impl Model {
     /// Integrate over `[t0, t1]` with the default method. Returns SolveReport
     /// as a JSON string. Safe to call when the document is invalid — reports
     /// `ok: false`.
+    ///
+    /// A run that gives up part-way is **not** that case: it reports
+    /// `ok: true` with `tEnd` short of `t1` and a `stopped` object saying why.
+    /// Draw the curve and show the sentence; see `docs/wasm-api.md`.
     pub fn solve(&mut self, t0: f64, t1: f64) -> String {
         self.inner.solve_json(t0, t1)
     }
@@ -67,6 +73,9 @@ impl Model {
     /// Uniformly sample the last solution: `n` points, flattened row-major as
     /// `[t, y_0, .., y_{d-1}]` repeated `n` times. Length = `n * (dim + 1)`.
     /// Empty if there is no solution.
+    ///
+    /// Spans `[t0, tEnd]`, which is what was integrated — after a run that
+    /// stopped early the curve ends where the run did.
     pub fn sample(&self, n: usize) -> Vec<f64> {
         self.inner.sample(n)
     }

@@ -78,6 +78,11 @@ impl std::fmt::Display for Method {
 ///
 /// `y0` is interleaved: position, then its velocity, per degree of freedom.
 ///
+/// Like [`crate::solve`], this always produces a solution when the call itself
+/// makes sense: a run the numerics gave up on comes back covering less time,
+/// with [`Solution::stopped`] saying why. Swapping methods must not be able to
+/// blank the plot, and neither must a model that misbehaves under one of them.
+///
 /// ```
 /// use numpla_ode::{measure, solve_with, Accel, Method, Opts};
 ///
