@@ -3560,7 +3560,10 @@ function insertEntry(entry) {
 function copyText(text) {
   const done = () => refFoot('copied  ' + text);
   try {
-    if (navigator.clipboard && navigator.clipboard.writeText) {
+    // `navigator` is a global only from Node 21 and in browsers; guarding the
+    // name itself rather than its property is what keeps this from throwing a
+    // ReferenceError anywhere it does not exist.
+    if (typeof navigator !== 'undefined' && navigator.clipboard && navigator.clipboard.writeText) {
       navigator.clipboard.writeText(text).then(done, () => refFoot('could not copy'));
       return;
     }
