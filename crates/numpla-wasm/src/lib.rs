@@ -86,6 +86,54 @@ impl Model {
         self.inner.eval(t)
     }
 
+    /// The right-hand side sampled on a grid across `[x0, x1] x [y0, y1]` at
+    /// time `t`, flattened as `[x, y, dx, dy]` per sample, `x` varying fastest.
+    ///
+    /// Empty when the document does not have exactly two states, does not
+    /// compile, or the grid is empty. Never throws — the `field` view simply
+    /// draws nothing, which is the same answer `phase` gives to a document with
+    /// the wrong number of axes.
+    ///
+    /// `t` is an argument because a non-autonomous system has a different field
+    /// at every instant; the shell passes the left edge of its window and says
+    /// so on screen.
+    #[allow(clippy::too_many_arguments)]
+    pub fn vector_field(
+        &self,
+        x0: f64,
+        x1: f64,
+        y0: f64,
+        y1: f64,
+        nx: usize,
+        ny: usize,
+        t: f64,
+    ) -> Vec<f64> {
+        self.inner.vector_field(x0, x1, y0, y1, nx, ny, t)
+    }
+
+    /// One trajectory from an explicit starting state — a seed — sampled
+    /// uniformly into the same flat layout as `sample`.
+    ///
+    /// Takes `&self`, which is the contract's "does not disturb the stored
+    /// solution" stated where the compiler can check it: the document's own
+    /// curve, its telemetry and its conservation series all survive any number
+    /// of seeds.
+    ///
+    /// Empty rather than thrown when `y0` is the wrong length, `n` is zero, the
+    /// method name is unknown, or the document cannot be integrated. Obeys the
+    /// same stop-early rule as `solve`: a seed that blows up comes back short,
+    /// and its last `t` is where it stopped.
+    pub fn trajectory_from(
+        &self,
+        t0: f64,
+        t1: f64,
+        method: &str,
+        y0: &[f64],
+        n: usize,
+    ) -> Vec<f64> {
+        self.inner.trajectory_from_named(t0, t1, method, y0, n)
+    }
+
     /// StepRecord list as JSON — for the telemetry strip.
     pub fn telemetry(&self) -> String {
         self.inner.telemetry_json()

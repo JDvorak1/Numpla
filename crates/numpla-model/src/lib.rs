@@ -42,7 +42,7 @@ pub use system::ModelSystem;
 pub use numpla_ode::Method;
 
 use numpla_ode::{
-    solve, solve_with as solve_second_order, Opts, Paired, SolveError, Solution, StopReason,
+    solve, solve_with as solve_second_order, Opts, Paired, Solution, SolveError, StopReason, System,
 };
 
 /// How many steps the solver is forced to take, at minimum, across the
@@ -92,6 +92,18 @@ pub struct Model {
     /// The most recent conservation measurement, so its series can cross the
     /// boundary as a `Float64Array` rather than as JSON.
     conservation: Option<(ConservationReport, Vec<f64>)>,
+}
+
+/// One completed integration, and the one thing about it that cannot be read
+/// back off the [`Solution`].
+///
+/// Whether the run had a symplectic structure to preserve is a property of the
+/// *document* — an acceleration row that mentions `x'` has none — so it is
+/// answered once, where the system is built, and carried out rather than
+/// recomputed by each caller.
+struct Run {
+    solution: Solution,
+    velocity_dependent: bool,
 }
 
 impl Model {
@@ -192,11 +204,69 @@ impl Model {
             error: Some(error),
         };
 
+        let y0 = self.doc.y0.clone();
+        let run = match self.integrate(t0, t1, method, &y0) {
+            Ok(run) => run,
+            Err(error) => return fail(error),
+        };
+
+        // A run that gave up part-way is still `ok`. It produced a real curve
+        // over `[t0, t_end]`, and for `x' = x^2` that curve *is* the answer —
+        // the rise into the singularity is what someone typed the model to
+        // see. `ok` therefore means "there is something to draw", and `stopped`
+        // carries the rest, so the shell can render the curve and the sentence
+        // together instead of choosing between a plot and an explanation.
+        let telemetry = run.solution.telemetry.clone();
+        let t_end = run.solution.t_end;
+        let stopped = run
+            .solution
+            .stopped
+            .map(|reason| describe_stop(reason, t_end));
+        self.solution = Some(run.solution);
+        self.method = Some(method);
+        SolveReport {
+            ok: true,
+            t0,
+            t1,
+            t_end,
+            stopped,
+            dim,
+            states,
+            accepted: telemetry.accepted,
+            rejected: telemetry.rejected,
+            rhs_evals: telemetry.rhs_evals,
+            method: name,
+            symplectic: method.is_symplectic() && !run.velocity_dependent,
+            error: None,
+        }
+    }
+
+    /// Integrate this document from an arbitrary starting state, without
+    /// touching anything the model has stored.
+    ///
+    /// Every integration in this crate goes through here — the document's own
+    /// solve, a seed's trajectory, and (through [`ModelSystem`]) the sampled
+    /// vector field. That is deliberate: a second entry point would be a second
+    /// chance for the picture on screen and the system being integrated to
+    /// drift apart, and the whole value of a phase portrait is that every curve
+    /// and every arrow in it answers to the same equations.
+    ///
+    /// `&self`, so the borrow checker guarantees what the contract promises: an
+    /// extra trajectory cannot disturb the stored solution, whatever it does.
+    ///
+    /// The `Err` side is reserved for having produced *nothing* — the same
+    /// meaning `ok: false` has in a [`SolveReport`]. A run the numerics
+    /// abandoned part-way comes back as `Ok` with a short [`Solution`] and
+    /// [`Solution::stopped`] set.
+    fn integrate(&self, t0: f64, t1: f64, method: Method, y0: &[f64]) -> Result<Run, String> {
+        let dim = self.doc.dim();
+        let name = method.name();
+
         if let Some(message) = self.doc.first_error() {
-            return fail(message);
+            return Err(message);
         }
         if dim == 0 {
-            return fail("there are no ODE rows to integrate".to_string());
+            return Err("there are no ODE rows to integrate".to_string());
         }
         // Reported, but as a statement of fact rather than a complaint: the
         // shell is expected to hold off on solving while rows are still
@@ -204,7 +274,14 @@ impl Model {
         // with no initial condition is reported *and* defaulted, so a document
         // that has not said where everything starts still draws.
         if let Some(blocker) = self.doc.first_blocker() {
-            return fail(format!("the model is still incomplete — {}", blocker));
+            return Err(format!("the model is still incomplete — {}", blocker));
+        }
+        if y0.len() != dim {
+            return Err(format!(
+                "this document has {} states, but {} starting values were given",
+                dim,
+                y0.len()
+            ));
         }
 
         let sys = ModelSystem::new(&self.doc);
@@ -223,11 +300,11 @@ impl Model {
         // guessing `false` would silently drop a damped one to first order.
         let velocity_dependent = self.doc.reads_velocity();
         let outcome = if method.is_adaptive() {
-            solve(&sys, (t0, t1), &self.doc.y0, &opts)
+            solve(&sys, (t0, t1), y0, &opts)
         } else {
             match self.doc.pairs() {
                 Err(why) => {
-                    return fail(format!(
+                    return Err(format!(
                         "{} needs second-order rows — {}. Write it as `x'' = ...`, or choose {}",
                         name,
                         why,
@@ -241,14 +318,14 @@ impl Model {
                     // stating it rather than letting the solver infer one.
                     let paired = match Paired::new(&sys, &pairs) {
                         Ok(p) => p,
-                        Err(e) => return fail(format!("internal error: {}", e)),
+                        Err(e) => return Err(format!("internal error: {}", e)),
                     };
                     let paired = if velocity_dependent {
                         paired.reading_velocity()
                     } else {
                         paired
                     };
-                    solve_second_order(method, &paired, (t0, t1), &self.doc.y0, &opts)
+                    solve_second_order(method, &paired, (t0, t1), y0, &opts)
                 }
             }
         };
@@ -257,40 +334,15 @@ impl Model {
             Ok(solution) => {
                 // A right-hand side cannot fail outward, so a failure recorded
                 // during the run outranks an integration that merely finished.
-                if let Some(message) = sys.failure() {
-                    return fail(message);
-                }
-                let telemetry = solution.telemetry.clone();
-                // A run that gave up part-way is still `ok`. It produced a real
-                // curve over `[t0, t_end]`, and for `x' = x^2` that curve *is*
-                // the answer — the rise into the singularity is what someone
-                // typed the model to see. `ok` therefore means "there is
-                // something to draw", and `stopped` carries the rest, so the
-                // shell can render the curve and the sentence together instead
-                // of choosing between a plot and an explanation.
-                let stopped = solution
-                    .stopped
-                    .map(|reason| describe_stop(reason, solution.t_end));
-                let t_end = solution.t_end;
-                self.solution = Some(solution);
-                self.method = Some(method);
-                SolveReport {
-                    ok: true,
-                    t0,
-                    t1,
-                    t_end,
-                    stopped,
-                    dim,
-                    states,
-                    accepted: telemetry.accepted,
-                    rejected: telemetry.rejected,
-                    rhs_evals: telemetry.rhs_evals,
-                    method: name,
-                    symplectic: method.is_symplectic() && !velocity_dependent,
-                    error: None,
+                match sys.failure() {
+                    Some(message) => Err(message),
+                    None => Ok(Run {
+                        solution,
+                        velocity_dependent,
+                    }),
                 }
             }
-            Err(e) => fail(sys.failure().unwrap_or_else(|| describe_solve_error(&e))),
+            Err(e) => Err(sys.failure().unwrap_or_else(|| describe_solve_error(&e))),
         }
     }
 
@@ -350,31 +402,14 @@ impl Model {
     /// than a flat tail across the rest of the window pretending to be physics.
     /// The last `t` here equals [`SolveReport::t_end`].
     ///
-    /// Flat and preallocated because this crosses into JS as one
-    /// `Float64Array`; a point-per-allocation shape would dominate the cost of
-    /// drawing a curve.
+    /// The flattening itself is [`sample_solution`], shared with
+    /// [`Model::trajectory_from`] so that a seed and the document's own curve
+    /// cannot come back in different shapes.
     pub fn sample(&self, n: usize) -> Vec<f64> {
-        let Some(sol) = &self.solution else {
-            return Vec::new();
-        };
-        if n == 0 {
-            return Vec::new();
+        match &self.solution {
+            Some(sol) => sample_solution(sol, n),
+            None => Vec::new(),
         }
-        let dim = sol.dim();
-        let (a, b) = (sol.t_start(), sol.t_end);
-        let mut out = Vec::with_capacity(n * (dim + 1));
-        let mut buf = vec![0.0; dim];
-        for i in 0..n {
-            let t = if n == 1 {
-                a
-            } else {
-                a + (b - a) * (i as f64) / ((n - 1) as f64)
-            };
-            sol.eval_into(t, &mut buf);
-            out.push(t);
-            out.extend_from_slice(&buf);
-        }
-        out
     }
 
     /// State at one time — the scrubber playhead. Clamped to the integrated
@@ -387,6 +422,150 @@ impl Model {
     pub fn eval(&self, t: f64) -> Vec<f64> {
         match &self.solution {
             Some(sol) => sol.eval(t),
+            None => Vec::new(),
+        }
+    }
+
+    /// The right-hand side sampled on a grid across `[x0, x1] x [y0, y1]`, at
+    /// time `t`.
+    ///
+    /// Flat and row-major, four numbers per sample: `[x, y, dx, dy]` repeated
+    /// `nx * ny` times. `x` varies fastest, so sample `(i, j)` — column `i` of
+    /// row `j` — starts at index `4 * (j * nx + i)`. Both ranges are sampled
+    /// endpoint-inclusive, the way [`Model::sample`] treats a time span; a grid
+    /// one wide sits on `x0`.
+    ///
+    /// Empty, never a panic, when there is nothing honest to draw: a document
+    /// without exactly two states (the phase plane has two axes and no opinion
+    /// about a third), one that does not compile, an empty grid, or a row that
+    /// could not be evaluated at some sample. That last case matters: a failed
+    /// row substitutes a zero derivative, and a grid of zero-length arrows
+    /// looks exactly like a system at rest. Nothing is the honest answer.
+    ///
+    /// # Why `t` is an argument
+    ///
+    /// A non-autonomous system — `x' = y`, `y' = -sin(t)` — genuinely has a
+    /// different field at every instant, so there is no field to draw without
+    /// being told which one. Assuming zero would quietly show the wrong picture
+    /// for exactly the models whose time dependence is the point.
+    ///
+    /// # Why this shares the solver's evaluation
+    ///
+    /// The arrows come from [`ModelSystem`]'s `rhs` — the same call, on the
+    /// same type, that Tsit5 makes six times per step, and that `Paired` calls
+    /// underneath Verlet and Yoshida4. There is deliberately no second
+    /// evaluator here: a field drawn from a subtly different reading of the
+    /// document would be a lie about the system whose trajectories are drawn on
+    /// top of it, and the failure mode — arrows that do not quite point along
+    /// the curves — is one nobody would think to distrust.
+    #[allow(clippy::too_many_arguments)]
+    pub fn vector_field(
+        &self,
+        x0: f64,
+        x1: f64,
+        y0: f64,
+        y1: f64,
+        nx: usize,
+        ny: usize,
+        t: f64,
+    ) -> Vec<f64> {
+        if self.doc.dim() != 2 || nx == 0 || ny == 0 {
+            return Vec::new();
+        }
+        if self.doc.first_error().is_some() || self.doc.first_blocker().is_some() {
+            return Vec::new();
+        }
+
+        let sys = ModelSystem::new(&self.doc);
+        let mut out = Vec::with_capacity(nx * ny * 4);
+        let mut state = [0.0f64; 2];
+        let mut dy = [0.0f64; 2];
+        for j in 0..ny {
+            let y = grid_coord(y0, y1, j, ny);
+            for i in 0..nx {
+                let x = grid_coord(x0, x1, i, nx);
+                state[0] = x;
+                state[1] = y;
+                sys.rhs(t, &state, &mut dy);
+                out.extend_from_slice(&[x, y, dy[0], dy[1]]);
+            }
+        }
+
+        // Checked after the sweep rather than per sample: `rhs` records only
+        // the first failure, and one unevaluable row makes the whole field
+        // fiction, not just the arrow that hit it.
+        if sys.failure().is_some() {
+            return Vec::new();
+        }
+        out
+    }
+
+    /// One trajectory from an explicit starting state, sampled uniformly.
+    ///
+    /// Flat: `[t, y_0, .., y_{dim-1}]` repeated `n` times — the same layout as
+    /// [`Model::sample`], so a seed and the document's own curve are drawn by
+    /// the same code.
+    ///
+    /// This is what a seed is: a starting point somebody placed on the plane,
+    /// integrated over the same window and drawn in the same frame. The
+    /// document's own initial condition is seed zero and is not special.
+    ///
+    /// # It cannot disturb the stored solution
+    ///
+    /// `&self` — the guarantee is the signature, not a promise in prose. The
+    /// shell calls this once per seed on top of the document's own run, and a
+    /// portrait whose curves quietly replaced each other as they were drawn
+    /// would be worse than no portrait. Nothing is cached either: a trajectory
+    /// belongs to the seed that asked for it, and the model has no business
+    /// remembering the last one.
+    ///
+    /// # Empty rather than thrown
+    ///
+    /// A `y0` of the wrong length is a normal state — the shell is holding a
+    /// seed from before the document grew a third row — so it comes back empty,
+    /// like every other "nothing to draw" in this API. So does `n == 0`, and so
+    /// does a document that cannot be integrated at all.
+    ///
+    /// # A seed that blows up
+    ///
+    /// Same rule as [`Model::solve`]: the part that worked is returned. The
+    /// samples span `[t0, t_end]`, so a seed sitting where solutions escape to
+    /// infinity draws a short curve that stops where the integration did — and
+    /// its last `t` is the only thing that says where. Read it, or a seed's
+    /// shortfall gets drawn as though it covered the window.
+    pub fn trajectory_from(
+        &self,
+        t0: f64,
+        t1: f64,
+        method: Method,
+        y0: &[f64],
+        n: usize,
+    ) -> Vec<f64> {
+        if n == 0 {
+            return Vec::new();
+        }
+        match self.integrate(t0, t1, method, y0) {
+            Ok(run) => sample_solution(&run.solution, n),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// [`Model::trajectory_from`] with the method named by string — the shape
+    /// the shell sends, and the same spelling [`Model::solve_named`] accepts.
+    ///
+    /// An unknown name is empty rather than a silent Tsit5: a seed drawn with
+    /// the wrong integrator, beside document curves drawn with the right one,
+    /// would put two methods in one picture under one label.
+    pub fn trajectory_from_named(
+        &self,
+        t0: f64,
+        t1: f64,
+        method: &str,
+        y0: &[f64],
+        n: usize,
+    ) -> Vec<f64> {
+        match method_named(method) {
+            Some(m) => self.trajectory_from(t0, t1, m, y0, n),
             None => Vec::new(),
         }
     }
@@ -516,6 +695,49 @@ pub fn method_named(name: &str) -> Option<Method> {
         .iter()
         .copied()
         .find(|m| m.name().eq_ignore_ascii_case(name.trim()))
+}
+
+/// Uniformly sample a solution into the flat `[t, y_0, .., y_{d-1}]` layout the
+/// whole product draws from.
+///
+/// Shared by [`Model::sample`] and [`Model::trajectory_from`] so a seed and the
+/// document's own curve can never come back in different shapes.
+///
+/// Flat and preallocated because this crosses into JS as one `Float64Array`; a
+/// point-per-allocation shape would dominate the cost of drawing a curve.
+fn sample_solution(sol: &Solution, n: usize) -> Vec<f64> {
+    if n == 0 {
+        return Vec::new();
+    }
+    let dim = sol.dim();
+    let (a, b) = (sol.t_start(), sol.t_end);
+    let mut out = Vec::with_capacity(n * (dim + 1));
+    let mut buf = vec![0.0; dim];
+    for i in 0..n {
+        let t = if n == 1 {
+            a
+        } else {
+            a + (b - a) * (i as f64) / ((n - 1) as f64)
+        };
+        sol.eval_into(t, &mut buf);
+        out.push(t);
+        out.extend_from_slice(&buf);
+    }
+    out
+}
+
+/// Sample `i` of `n` across `[a, b]`, endpoints included.
+///
+/// The same rule [`sample_solution`] uses for time, for the same reason: the
+/// window the caller asked for is the window that gets drawn, edges and all. A
+/// single sample sits at `a` rather than in the middle, so a degenerate grid is
+/// a point on the boundary rather than one nobody asked about.
+fn grid_coord(a: f64, b: f64, i: usize, n: usize) -> f64 {
+    if n <= 1 {
+        a
+    } else {
+        a + (b - a) * (i as f64) / ((n - 1) as f64)
+    }
 }
 
 /// The step a fixed-step method takes across `[t0, t1]`.
@@ -1631,6 +1853,335 @@ mod tests {
         assert_eq!(issues.len(), 1, "{:?}", issues);
         assert_eq!(issues[0].line, 3);
         assert!(issues[0].message.contains('q'), "{:?}", issues[0]);
+    }
+
+    // --- the field, and the curves seeded into it --------------------------
+
+    /// One arrow out of a field, by grid position.
+    fn arrow(field: &[f64], nx: usize, i: usize, j: usize) -> [f64; 4] {
+        let k = 4 * (j * nx + i);
+        [field[k], field[k + 1], field[k + 2], field[k + 3]]
+    }
+
+    /// The circle, written first order. `x' = -y`, `y' = x`.
+    const CIRCLE: &str = "x' = -y\ny' = x\nx(0) = 1\ny(0) = 0";
+
+    #[test]
+    fn the_field_is_a_flat_grid_of_point_and_derivative() {
+        let mut m = Model::new();
+        m.set_source(CIRCLE);
+        let (nx, ny) = (5, 3);
+        let f = m.vector_field(-1.0, 1.0, 0.0, 2.0, nx, ny, 0.0);
+        assert_eq!(f.len(), nx * ny * 4);
+
+        // Endpoint-inclusive in both directions, `x` varying fastest, so the
+        // corners of the window are the corners of the grid.
+        assert_eq!(arrow(&f, nx, 0, 0)[0..2], [-1.0, 0.0]);
+        assert_eq!(arrow(&f, nx, 4, 0)[0..2], [1.0, 0.0]);
+        assert_eq!(arrow(&f, nx, 0, 2)[0..2], [-1.0, 2.0]);
+        assert_eq!(arrow(&f, nx, 4, 2)[0..2], [1.0, 2.0]);
+        // and evenly spaced between them
+        assert_eq!(arrow(&f, nx, 2, 1)[0..2], [0.0, 1.0]);
+
+        // A one-wide grid sits on the low edge rather than somewhere nobody
+        // named; the same rule `sample` uses for a single time.
+        let f = m.vector_field(3.0, 9.0, 4.0, 8.0, 1, 1, 0.0);
+        assert_eq!(f[0..2], [3.0, 4.0]);
+        // An empty grid is empty, not a panic on `n - 1`.
+        assert!(m.vector_field(-1.0, 1.0, -1.0, 1.0, 0, 4, 0.0).is_empty());
+        assert!(m.vector_field(-1.0, 1.0, -1.0, 1.0, 4, 0, 0.0).is_empty());
+    }
+
+    /// The arrows are the equations, not a picture of them. For the circle the
+    /// field is a quarter turn anticlockwise of the position vector.
+    #[test]
+    fn the_field_points_where_the_rows_point() {
+        let mut m = Model::new();
+        m.set_source(CIRCLE);
+        let f = m.vector_field(-1.0, 1.0, -1.0, 1.0, 3, 3, 0.0);
+
+        // (1, 0) -> (0, 1)
+        let a = arrow(&f, 3, 2, 1);
+        assert_eq!(&a[0..2], &[1.0, 0.0]);
+        assert!(a[2].abs() < 1e-12 && (a[3] - 1.0).abs() < 1e-12, "{:?}", a);
+
+        // (0, 1) -> (-1, 0)
+        let b = arrow(&f, 3, 1, 2);
+        assert_eq!(&b[0..2], &[0.0, 1.0]);
+        assert!((b[2] + 1.0).abs() < 1e-12 && b[3].abs() < 1e-12, "{:?}", b);
+
+        // and the fixed point at the origin has no arrow at all
+        let c = arrow(&f, 3, 1, 1);
+        assert_eq!(&c[2..4], &[0.0, 0.0]);
+    }
+
+    /// The plane has two axes. One state has nothing to put on the second and
+    /// three has nothing to do with the third, so both draw nothing rather than
+    /// projecting a picture nobody asked for.
+    #[test]
+    fn a_field_needs_exactly_two_states() {
+        let mut m = Model::new();
+        m.set_source("x' = -x\nx(0) = 1");
+        assert!(m.vector_field(-1.0, 1.0, -1.0, 1.0, 4, 4, 0.0).is_empty());
+
+        m.set_source("x' = -y\ny' = x\nz' = -z\nx(0) = 1");
+        assert_eq!(m.document().dim(), 3);
+        assert!(m.vector_field(-1.0, 1.0, -1.0, 1.0, 4, 4, 0.0).is_empty());
+
+        // A second-order row is two states and does have a field: position on
+        // one axis, its velocity on the other.
+        m.set_source("x'' = -x\nx(0) = 1");
+        assert_eq!(m.vector_field(-1.0, 1.0, -1.0, 1.0, 4, 4, 0.0).len(), 64);
+    }
+
+    /// `t` is a parameter because for these rows the field genuinely is a
+    /// different field at every instant. Sampling at zero and calling it *the*
+    /// field would be the one thing the view must not do.
+    #[test]
+    fn a_non_autonomous_field_changes_with_time() {
+        let mut m = Model::new();
+        m.set_source("x' = sin(t)\ny' = x\nx(0) = 0\ny(0) = 0");
+
+        let a = m.vector_field(-1.0, 1.0, -1.0, 1.0, 4, 4, 0.0);
+        let b = m.vector_field(-1.0, 1.0, -1.0, 1.0, 4, 4, std::f64::consts::FRAC_PI_2);
+        assert_eq!(a.len(), b.len());
+
+        // Same grid points, genuinely different arrows.
+        for k in (0..a.len()).step_by(4) {
+            assert_eq!((a[k], a[k + 1]), (b[k], b[k + 1]));
+            assert!(a[k + 2].abs() < 1e-12, "at t = 0, x' = sin(0) = 0");
+            assert!((b[k + 2] - 1.0).abs() < 1e-12, "at t = pi/2, x' = 1");
+        }
+        assert!(a != b);
+
+        // An autonomous document is the honest opposite: same field forever.
+        m.set_source(CIRCLE);
+        assert_eq!(
+            m.vector_field(-1.0, 1.0, -1.0, 1.0, 4, 4, 0.0),
+            m.vector_field(-1.0, 1.0, -1.0, 1.0, 4, 4, 17.5)
+        );
+    }
+
+    /// Half-typed input is a normal state here too. Nothing throws; the view
+    /// simply has nothing to draw until the row means something.
+    #[test]
+    fn a_document_that_does_not_compile_has_no_field() {
+        let mut m = Model::new();
+        // a genuine error
+        m.set_source("x' = -y)\ny' = x");
+        assert!(m.vector_field(-1.0, 1.0, -1.0, 1.0, 4, 4, 0.0).is_empty());
+        // a name nobody has defined yet — pending, and equally undrawable
+        m.set_source("x' = -k y\ny' = x");
+        assert!(m.vector_field(-1.0, 1.0, -1.0, 1.0, 4, 4, 0.0).is_empty());
+        // mid-keystroke
+        m.set_source("x' = -\ny' = x");
+        assert!(m.vector_field(-1.0, 1.0, -1.0, 1.0, 4, 4, 0.0).is_empty());
+        // and nothing at all
+        assert!(Model::new()
+            .vector_field(-1.0, 1.0, -1.0, 1.0, 4, 4, 0.0)
+            .is_empty());
+    }
+
+    /// The property the whole field view rests on: the arrows and the curves
+    /// come out of one evaluation of the document, so an arrow is the tangent
+    /// of the trajectory through the point it sits on. Checked against a
+    /// trajectory the solver actually integrated, not against a formula — a
+    /// second reading of the rows here would test the wrong thing.
+    #[test]
+    fn every_arrow_is_the_tangent_of_the_curve_through_it() {
+        // Nonlinear and asymmetric, so a swapped or sign-flipped component
+        // could not pass by coincidence.
+        let mut m = Model::new();
+        m.set_source("x' = x - x y\ny' = x y - y\nx(0) = 1\ny(0) = 0.5");
+
+        let h = 1e-4;
+        for &(x, y) in &[(1.0, 0.5), (0.4, 1.7), (2.3, 0.9), (1.5, 1.5)] {
+            let f = m.vector_field(x, x, y, y, 1, 1, 0.0);
+            let seed = m.trajectory_from(0.0, h, Method::Tsit5, &[x, y], 2);
+            assert_eq!(seed.len(), 6);
+            let (dx, dy) = ((seed[4] - seed[1]) / h, (seed[5] - seed[2]) / h);
+            assert!((f[2] - dx).abs() < 1e-3, "at ({}, {}): {:?}", x, y, f);
+            assert!((f[3] - dy).abs() < 1e-3, "at ({}, {}): {:?}", x, y, f);
+        }
+
+        // The same holds through the symplectic path, where the solver reaches
+        // the rows via `Paired` rather than directly: one `ModelSystem`, so one
+        // right-hand side whichever integrator is on the slider.
+        m.set_source("x'' = -sin(x) - 0.3x'\nx(0) = 1\nx'(0) = 0");
+        for &(x, v) in &[(1.0, 0.0), (-0.7, 1.2), (2.0, -0.5)] {
+            let f = m.vector_field(x, x, v, v, 1, 1, 0.0);
+            let seed = m.trajectory_from(0.0, h, Method::Verlet, &[x, v], 2);
+            assert_eq!(seed.len(), 6);
+            let (dx, dv) = ((seed[4] - seed[1]) / h, (seed[5] - seed[2]) / h);
+            assert!((f[2] - dx).abs() < 1e-3, "at ({}, {}): {:?}", x, v, f);
+            assert!((f[3] - dv).abs() < 1e-3, "at ({}, {}): {:?}", x, v, f);
+        }
+    }
+
+    /// A seed is a different starting point, and it draws a different curve.
+    /// The document's own initial condition is seed zero and nothing more.
+    #[test]
+    fn a_seed_draws_its_own_curve() {
+        let m = solved(CIRCLE, 0.0, std::f64::consts::TAU);
+        let own = m.sample(64);
+        let seed = m.trajectory_from(0.0, std::f64::consts::TAU, Method::Tsit5, &[2.0, 0.0], 64);
+
+        assert_eq!(seed.len(), own.len(), "the same flat layout as `sample`");
+        // Same times, twice the radius.
+        for row in 0..64 {
+            let k = row * 3;
+            assert!((seed[k] - own[k]).abs() < 1e-12, "same sample times");
+            let r = (seed[k + 1].powi(2) + seed[k + 2].powi(2)).sqrt();
+            assert!((r - 2.0).abs() < 1e-6, "radius {} at row {}", r, row);
+        }
+        assert!(seed != own);
+    }
+
+    /// The property most likely to break, asserted on its own: a seed is a
+    /// *view* of the model. The shell draws one per seed on top of the
+    /// document's own run, and that run — its curve, its telemetry, its
+    /// conservation series — has to be exactly where it was left.
+    #[test]
+    fn a_seed_leaves_the_stored_solution_untouched() {
+        let mut m = solved(
+            "x'' = -x\nx(0) = 1\nx'(0) = 0\nE = 0.5(x'^2 + x^2)",
+            0.0,
+            20.0,
+        );
+        let before_sample = m.sample(200);
+        let before_eval = m.eval(7.5);
+        let before_method = m.method();
+        let before_telemetry = m.telemetry().steps.len();
+        m.conservation("E", 0);
+        let before_series = m.conservation_series();
+        assert!(!before_series.is_empty());
+
+        // Several seeds, different starting points, different methods, and one
+        // that cannot be integrated at all.
+        for method in Method::ALL {
+            for start in [[0.5, 0.0], [0.0, 3.0], [-2.0, 1.5]] {
+                let seed = m.trajectory_from(0.0, 20.0, method, &start, 100);
+                assert_eq!(seed.len(), 300, "{} from {:?}", method, start);
+            }
+        }
+        assert!(m
+            .trajectory_from(0.0, 20.0, Method::Tsit5, &[1.0], 100)
+            .is_empty());
+
+        assert_eq!(m.sample(200), before_sample, "the document's own curve");
+        assert_eq!(m.eval(7.5), before_eval);
+        assert_eq!(m.method(), before_method);
+        assert_eq!(m.telemetry().steps.len(), before_telemetry);
+        assert_eq!(
+            m.conservation_series(),
+            before_series,
+            "and its drift curve"
+        );
+    }
+
+    /// A stale seed — one the shell is still holding from before the document
+    /// grew a row — is a normal state, and normal states come back empty.
+    #[test]
+    fn a_seed_of_the_wrong_length_draws_nothing() {
+        let m = solved(CIRCLE, 0.0, 10.0);
+        assert!(m
+            .trajectory_from(0.0, 10.0, Method::Tsit5, &[], 50)
+            .is_empty());
+        assert!(m
+            .trajectory_from(0.0, 10.0, Method::Tsit5, &[1.0], 50)
+            .is_empty());
+        assert!(m
+            .trajectory_from(0.0, 10.0, Method::Tsit5, &[1.0, 0.0, 0.0], 50)
+            .is_empty());
+        // and asking for no samples is asking for nothing
+        assert!(m
+            .trajectory_from(0.0, 10.0, Method::Tsit5, &[1.0, 0.0], 0)
+            .is_empty());
+    }
+
+    /// The same rule `solve` obeys: the part that worked is the answer. A seed
+    /// dropped where solutions escape to infinity is usually dropped there on
+    /// purpose.
+    #[test]
+    fn a_seed_that_blows_up_returns_the_part_that_worked() {
+        // `x' = x^2` escapes at `t = 1 / x(0)`; `y' = 1` is a clock beside it.
+        let mut m = Model::new();
+        m.set_source("x' = x^2\ny' = 1\nx(0) = 0\ny(0) = 0");
+
+        // The document's own seed sits at x = 0 and never leaves.
+        let r = m.solve(0.0, 5.0);
+        assert!(r.ok && r.stopped.is_none(), "{:?}", r);
+
+        let seed = m.trajectory_from(0.0, 5.0, Method::Tsit5, &[1.0, 0.0], 100);
+        assert_eq!(seed.len(), 300, "short in time, not in samples");
+
+        // It stops where the singularity is, and the last sample is the only
+        // thing that says so.
+        let last_t = seed[297];
+        assert!((last_t - 1.0).abs() < 1e-3, "reached t = {}", last_t);
+        assert!(seed[0].abs() < 1e-12, "still starts at t0");
+
+        // Usable, not a row of infinities: the rise into the pole is the curve.
+        for row in seed.chunks(3) {
+            assert!(row[1].is_finite() && row[2].is_finite(), "{:?}", row);
+            if row[0] < 0.9 {
+                let want = 1.0 / (1.0 - row[0]);
+                assert!((row[1] - want).abs() < 1e-3 * want, "{:?}", row);
+            }
+        }
+
+        // And the document's own solution still covers the whole window.
+        assert!((m.sample(2)[3] - 5.0).abs() < 1e-12);
+    }
+
+    /// A seed is the model's answer, not the integrator's. Two methods over one
+    /// starting point land on one curve, which is what makes the mode slider a
+    /// comparison rather than a change of subject.
+    #[test]
+    fn the_same_seed_agrees_under_two_methods() {
+        let m = solved("x'' = -x\nx(0) = 1\nx'(0) = 0", 0.0, 10.0);
+        let start = [0.4, 1.3];
+        let a = m.trajectory_from(0.0, 10.0, Method::Tsit5, &start, 200);
+        let b = m.trajectory_from(0.0, 10.0, Method::Yoshida4, &start, 200);
+        assert_eq!(a.len(), b.len());
+        for (i, (p, q)) in a.iter().zip(&b).enumerate() {
+            assert!((p - q).abs() < 1e-6, "at {}: {} vs {}", i, p, q);
+        }
+    }
+
+    /// The wire spelling, and the one thing it refuses to guess.
+    #[test]
+    fn a_seed_names_its_method_the_way_the_slider_does() {
+        let m = solved(CIRCLE, 0.0, 6.0);
+        let start = [0.0, 1.0];
+        assert_eq!(
+            m.trajectory_from_named(0.0, 6.0, "tsit5", &start, 32),
+            m.trajectory_from(0.0, 6.0, Method::Tsit5, &start, 32)
+        );
+        // Not a silent default: a seed drawn with an integrator nobody chose,
+        // beside curves drawn with one somebody did, is two pictures in one.
+        assert!(m
+            .trajectory_from_named(0.0, 6.0, "verlet5", &start, 32)
+            .is_empty());
+        // A first-order document has no position/velocity structure, so a
+        // symplectic seed is refused exactly as a symplectic solve is.
+        assert!(m
+            .trajectory_from_named(0.0, 6.0, "Verlet", &start, 32)
+            .is_empty());
+    }
+
+    /// Seeds work on a document that has never been solved: the field and its
+    /// curves are a function of the rows, not of what happens to be stored.
+    #[test]
+    fn a_seed_does_not_need_a_stored_solution_first() {
+        let mut m = Model::new();
+        m.set_source(CIRCLE);
+        assert!(m.sample(10).is_empty(), "nothing solved yet");
+        let seed = m.trajectory_from(0.0, std::f64::consts::TAU, Method::Tsit5, &[1.0, 0.0], 16);
+        assert_eq!(seed.len(), 48);
+        // ...and it still has not stored one.
+        assert!(m.sample(10).is_empty());
+        assert!(m.method().is_none());
     }
 
     // --- the wire shapes --------------------------------------------------

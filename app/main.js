@@ -5,7 +5,10 @@
 //   boot()   ->  load MathField + WASM  ->  reveal the app (eased)
 //   edit     ->  debounce  ->  set_source  ->  per-row diagnostics  ->  solve
 //   pan/zoom ->  debounce  ->  solve over the NEW window  ->  re-sample
+//                          ->  re-ask vector_field for the NEW window
 //   sliders  ->  a parameter slider rewrites its own row and re-solves
+//   click    ->  a seed on the plane  ->  trajectory_from, throttled while
+//                it is dragged, and it NEVER writes a row
 //
 // Rows are Desmos-shaped: a blank row always sits at the end of the list and is
 // not a real row until something is typed into it, Enter opens a row below, and
@@ -27,6 +30,12 @@
 // draw. Pan or zoom the horizontal axis and the model re-solves over the new
 // span, debounced exactly the way editing is, with the last good curve left on
 // screen in the meantime.
+//
+// The same sentence is why the `field` view exists: the window is the query
+// there too, so the arrows are re-sampled for wherever you are looking. And a
+// SEED - a starting point dropped on the plane - is a view of the model rather
+// than a change to it: it gets its own trajectory over the same window and
+// never touches a row (docs/fields-and-seeds.md).
 //
 // Five structural rules this file exists to enforce:
 //
@@ -52,7 +61,8 @@
 // ============================================================================
 
 import {
-  Plot, VIEWS, VIEW_LABEL, panned, scaled, zoomed, seriesColor, fmtValue,
+  Plot, VIEWS, VIEW_LABEL, PLANE_VIEWS, panned, scaled, zoomed, seriesColor,
+  fmtValue, fieldGrid,
 } from './plot.js';
 import { DEMOS } from './demos.js';
 import { SoundPlayer, DEFAULTS as AUDIO_DEFAULTS } from './audio.js';
@@ -79,6 +89,7 @@ const el = {
   methods:   $('methods'),
   viewsBtn:  $('views-btn'),
   viewmenu:  $('viewmenu'),
+  seedsBtn:  $('seeds-btn'),
   canvas:     $('canvas'),
   frameFit:   $('frame-fit'),
   frameReset: $('frame-reset'),
@@ -247,6 +258,10 @@ const state = {
   // What the loaded document says is worth drawing (`show`), or null for
   // everything. A display choice: the states left out are still solved.
   show: null,
+  // The right-hand side as last sampled across the visible window:
+  // { nx, ny, t, data, gen, win } or null. The window is the query, so this is
+  // re-asked whenever the window moves.
+  field: null,
 };
 
 const clamp = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v);
@@ -760,6 +775,10 @@ function loadDemo(demo) {
   // `show` names the series that ARE the picture - one line per string rather
   // than one per state. Everything is still solved; this only says what to draw.
   state.show = Array.isArray(demo.show) && demo.show.length ? demo.show.slice() : null;
+
+  // A seed is a point in THIS system's state space. Another system is another
+  // space, so the handles do not carry over.
+  clearSeeds();
 
   clearRows();
   buildRows(demo.source.split('\n'));
@@ -1379,9 +1398,24 @@ const VIEW_WHY = {
   time:  ['every state against time', 'every state against time'],
   phase: ['state 2 against state 1', 'needs exactly 2 states'],
   polar: ['r against the angle', 'needs a state named r'],
+  field: ['the equation itself, as arrows', 'needs exactly 2 states'],
 };
 
-const caps = { time: true, phase: false, polar: false };
+const caps = { time: true, phase: false, polar: false, field: false };
+
+/**
+ * The one-line reason a view is or is not drawable. `field` has a second way
+ * to be unavailable that has nothing to do with the document: an `app/pkg/`
+ * built before `vector_field` existed. Saying which is which is the difference
+ * between "your model is wrong" and "your build is old".
+ */
+function viewWhy(view) {
+  const t = VIEW_WHY[view];
+  if (!t) return '';
+  if (caps[view]) return t[0];
+  if (view === 'field' && !fieldApi) return 'this WASM build has no vector_field';
+  return t[1];
+}
 
 /**
  * The views the user has explicitly switched OFF. Everything the model supports
@@ -1402,6 +1436,9 @@ function applyViews() {
   plot.setSupport(caps);
   renderViewMenu();
   syncFrameButtons();
+  // Turning the field on IS the query; turning it off drops the arrows.
+  scheduleField(0);
+  syncSeeds();
   scheduleDraw();
 }
 
@@ -1447,8 +1484,7 @@ function renderViewMenu() {
 
     const why = document.createElement('span');
     why.className = 'viewitem__why';
-    const t = VIEW_WHY[view];
-    why.textContent = t ? (caps[view] ? t[0] : t[1]) : '';
+    why.textContent = viewWhy(view);
 
     item.append(mark, name, why);
     item.addEventListener('click', () => toggleView(view));
@@ -1487,9 +1523,13 @@ function toggleViewMenu() {
  * anyone is owed.
  */
 function updateCapabilities(names) {
+  const plane = Array.isArray(names) && names.length === 2;
   caps.time = true;
-  caps.phase = Array.isArray(names) && names.length === 2;
+  caps.phase = plane;
   caps.polar = polarMapFor(names) !== null;
+  // The same condition as `phase`, for the same reason - the plane has two
+  // axes - plus a build that can actually answer for the right-hand side.
+  caps.field = plane && !!fieldApi;
   applyViews();
 }
 
@@ -1631,6 +1671,9 @@ function frameChanged(delay) {
   resampleForFrame();
   scheduleDraw();
   scheduleResolve(delay);
+  // The window is the field's query too, so the arrows follow it - debounced
+  // the same way, with the ones already on screen left up in the meantime.
+  scheduleField(delay);
 }
 
 /**
@@ -1710,20 +1753,66 @@ function canvasPoint(e) {
 
 const CURSOR = { body: 'grab', x: 'ew-resize', y: 'ns-resize' };
 
+/**
+ * A tap that lands a seed must not also be half of a double click, and a
+ * double click must still reset the frame. So an add remembers where and when
+ * it happened: a second tap in the same place inside the threshold is the same
+ * gesture and adds nothing, and the dblclick that follows takes the seed back
+ * out instead of resetting the frame.
+ *
+ * Two windows, because they guard opposite mistakes. Suppressing the second
+ * tap must not swallow a deliberate second click, so it stays at the platform's
+ * own double-click threshold. Undoing on `dblclick` only ever runs when the
+ * platform has ALREADY ruled the pair a double click, so it can afford to be
+ * generous - and it has to be, because the two events are separated by an
+ * integration and a repaint.
+ */
+const ADD_SUPPRESS_MS = 500;
+const DBL_UNDO_MS = 900;
+const DBL_PX = 6;
+let lastSeedAdd = { t: -1e9, x: 0, y: 0, id: 0 };
+
 function wireCanvasGestures() {
   const cv = el.canvas;
   let drag = null;
 
+  const setHover = (id) => {
+    if (hoverSeedId === id) return;
+    hoverSeedId = id;
+    syncSeeds();
+    scheduleDraw();
+  };
+
   cv.addEventListener('pointermove', (e) => {
     if (drag) return;
     const p = canvasPoint(e);
+    const seed = plot.hitSeed(p.x, p.y);
+    setHover(seed && !seed.locked ? seed.id : 0);
+    if (seed) {
+      cv.style.cursor = seed.locked ? 'default' : seed.part === 'remove' ? 'pointer' : 'move';
+      return;
+    }
     const hit = plot.hit(p.x, p.y);
     cv.style.cursor = hit ? CURSOR[hit.region] : 'default';
   });
 
+  cv.addEventListener('pointerleave', () => { if (!drag) setHover(0); });
+
   cv.addEventListener('pointerdown', (e) => {
     if (e.button != null && e.button !== 0) return;
     const p = canvasPoint(e);
+
+    // A handle takes the pointer before the frame does: grabbing a seed is
+    // never a pan, and its × is never a seed.
+    const seed = plot.hitSeed(p.x, p.y);
+    if (seed && !seed.locked) {
+      e.preventDefault();
+      closeSettings();
+      if (seed.part === 'remove') { removeSeed(seed.id); return; }
+      dragSeed(cv, e, p, seed.id);
+      return;
+    }
+
     const hit = plot.hit(p.x, p.y);
     if (!hit) return;
     e.preventDefault();
@@ -1772,8 +1861,14 @@ function wireCanvasGestures() {
       cv.removeEventListener('pointermove', move);
       cv.removeEventListener('pointerup', up);
       cv.removeEventListener('pointercancel', up);
+      const rec = drag;
       drag = null;
       const q = canvasPoint(ev);
+      // A press on the plane that never turned into a pan is a click, and a
+      // click on the plane is where a seed goes.
+      if (rec && !rec.moved && rec.region === 'body' && ev.type === 'pointerup') {
+        placeSeedAt(q, plot.dataAt(rec.box, q.x, q.y));
+      }
       const h = plot.hit(q.x, q.y);
       cv.style.cursor = h ? CURSOR[h.region] : 'default';
     };
@@ -1788,6 +1883,18 @@ function wireCanvasGestures() {
     const hit = plot.hit(p.x, p.y);
     if (!hit) return;
     e.preventDefault();
+    // The first half of this gesture may have dropped a seed. Take it back -
+    // and then do what a double click has always done here. One intent, one
+    // outcome: the frame goes home and no seed is left behind to prove the
+    // shell was confused about which gesture it was watching.
+    const fresh = lastSeedAdd.id
+      && performance.now() - lastSeedAdd.t < DBL_UNDO_MS
+      && Math.abs(p.x - lastSeedAdd.x) <= DBL_PX
+      && Math.abs(p.y - lastSeedAdd.y) <= DBL_PX;
+    if (fresh) {
+      removeSeed(lastSeedAdd.id);
+      lastSeedAdd = { t: -1e9, x: 0, y: 0, id: 0 };
+    }
     plot.resetWindow();
     frameChanged(0);
   });
@@ -1808,6 +1915,63 @@ function wireCanvasGestures() {
     else plot.setWindow(zoomed(win, f, at.x, at.y));
     frameChanged();
   }, { passive: false });
+}
+
+/**
+ * Drop a seed where the pointer was released - if a click there can mean a
+ * state at all. With only `t–y` on the horizontal axis is time, so a click
+ * names no starting point and nothing is placed; the seeds control on the
+ * strip carries the reason.
+ */
+function placeSeedAt(px, at) {
+  if (!canPlaceSeeds() || !at) return;
+  const now = performance.now();
+  // the second tap of a double click is the same gesture, not a second seed
+  if (now - lastSeedAdd.t < ADD_SUPPRESS_MS &&
+      Math.abs(px.x - lastSeedAdd.x) <= DBL_PX &&
+      Math.abs(px.y - lastSeedAdd.y) <= DBL_PX) return;
+  const s = addSeed(at.x, at.y);
+  if (s) lastSeedAdd = { t: now, x: px.x, y: px.y, id: s.id };
+}
+
+/**
+ * Drag one seed. The handle is repositioned on every pointermove and the
+ * re-integration is throttled underneath it, so the curve keeps up instead of
+ * flickering - the same bargain the frame gestures make with the solve.
+ */
+function dragSeed(cv, e, p, id) {
+  draggingSeedId = id;
+  hoverSeedId = id;
+  const box = plot.box;
+  syncSeeds();
+  scheduleDraw();
+  cv.style.cursor = 'grabbing';
+  try { cv.setPointerCapture(e.pointerId); } catch (err) { /* older engines */ }
+
+  const move = (ev) => {
+    if (ev.pointerId !== e.pointerId) return;
+    const q = canvasPoint(ev);
+    const at = plot.dataAt(box, q.x, q.y);
+    moveSeed(id, at.x, at.y, true);
+  };
+
+  const up = (ev) => {
+    if (ev.pointerId !== e.pointerId) return;
+    cv.removeEventListener('pointermove', move);
+    cv.removeEventListener('pointerup', up);
+    cv.removeEventListener('pointercancel', up);
+    draggingSeedId = 0;
+    const q = canvasPoint(ev);
+    const at = plot.dataAt(box, q.x, q.y);
+    // One last integration at the position the pointer actually stopped at,
+    // un-throttled: the final frame is the one that has to be exact.
+    moveSeed(id, at.x, at.y, false);
+    cv.style.cursor = 'move';
+  };
+
+  cv.addEventListener('pointermove', move);
+  cv.addEventListener('pointerup', up);
+  cv.addEventListener('pointercancel', up);
 }
 
 // ---------------------------------------------------------------------------
@@ -2341,6 +2505,10 @@ function recompute() {
   // A re-solve draws inside the frame the user left. It is never moved here.
   syncFrameButtons();
   renderReadout(reportNames, endValues());
+  // The equation moved, so both views of it move with it: the arrows are of
+  // this right-hand side, and every seed is over this span.
+  scheduleField(0);
+  refreshSeeds();
   scheduleDraw();
 }
 
@@ -2411,6 +2579,42 @@ globalThis.__numplaInspect = {
     ensureTail();
     scheduleRecompute(0);
   },
+
+  /** Which views are drawable, and which are drawing. */
+  views: () => ({ on: activeViews(), caps: { ...caps } }),
+
+  /**
+   * The arrows as last computed: the grid, the instant, and a generation
+   * counter that ticks once per recompute - which is how the suite can tell
+   * "the field followed the window" from "the field happens to look the same".
+   */
+  field: () => {
+    const f = state.field;
+    if (!f) return null;
+    return { nx: f.nx, ny: f.ny, t: f.t, gen: f.gen, win: f.win, count: f.data.length / 4 };
+  },
+
+  /** Seed zero (the document's, locked) and every seed the user placed. */
+  seeds: () => plot.seeds.map((s) => ({
+    id: s.id, x: s.x, y: s.y, locked: !!s.locked, n: s.sol ? s.sol.n : 0,
+  })),
+
+  /** Which optional WASM calls this build actually has. */
+  probe: () => ({ field: !!fieldApi, seed: !!seedApi }),
+
+  /**
+   * Swap the optional calls out. The suite uses this twice: with `null`, to
+   * prove the shell degrades when `app/pkg/` predates them; and with a stub,
+   * to drive the whole field/seed pipeline on a build that has not shipped
+   * them yet. `null` restores whatever the real probe found.
+   */
+  setApis: (next) => {
+    fieldApi = next && 'field' in next ? next.field : probedApis.field;
+    seedApi = next && 'seed' in next ? next.seed : probedApis.seed;
+    updateCapabilities(state.names);
+    clearSeeds();
+    scheduleField(0);
+  },
 };
 
 let debounceTimer = 0;
@@ -2462,6 +2666,322 @@ function scheduleResolve(delay = RESOLVE_MS) {
     if (spanUnchanged(want, { t0: state.t0, t1: state.t1 })) return;
     runRecompute();
   }, delay);
+}
+
+// ===========================================================================
+// The field, and the seeds
+//
+// Two halves of one idea (docs/fields-and-seeds.md): an equation is a field of
+// arrows, and a solution is a point dropped into it. Numpla drew only the
+// second half, for the single starting point the document happened to name.
+//
+// Both calls are OPTIONAL. `app/pkg/` can be older than the crate, so they are
+// probed exactly the way `solve_with` is - never assumed - and everything
+// below degrades to "the menu says why" when they are not there.
+// ===========================================================================
+
+/** (x0, x1, y0, y1, nx, ny, t) -> Float64Array, or null if the build has none. */
+let fieldApi = null;
+/** (t0, t1, method, y0, n) -> Float64Array, or null if the build has none. */
+let seedApi = null;
+/** What the probe found, so a test that swaps them can put them back. */
+let probedApis = { field: null, seed: null };
+
+/** Bind `vector_field` off a model, camelCase or not. Null when absent. */
+export function probeFieldApi(model) {
+  if (!model) return null;
+  const fn = typeof model.vector_field === 'function' ? 'vector_field'
+           : typeof model.vectorField === 'function' ? 'vectorField'
+           : null;
+  if (!fn) return null;
+  return (x0, x1, y0, y1, nx, ny, t) => model[fn](x0, x1, y0, y1, nx, ny, t);
+}
+
+/** Bind `trajectory_from` off a model, camelCase or not. Null when absent. */
+export function probeSeedApi(model) {
+  if (!model) return null;
+  const fn = typeof model.trajectory_from === 'function' ? 'trajectory_from'
+           : typeof model.trajectoryFrom === 'function' ? 'trajectoryFrom'
+           : null;
+  if (!fn) return null;
+  return (t0, t1, method, y0, n) => model[fn](t0, t1, method, y0, n);
+}
+
+// ---------------------------------------------------------------------------
+// The field
+//
+// The window is the query, so the grid follows the window: every pan and zoom
+// re-asks for the arrows where you are now looking, debounced at the same
+// 180 ms as the re-solve and for the same reason - a pointermove is not a
+// decision. The previous arrows stay up meanwhile; they are drawn at their own
+// data coordinates, so a pan slides them along with everything else and only
+// the newly exposed edge is briefly bare.
+//
+// The grid density comes from the BOX, in pixels, per axis - see `fieldGrid`
+// in plot.js, which owns the rule.
+//
+// A non-autonomous system has a different field at every instant. This is the
+// one at the START of the window, and the canvas says so rather than implying
+// the picture is timeless.
+// ---------------------------------------------------------------------------
+
+let fieldTimer = 0;
+let fieldGen = 0;
+
+/** The data box in CSS pixels - the plot's if it has drawn, else the canvas. */
+function fieldBoxSize() {
+  const b = plot.box;
+  if (b && b.R - b.L > 8 && b.B - b.T > 8) return { w: b.R - b.L, h: b.B - b.T };
+  const r = el.canvas.getBoundingClientRect();
+  return { w: Math.max(80, (r.width || 900) * 0.86), h: Math.max(60, (r.height || 420) * 0.82) };
+}
+
+function clearField() {
+  if (!state.field) return;
+  state.field = null;
+  plot.setField(null);
+  scheduleDraw();
+}
+
+function computeField() {
+  if (!fieldApi || !caps.field || activeViews().indexOf('field') < 0) {
+    clearField();
+    return;
+  }
+  const win = plot.getWindow();
+  const size = fieldBoxSize();
+  const { nx, ny } = fieldGrid(size.w, size.h);
+  // The start of the window is the instant being sampled. With `t–y` off the
+  // window says nothing about time, so the span that was last integrated does.
+  const t = spanFromFrame().t0;
+
+  let data = null;
+  try {
+    data = toF64(fieldApi(win.x0, win.x1, win.y0, win.y1, nx, ny, t));
+  } catch (err) {
+    console.error('[numpla] vector_field threw', err);
+    data = null;
+  }
+  // "Empty when the document does not have exactly two states, or does not
+  // compile" - a normal answer, not a failure.
+  if (!data || data.length < nx * ny * 4) {
+    clearField();
+    return;
+  }
+
+  state.field = { nx, ny, t, data, gen: ++fieldGen, win };
+  plot.setField(state.field);
+  scheduleDraw();
+}
+
+function scheduleField(delay = RESOLVE_MS) {
+  clearTimeout(fieldTimer);
+  fieldTimer = setTimeout(computeField, Math.max(0, delay));
+}
+
+// ---------------------------------------------------------------------------
+// Seeds
+//
+// A seed is a starting point the user put down, integrated over the same
+// window in the same frame. It is a VIEW of the model and never a change to
+// it: nothing here writes a row, and the document's own initial condition is
+// seed zero - drawn with the same ring, given no more weight than the rest.
+//
+// WHAT A SEED MEANS WITH ONLY `t–y` ON. Placing one is a phase-plane idea: a
+// click only names a state when both axes are states, and with `t–y` on the
+// horizontal axis is time. So a seed can only be PLACED while the plane is on
+// (`phase` or `field`) - and once placed it is not a phase-plane-only object.
+// Its trajectory is drawn against t as well, thin, one line per state, which
+// is the same starting point read the other way round.
+//
+// WHY DRAGGING STAYS SMOOTH. The handle follows the pointer every frame; the
+// integration is THROTTLED to one every 55 ms, leading edge plus a trailing
+// call so the last position is never the one that got skipped. Between them
+// the previous trajectory stays on screen, drawn slightly faded, so a drag is
+// a curve keeping up rather than a curve blinking out.
+// ---------------------------------------------------------------------------
+
+/** User-placed seeds, in placement order. Ids start at 1: 0 is the document. */
+const seeds = [];
+let seedIdSeq = 0;
+let hoverSeedId = 0;
+let draggingSeedId = 0;
+
+const SEED_THROTTLE_MS = 55;
+
+/** Can a seed exist at all? Two states, and a build that can integrate one. */
+function seedsUsable() {
+  return !!seedApi && caps.phase;
+}
+
+/** Is the plane - where a seed is placed and shown - on screen? */
+function planeIsOn() {
+  return activeViews().some((v) => PLANE_VIEWS.indexOf(v) >= 0);
+}
+
+/** Seeds may be PLACED only where a click names a state on both axes. */
+function canPlaceSeeds() {
+  return seedsUsable() && planeIsOn();
+}
+
+/**
+ * What the plot draws: seed zero (the document's own start, locked) followed
+ * by the user's, each carrying its colour slot and its live gesture state.
+ */
+function seedList() {
+  const out = [];
+  const f = state.sol;
+  if (f && f.dim === 2 && f.n) {
+    out.push({ id: 0, locked: true, slot: 0, x: f.data[1], y: f.data[2], sol: null });
+  }
+  seeds.forEach((s, i) => out.push({
+    id: s.id,
+    slot: i,
+    x: s.x,
+    y: s.y,
+    sol: s.sol,
+    stale: !!s.stale,
+    hover: hoverSeedId === s.id,
+    dragging: draggingSeedId === s.id,
+  }));
+  return out;
+}
+
+function syncSeeds() {
+  plot.setSeeds(seedList());
+  renderSeedsButton();
+}
+
+/**
+ * One seed's trajectory. `trajectory_from` does not disturb the stored
+ * solution, so this costs exactly its own integration and the document's curve
+ * is untouched.
+ */
+function integrateSeed(s) {
+  clearTimeout(s.timer);
+  s.timer = 0;
+  if (!seedsUsable()) {
+    if (s.sol) { s.sol = null; s.stale = false; syncSeeds(); scheduleDraw(); }
+    return;
+  }
+  const { t0, t1 } = spanFromFrame();
+  if (!isFinite(t0) || !isFinite(t1) || t1 <= t0) return;
+
+  const n = sampleCount();
+  let data = null;
+  try {
+    data = toF64(seedApi(t0, t1, currentMethod, Float64Array.of(s.x, s.y), n));
+  } catch (err) {
+    console.error('[numpla] trajectory_from threw', err);
+    return;                       // keep the last good curve exactly where it is
+  }
+  const stride = 3;               // [t, y0, y1] - the same layout as `sample`
+  const got = Math.floor(data.length / stride);
+  s.stale = false;
+  // Empty is the contract's answer to a refusal or a mismatch, not a throw.
+  s.sol = got > 1 ? { dim: 2, n: got, data } : null;
+  syncSeeds();
+  scheduleDraw();
+}
+
+/**
+ * Re-integrate during a drag: at most one every 55 ms, and always one more
+ * after the pointer stops. The handle itself has already moved.
+ */
+function seedSolveThrottled(s) {
+  const now = performance.now();
+  const wait = SEED_THROTTLE_MS - (now - (s.last || 0));
+  clearTimeout(s.timer);
+  if (wait <= 0) {
+    s.last = now;
+    integrateSeed(s);
+    return;
+  }
+  s.stale = true;                 // the curve on screen is one step behind
+  s.timer = setTimeout(() => { s.last = performance.now(); integrateSeed(s); }, wait);
+}
+
+/** Every seed, over the current span. Called whenever the model or span moves. */
+function refreshSeeds() {
+  if (!seeds.length) { syncSeeds(); return; }
+  for (const s of seeds) integrateSeed(s);
+  syncSeeds();
+}
+
+function addSeed(x, y) {
+  if (!isFinite(x) || !isFinite(y)) return null;
+  const s = { id: ++seedIdSeq, x, y, sol: null, stale: false, timer: 0, last: 0 };
+  seeds.push(s);
+  hoverSeedId = s.id;
+  integrateSeed(s);
+  syncSeeds();
+  scheduleDraw();
+  return s;
+}
+
+function seedById(id) {
+  return seeds.find((s) => s.id === id) || null;
+}
+
+function moveSeed(id, x, y, live) {
+  const s = seedById(id);
+  if (!s || !isFinite(x) || !isFinite(y)) return;
+  s.x = x;
+  s.y = y;
+  syncSeeds();
+  scheduleDraw();                 // the handle keeps up with the pointer
+  if (live) seedSolveThrottled(s); else integrateSeed(s);
+}
+
+function removeSeed(id) {
+  const i = seeds.findIndex((s) => s.id === id);
+  if (i < 0) return false;
+  clearTimeout(seeds[i].timer);
+  seeds.splice(i, 1);
+  if (hoverSeedId === id) hoverSeedId = 0;
+  if (draggingSeedId === id) draggingSeedId = 0;
+  syncSeeds();
+  scheduleDraw();
+  return true;
+}
+
+function clearSeeds() {
+  if (!seeds.length) { syncSeeds(); return; }
+  for (const s of seeds) clearTimeout(s.timer);
+  seeds.length = 0;
+  hoverSeedId = 0;
+  draggingSeedId = 0;
+  syncSeeds();
+  scheduleDraw();
+}
+
+/**
+ * The seeds control on the strip. With none placed it is the only place that
+ * says the gesture exists; with some placed it is how they all go away.
+ */
+/** Why a seed can or cannot be placed right now, in one sentence. */
+function seedsWhy() {
+  if (!seedApi) return 'this WASM build has no trajectory_from — rebuild the WASM';
+  if (!caps.phase) return 'a seed is a point in the plane — this document needs exactly 2 states';
+  if (!planeIsOn()) {
+    return 'seeds are a phase-plane idea — turn on phase or field, then click the plane';
+  }
+  return 'click the plane to drop a starting point';
+}
+
+function renderSeedsButton() {
+  const btn = el.seedsBtn;
+  if (!btn) return;
+  const n = seeds.length;
+  btn.textContent = n ? 'seeds · ' + n + ' ×' : 'seeds';
+  btn.classList.toggle('is-live', n > 0);
+  btn.setAttribute('aria-disabled', n ? 'false' : 'true');
+  // The count never displaces the reason: with the plane off, the seeds still
+  // on screen are exactly when someone needs to be told where to put the next
+  // one.
+  btn.title = n
+    ? 'Remove all ' + n + ' seed' + (n === 1 ? '' : 's') + ' · ' + seedsWhy()
+    : seedsWhy();
 }
 
 // ===========================================================================
@@ -3103,6 +3623,14 @@ function wire() {
 
   el.viewsBtn.addEventListener('click', toggleViewMenu);
 
+  if (el.seedsBtn) {
+    el.seedsBtn.addEventListener('click', (e) => {
+      e.preventDefault();
+      clearSeeds();
+    });
+  }
+  renderSeedsButton();
+
   // a pointer released anywhere ends whatever slider drag was in progress
   const endDrag = () => { sliders.forEach((s) => { s.dragging = false; }); };
   window.addEventListener('pointerup', endDrag);
@@ -3196,7 +3724,8 @@ function wire() {
 
   // HiDPI-correct redraw whenever the plot box changes size
   if (typeof ResizeObserver === 'function') {
-    const ro = new ResizeObserver(() => scheduleDraw());
+    // The grid density is read off the box, so a resized box is a new query.
+    const ro = new ResizeObserver(() => { scheduleDraw(); scheduleField(); });
     document.querySelectorAll('.plot__canvas').forEach((n) => ro.observe(n));
   }
 
@@ -3206,6 +3735,7 @@ function wire() {
     if (!el.info.hidden) positionInfo();
     setDocWidth(docWidth, false);   // re-clamp; the user's choice is kept
     scheduleDraw();
+    scheduleField();
   });
 
   // devicePixelRatio can change when a window moves between monitors
@@ -3292,6 +3822,9 @@ async function boot() {
     };
     // Probed, never assumed: app/pkg/ can be older than the crate.
     methodApi = probeMethodApi(model, mod.Model);
+    probedApis = { field: probeFieldApi(model), seed: probeSeedApi(model) };
+    fieldApi = probedApis.field;
+    seedApi = probedApis.seed;
   } catch (err) {
     fail('The WASM module does not match docs/wasm-api.md.', err);
     return;

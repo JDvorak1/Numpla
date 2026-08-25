@@ -6,6 +6,23 @@
 //   'time'   every state variable against t, one coloured polyline each
 //   'phase'  state[1] against state[0]   (needs exactly 2 states)
 //   'polar'  r against the angle, on the same cartesian frame
+//   'field'  the right-hand side as arrows on the plane (needs exactly 2)
+//
+// THE FIELD IS THE QUESTION, THE CURVES ARE THE ANSWER
+// ----------------------------------------------------
+// `field` draws UNDER everything else, and its arrows are all the same length:
+// direction is what a field is for, and a field whose corner is a thousand
+// times faster than its middle is unreadable the moment length tracks speed.
+// Magnitude is a shade instead, on a log ramp between robust percentiles, so
+// the picture stays legible whatever the numbers are (docs/fields-and-seeds.md).
+//
+// SEEDS ARE HANDLES, NOT DATA
+// ---------------------------
+// A seed is a starting point the user put down. Its trajectory is drawn like
+// any other curve - the document's initial condition is seed zero and gets no
+// special weight - but the seed ITSELF is drawn as a ring: an object to grab,
+// visibly not a sample. This module owns the geometry, so it also answers
+// "which seed is under this pixel" (hitSeed); the shell owns the gestures.
 //
 // HOW SEVERAL VIEWS SHARE THE CANVAS
 // ----------------------------------
@@ -48,6 +65,12 @@ export const SERIES = [
 
 export const seriesColor = (i) => SERIES[i % SERIES.length];
 
+/**
+ * The colour of seed `i`. Offset past the first two series so a seed's curve
+ * never wears the colour of the state it is a starting point for.
+ */
+export const seedColor = (i) => seriesColor(i + 2);
+
 /** Every non-curve colour on the canvas, in one place. */
 const INK = {
   bg:       '#ffffff',
@@ -58,16 +81,31 @@ const INK = {
   label:    '#78818f',
   faint:    '#9aa2b0',
   title:    '#a7aeba',
+  // The field's shade ramp: slow is barely there, fast is nearly ink. Both
+  // ends stay cooler and greyer than every series colour, so the arrows read
+  // as ground and the curves as figure however dense the grid gets.
+  fieldLo:  [186, 194, 206],
+  fieldHi:  [ 74,  86, 110],
 };
 
 const MONO =
   'ui-monospace, SFMono-Regular, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace';
 
+/** A seed handle's ring radius, and the remove badge that appears on hover. */
+export const SEED_R = 5.5;
+export const SEED_BADGE = { dx: 10, dy: -10, r: 5.5 };
+
 /** The view ids this module understands. `main.js` shares this vocabulary. */
-export const VIEWS = ['time', 'phase', 'polar'];
+export const VIEWS = ['time', 'phase', 'polar', 'field'];
 
 /** What each pane is called on the canvas. */
-export const VIEW_LABEL = { time: 't–y', phase: 'phase', polar: 'polar' };
+export const VIEW_LABEL = { time: 't–y', phase: 'phase', polar: 'polar', field: 'field' };
+
+/**
+ * The views drawn on the PLANE - the two axes are the two states. Seeds are
+ * placed and shown here; with only `t–y` on there is no plane to click.
+ */
+export const PLANE_VIEWS = ['phase', 'field'];
 
 /** The frame every view starts in, and the one the reset control returns to. */
 export const DEFAULT_WINDOW = Object.freeze({ x0: -5, x1: 5, y0: -5, y1: 5 });
@@ -187,6 +225,73 @@ export function scaled(win, axis, f, anchor) {
 /** Zoom both axes about a data point - the wheel gesture. */
 export function zoomed(win, f, ax, ay) {
   return scaled(scaled(win, 'x', f, ax), 'y', f, ay);
+}
+
+// ---------------------------------------------------------------------------
+// The field grid
+//
+// THE DENSITY RULE: one arrow per ~34 CSS pixels of box, counted on each axis
+// separately, clamped to 5..26 arrows per axis.
+//
+// Per axis and in pixels, because that is the only unit readability is
+// measured in. A count fixed in DATA units breaks the moment the window is not
+// square - stretch y and the arrows crowd into rows; a single count for both
+// axes breaks on a wide, short box for the same reason. Spacing the samples
+// evenly on the SCREEN keeps the cells square whatever shape the window is, so
+// the arrows never touch and never leave a lonely scatter. The floor keeps a
+// tiny plot from showing three arrows and calling it a field; the ceiling caps
+// the query at 676 samples, which is cheap and already denser than the eye can
+// separate.
+// ---------------------------------------------------------------------------
+
+export const FIELD_CELL_PX = 34;
+export const FIELD_MIN = 5;
+export const FIELD_MAX = 26;
+
+/** How many arrows across and down, for a box of this size in CSS pixels. */
+export function fieldGrid(wPx, hPx) {
+  const count = (px) =>
+    Math.round(clamp(Math.round((isFinite(px) ? px : 0) / FIELD_CELL_PX), FIELD_MIN, FIELD_MAX));
+  return { nx: count(wPx), ny: count(hPx) };
+}
+
+/**
+ * The shade ramp for a set of magnitudes.
+ *
+ * Log, because a right-hand side routinely spans decades across one window,
+ * and between the 5th and 95th percentile rather than min..max, because one
+ * near-singular corner would otherwise flatten everything else to the palest
+ * shade. A field that really is uniform is widened to half a decade either
+ * side, so numerical dust is not amplified into a picture of variation.
+ */
+export function shadeRamp(mags) {
+  const logs = [];
+  for (const m of mags) if (isFinite(m) && m > 0) logs.push(Math.log10(m));
+  if (!logs.length) return { lo: 0, hi: 1, flat: true, min: 0, max: 0 };
+  logs.sort((a, b) => a - b);
+  const at = (q) => logs[clamp(Math.round(q * (logs.length - 1)), 0, logs.length - 1)];
+  let lo = at(0.05);
+  let hi = at(0.95);
+  const flat = hi - lo < 0.15;
+  if (flat) { const c = (lo + hi) / 2; lo = c - 0.5; hi = c + 0.5; }
+  return {
+    lo, hi, flat,
+    min: Math.pow(10, logs[0]),
+    max: Math.pow(10, logs[logs.length - 1]),
+  };
+}
+
+/** 0..1 - where a magnitude sits on the ramp. */
+function shadeOf(ramp, m) {
+  if (!isFinite(m) || m <= 0) return 0;
+  return clamp((Math.log10(m) - ramp.lo) / Math.max(1e-12, ramp.hi - ramp.lo), 0, 1);
+}
+
+function fieldInk(s) {
+  const a = INK.fieldLo;
+  const b = INK.fieldHi;
+  const mix = (i) => Math.round(a[i] + (b[i] - a[i]) * s);
+  return `rgb(${mix(0)}, ${mix(1)}, ${mix(2)})`;
 }
 
 // ---------------------------------------------------------------------------
@@ -323,11 +428,16 @@ export class Plot {
     this.window = { ...DEFAULT_WINDOW };
     /** view id -> false when the model cannot support it. The shell's menu
      *  reads this; nothing in here switches a view on or off. */
-    this.support = { time: true, phase: true, polar: true };
+    this.support = { time: true, phase: true, polar: true, field: false };
     /** The data box as last drawn: what hit testing and the gestures use. */
     this.box = null;
     /** The whole drawable area as last drawn. */
     this.area = null;
+    /** The sampled right-hand side: { nx, ny, t, data } or null. The shell
+     *  fills it from `vector_field`; this module only draws it. */
+    this.field = null;
+    /** Seeds, in draw order: { id, x, y, sol, locked, hover, dragging }. */
+    this.seeds = [];
   }
 
   /** @param {string[]} list the views that are on; order is canonical. */
@@ -338,6 +448,22 @@ export class Plot {
 
   setSupport(support) {
     for (const v of VIEWS) this.support[v] = !!(support && support[v]);
+  }
+
+  /** The sampled field, or null. Flat [x, y, dx, dy] * (nx * ny). */
+  setField(field) {
+    this.field = field && field.nx > 0 && field.ny > 0 && field.data
+      && field.data.length >= field.nx * field.ny * 4 ? field : null;
+  }
+
+  /** The seeds to draw, in order. Seed zero is the document's own start. */
+  setSeeds(list) {
+    this.seeds = Array.isArray(list) ? list : [];
+  }
+
+  /** True while a view whose two axes ARE the two states is drawing. */
+  planeIsOn() {
+    return this.views.some((v) => PLANE_VIEWS.indexOf(v) >= 0);
   }
 
   getWindow() {
@@ -371,6 +497,45 @@ export class Plot {
     if (px < b.L) region = py <= b.B ? 'y' : 'body';
     else if (py > b.B) region = 'x';
     return { box: b, region };
+  }
+
+  /**
+   * Which seed handle is under this pixel, and which part of it.
+   *
+   * Handles are only on the plane, so this answers null whenever the plane is
+   * off - there is nothing to grab on a t-against-y plot. Reverse order, so
+   * the handle drawn on top is the one that gets the pointer.
+   *
+   * @returns {{id:number, part:'handle'|'remove', locked:boolean}|null}
+   */
+  hitSeed(px, py) {
+    const b = this.box;
+    if (!b || !this.planeIsOn() || !this.seeds.length) return null;
+    const near = (x, y, r) => (px - x) * (px - x) + (py - y) * (py - y) <= r * r;
+    for (let i = this.seeds.length - 1; i >= 0; i--) {
+      const s = this.seeds[i];
+      const p = this.pixelAt(s.x, s.y);
+      if (!p) continue;
+      if (!s.locked && (s.hover || s.dragging) &&
+          near(p.x + SEED_BADGE.dx, p.y + SEED_BADGE.dy, SEED_BADGE.r + 2)) {
+        return { id: s.id, part: 'remove', locked: false };
+      }
+      if (near(p.x, p.y, SEED_R + 4)) {
+        return { id: s.id, part: 'handle', locked: !!s.locked };
+      }
+    }
+    return null;
+  }
+
+  /** Data -> pixel, in the box as last drawn. Null before the first draw. */
+  pixelAt(x, y) {
+    const b = this.box;
+    const w = this.window;
+    if (!b || !isFinite(x) || !isFinite(y)) return null;
+    return {
+      x: b.L + ((x - w.x0) / (w.x1 - w.x0)) * (b.R - b.L),
+      y: b.B - ((y - w.y0) / (w.y1 - w.y0)) * (b.B - b.T),
+    };
   }
 
   /** Pixel -> data, inside the frame's box. */
@@ -409,6 +574,11 @@ export class Plot {
     }
     if (this.views.indexOf('phase') >= 0 && dim === 2) {
       for (let i = 0; i < n; i++) take(data[i * stride + 1], data[i * stride + 2]);
+    }
+    // A fit that hid a handle the user had just placed would be a frame that
+    // lost the thing it was asked to look at.
+    if (this.planeIsOn()) {
+      for (const s of this.seeds) take(s.x, s.y);
     }
     if (this.views.indexOf('polar') >= 0 && sol.polar && sol.polar.r >= 0) {
       const map = sol.polar;
@@ -451,22 +621,42 @@ export class Plot {
     if (this.views.indexOf('polar') >= 0) this._polarGrid(ctx, dpr, pane);
     this._rules(ctx, dpr, box);
 
+    // The field is the question and the curves are the answer, so it goes down
+    // FIRST - under the grid's meaning but under every curve too, including the
+    // ones a seed put there.
+    const fieldOn = this.views.indexOf('field') >= 0;
+    if (fieldOn && this.field) this._fieldArrows(ctx, pane, this.field);
+
     if (!this.views.length) {
       centredText(ctx, box, 'no view is on — turn one on in the views menu');
       return;
     }
+    if (fieldOn) this._fieldCaption(ctx, area, this.field);
+
+    // Seeds outlive a broken document: their curves are the last good ones and
+    // the handles are still where the user put them, so they are drawn whether
+    // or not the document itself has a solution to show.
+    const planeOn = this.planeIsOn();
+    const timeOn = this.views.indexOf('time') >= 0;
+    if (this.seeds.length) this._seedTrails(ctx, pane, planeOn, timeOn);
+
     if (!sol || !sol.n || !sol.dim) {
-      centredText(ctx, box, (sol && sol.message) || 'no solution yet');
-      return;
+      // A refusal is always said out loud. "No solution yet" is not, once
+      // seeds are drawing curves of their own - the canvas is not empty.
+      const msg = (sol && sol.message) || (this.seeds.length ? '' : 'no solution yet');
+      if (msg) centredText(ctx, box, msg);
+    } else {
+      // Everything overlaps, in a fixed order so a view turning on never moves
+      // one already there: the time curves first, the portraits over them.
+      if (timeOn) this._time(ctx, pane, sol);
+      if (this.views.indexOf('phase') >= 0 && sol.dim === 2) this._phase(ctx, pane, sol);
+      if (this.views.indexOf('polar') >= 0 && sol.polar && sol.polar.r >= 0) {
+        this._polar(ctx, pane, sol);
+      }
     }
 
-    // Everything overlaps, in a fixed order so a view turning on never moves
-    // one already there: the time curves first, the portraits over them.
-    if (this.views.indexOf('time') >= 0) this._time(ctx, pane, sol);
-    if (this.views.indexOf('phase') >= 0 && sol.dim === 2) this._phase(ctx, pane, sol);
-    if (this.views.indexOf('polar') >= 0 && sol.polar && sol.polar.r >= 0) {
-      this._polar(ctx, pane, sol);
-    }
+    // Handles last: a thing you grab is never underneath a thing you read.
+    if (planeOn && this.seeds.length) this._seedHandles(ctx, pane);
   }
 
   // -- shared chrome --------------------------------------------------------
@@ -729,6 +919,220 @@ export class Plot {
     ctx.strokeStyle = seriesColor(ri);
     ctx.lineWidth = 1.9;
     this._stroke(ctx, sol, xOf, yOf, pane.sx, pane.sy);
+    ctx.restore();
+  }
+
+  // -- view: the field ------------------------------------------------------
+
+  /**
+   * The right-hand side, as arrows of ONE length on a grid.
+   *
+   * Two decisions carry this picture:
+   *
+   *   - The direction is normalised IN PIXELS, after the window's own scaling,
+   *     so an arrow points along the curve that would be drawn through it. Do
+   *     it in data units instead and stretching one axis leaves every arrow
+   *     lying about its own tangent.
+   *   - The length is a fixed fraction of the cell, so arrows never collide
+   *     and never scatter. Magnitude is the SHADE - pale is slow, dark is fast
+   *     - on a log ramp between percentiles (see `shadeRamp`).
+   *
+   * A sample with no magnitude has no direction either: it is drawn as a small
+   * ring, which is exactly what an equilibrium is.
+   */
+  _fieldArrows(ctx, pane, field) {
+    const b = pane.box;
+    const w = pane.win;
+    const { nx, ny, data } = field;
+    const count = Math.min(nx * ny, Math.floor(data.length / 4));
+    if (count <= 0) return;
+
+    const kx = (b.R - b.L) / (w.x1 - w.x0);
+    const ky = (b.B - b.T) / (w.y1 - w.y0);
+    const cellW = (b.R - b.L) / Math.max(1, nx);
+    const cellH = (b.B - b.T) / Math.max(1, ny);
+    const len = Math.max(5, Math.min(cellW, cellH) * 0.74);
+    const head = Math.min(4.6, len * 0.36);
+
+    const mags = new Float64Array(count);
+    for (let i = 0; i < count; i++) mags[i] = Math.hypot(data[i * 4 + 2], data[i * 4 + 3]);
+    const ramp = shadeRamp(mags);
+    field.ramp = ramp;                       // the caption reads it back
+
+    this._clip(ctx, b);
+    ctx.lineWidth = 1.15;
+
+    for (let i = 0; i < count; i++) {
+      const x = data[i * 4];
+      const y = data[i * 4 + 1];
+      const dx = data[i * 4 + 2];
+      const dy = data[i * 4 + 3];
+      if (!isFinite(x) || !isFinite(y)) continue;
+      const px = pane.sx(x);
+      const py = pane.sy(y);
+      if (px < b.L - len || px > b.R + len || py < b.T - len || py > b.B + len) continue;
+
+      const ink = fieldInk(shadeOf(ramp, mags[i]));
+
+      // pixel-space direction: the tangent of the curve that would pass here
+      const ux = dx * kx;
+      const uy = -dy * ky;
+      const norm = Math.hypot(ux, uy);
+      if (!isFinite(norm) || norm <= 0) {
+        ctx.strokeStyle = ink;
+        ctx.beginPath();
+        ctx.arc(px, py, 2.1, 0, Math.PI * 2);
+        ctx.stroke();
+        continue;
+      }
+
+      const ex = (ux / norm) * (len / 2);
+      const ey = (uy / norm) * (len / 2);
+      ctx.strokeStyle = ink;
+      ctx.beginPath();
+      ctx.moveTo(px - ex, py - ey);
+      ctx.lineTo(px + ex, py + ey);
+      // barbs, drawn from the tip back along the shaft
+      const bx = -(ux / norm) * head;
+      const by = -(uy / norm) * head;
+      const s = 0.5;
+      ctx.moveTo(px + ex, py + ey);
+      ctx.lineTo(px + ex + bx - by * s, py + ey + by + bx * s);
+      ctx.moveTo(px + ex, py + ey);
+      ctx.lineTo(px + ex + bx + by * s, py + ey + by - bx * s);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  /**
+   * What the arrows are, said out loud: the time they were sampled at, and the
+   * speeds the shade ramp is spread across.
+   *
+   * A non-autonomous system has a different field at every instant, and this is
+   * one instant of it. Saying "at t = 0" is the whole difference between a
+   * snapshot and a claim.
+   */
+  _fieldCaption(ctx, area, field) {
+    // It shares the title's line, so on a narrow canvas it stands down rather
+    // than printing over it.
+    if (area.R - area.L < 340) return;
+    const bits = [];
+    if (field && isFinite(field.t)) bits.push('field at t = ' + fmtValue(field.t));
+    else bits.push('field unavailable');
+    if (field && field.ramp && field.ramp.max > 0) {
+      bits.push('|f| ' + fmtValue(field.ramp.min) + '…' + fmtValue(field.ramp.max)
+        + ' pale→dark');
+    }
+    if (field && field.nx) bits.push(field.nx + '×' + field.ny);
+    ctx.save();
+    ctx.fillStyle = INK.title;
+    ctx.font = `10px ${MONO}`;
+    ctx.textAlign = 'right';
+    ctx.textBaseline = 'top';
+    ctx.fillText(bits.join('  ·  '), area.R - 6, area.T + 2);
+    ctx.restore();
+  }
+
+  // -- seeds ----------------------------------------------------------------
+
+  /**
+   * Every seed's trajectory, in whichever frames are on.
+   *
+   * On the plane it is the seed's own orbit. With `t–y` on it is the same
+   * trajectory read the other way - each of its states against time - which is
+   * what a starting point means when the horizontal axis is time. A seed that
+   * has not been integrated yet keeps the curve it last had (`sol`), which is
+   * the whole trick that makes dragging smooth.
+   */
+  _seedTrails(ctx, pane, planeOn, timeOn) {
+    const b = pane.box;
+    this._clip(ctx, b);
+    for (const s of this.seeds) {
+      const sol = s.sol;
+      if (!sol || !sol.n || !sol.dim) continue;
+      const stride = sol.dim + 1;
+      const colour = s.locked ? seriesColor(0) : seedColor(s.slot ?? s.id);
+      ctx.strokeStyle = colour;
+      ctx.globalAlpha = s.stale ? 0.55 : 1;
+      if (planeOn && sol.dim === 2) {
+        ctx.lineWidth = 1.6;
+        this._stroke(ctx, sol,
+          (i) => sol.data[i * stride + 1], (i) => sol.data[i * stride + 2],
+          pane.sx, pane.sy);
+      }
+      if (timeOn) {
+        ctx.lineWidth = 1.2;
+        ctx.globalAlpha *= 0.75;
+        for (let d = 0; d < sol.dim; d++) {
+          this._stroke(ctx, sol,
+            (i) => sol.data[i * stride], (i) => sol.data[i * stride + 1 + d],
+            pane.sx, pane.sy);
+        }
+      }
+      ctx.globalAlpha = 1;
+    }
+    ctx.restore();
+  }
+
+  /**
+   * The handles. A ring, not a dot: a dot is a sample and a ring is a thing to
+   * take hold of. Seed zero - the document's own initial condition - wears the
+   * same ring with a filled centre, because it is the same kind of object and
+   * only its source is different.
+   */
+  _seedHandles(ctx, pane) {
+    const b = pane.box;
+    this._clip(ctx, b);
+    for (const s of this.seeds) {
+      const p = this.pixelAt(s.x, s.y);
+      if (!p) continue;
+      if (p.x < b.L - 12 || p.x > b.R + 12 || p.y < b.T - 12 || p.y > b.B + 12) continue;
+      const colour = s.locked ? seriesColor(0) : seedColor(s.slot ?? s.id);
+      const live = s.hover || s.dragging;
+      const r = live ? SEED_R + 1.4 : SEED_R;
+
+      if (live) {
+        ctx.fillStyle = colour;
+        ctx.globalAlpha = 0.14;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, r + 5, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.globalAlpha = 1;
+      }
+
+      ctx.fillStyle = INK.bg;
+      ctx.strokeStyle = colour;
+      ctx.lineWidth = s.dragging ? 2.6 : 2;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+
+      if (s.locked) {
+        ctx.fillStyle = colour;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, 1.9, 0, Math.PI * 2);
+        ctx.fill();
+      } else if (live) {
+        // the way to get rid of it, on the thing itself
+        const bx = p.x + SEED_BADGE.dx;
+        const by = p.y + SEED_BADGE.dy;
+        ctx.fillStyle = colour;
+        ctx.beginPath();
+        ctx.arc(bx, by, SEED_BADGE.r, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.strokeStyle = INK.bg;
+        ctx.lineWidth = 1.5;
+        const k = 2.2;
+        ctx.beginPath();
+        ctx.moveTo(bx - k, by - k);
+        ctx.lineTo(bx + k, by + k);
+        ctx.moveTo(bx + k, by - k);
+        ctx.lineTo(bx - k, by + k);
+        ctx.stroke();
+      }
+    }
     ctx.restore();
   }
 }

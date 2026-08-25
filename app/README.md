@@ -33,7 +33,7 @@ of hanging. Same for a missing `mathfield.js`.
 | `index.html` | markup: loading screen, expression rows, the plot and its control strip, the overlays |
 | `styles.css` | the light theme, the fixed layout, the eased loader → app hand-off |
 | `main.js` | boot, WASM binding, the row list, diagnostics, sliders, the frame gestures, the reference |
-| `plot.js` | `Plot` — one HiDPI canvas, one frame, and `time` / `phase` / `polar` all drawn into it, overlapping |
+| `plot.js` | `Plot` — one HiDPI canvas, one frame, and `time` / `phase` / `polar` / `field` all drawn into it, overlapping; the field grid rule, the shade ramp, and seed hit-testing |
 | `demos.js` | the gallery: source, `tSpan`, `show`, and the knobs each demo declares |
 | `mathfield.js` / `mathfield.css` | the math field itself (see `docs/ui-v2.md` Part A) |
 | `serve.mjs` | the dependency-free dev server |
@@ -91,11 +91,11 @@ all stay exactly as they were while you finish typing.
 ### 3. One plot, everything in it, nothing tiled
 
 One canvas, one frame, and a control strip carrying everything that acts on the
-picture: the **integrator**, the **views** menu, the frame controls, and the
-readout. **There is no bottom bar** — the plot has that height instead — and
-**there is no `t` widget of any kind**.
+picture: the **integrator**, the **views** menu, the **seeds** control, the
+frame controls, and the readout. **There is no bottom bar** — the plot has that
+height instead — and **there is no `t` widget of any kind**.
 
-Three views, and every one the model supports draws into the **same frame**,
+Four views, and every one the model supports draws into the **same frame**,
 overlapping:
 
 | view | supported when |
@@ -103,6 +103,7 @@ overlapping:
 | `t–y` | always — every state against time |
 | `phase` | the document has **exactly 2 states** |
 | `polar` | a **state named `r`** exists (the angle is a state named `theta`/`phi` if there is one, otherwise `t`) |
+| `field` | the document has **exactly 2 states** *and* the loaded WASM has `vector_field` |
 
 Tiling is gone. Splitting the canvas turned "show me two things about this
 system" into a layout problem and shrank the picture every time you asked for
@@ -190,6 +191,97 @@ fallback to `Tsit5` — it would draw a `Tsit5` curve under a label reading
 - the refused chip turns red and the solve badge carries the message;
 - and the sentence itself is **drawn on the plot**, wrapped, where a blank
   canvas would otherwise just look broken.
+
+#### 3c. The field is the question; the curves are the answer
+
+An equation *is* a field of arrows, and a solution is a point dropped into it.
+The `field` view draws the first half — the right-hand side sampled across the
+visible window, through `vector_field(x0, x1, y0, y1, nx, ny, t)` — **under**
+everything else on the canvas.
+
+**The grid density comes from the box, per axis, in pixels: one arrow per
+~34 CSS pixels, clamped to 5…26 arrows on each axis** (`fieldGrid` in
+`plot.js`). Per axis and in pixels because that is the only unit readability is
+measured in: a count fixed in *data* units crowds the arrows into rows the
+moment you stretch one axis, and a single count for both axes does the same to
+a wide, short box. Spacing the samples evenly on the *screen* keeps the cells
+square whatever shape the window is, so the arrows never touch and never
+scatter. The floor stops a small plot showing three arrows and calling it a
+field; the ceiling caps the query at 676 samples, already denser than the eye
+can separate.
+
+**Every arrow is the same length; magnitude is the shade.** A field whose
+corner is a thousand times faster than its middle is unreadable the moment
+length tracks speed — the fast corner becomes a smear and everything else
+vanishes. So the length is a fixed fraction of the cell (0.74 × the shorter
+side) and |f| runs pale → dark on a **log** ramp between the **5th and 95th
+percentile** of the sampled magnitudes: log because a right-hand side routinely
+spans decades across one window, and percentiles because one near-singular
+corner would otherwise flatten everything else to the palest shade. A field
+that really is uniform is widened to half a decade either side rather than
+amplifying numerical dust into a picture of variation. A sample with no
+magnitude has no direction either, and is drawn as a small ring — which is
+exactly what an equilibrium is.
+
+The direction is normalised **in pixels**, after the window's own scaling, so
+an arrow is tangent to the curve that would be drawn through it. Normalising in
+data units instead would leave every arrow lying about its own tangent the
+moment an axis is stretched.
+
+**The window is the query, so the grid follows the window.** Pan or zoom and
+the arrows are recomputed for where you are now looking, debounced at the same
+180 ms as the re-solve and for the same reason. The arrows already up stay
+there meanwhile — they are drawn at their own data coordinates, so a pan slides
+them along with everything else and only the newly exposed edge is briefly
+bare. A resize is a new query too, because the density is read off the box.
+
+A non-autonomous system has a different field at every instant. This is the one
+at the **start of the window**, and the canvas says so — `field at t = 0 · |f|
+0.02…14.1 pale→dark · 24×10` sits in the corner rather than letting the picture
+imply it is timeless.
+
+#### 3d. Seeds
+
+A **seed** is a starting point you place yourself. Each one is integrated over
+the same window with the same method through `trajectory_from(t0, t1, method,
+y0, n)`, and drawn in the same frame.
+
+- **Click the plane** to drop one. **Drag** it and the trajectory follows live.
+  The `×` that appears on a handle under the pointer removes that one; the
+  `seeds · N ×` control on the strip removes them all.
+- **A seed never rewrites the document.** It is a *view* of the model, not a
+  change to it — `trajectory_from` does not disturb the stored solution, so a
+  seed costs exactly its own integration and the document's own curve is
+  untouched.
+- **The document's initial condition is seed zero, and it is not special**: it
+  wears the same ring (with a filled centre, because you move it by editing its
+  row rather than by dragging), and a user's seed gets a curve of the same
+  weight, not a second-class dashed one.
+- A double click still resets the frame, and takes back the seed its first
+  click dropped — one gesture, one outcome.
+
+**What a seed means with only `t–y` on.** Placing one is a **phase-plane idea**:
+a click only names a state when *both* axes are states, and with `t–y` on the
+horizontal axis is time. So a seed can only be **placed** while the plane is on
+(`phase` or `field`), and the seeds control carries the reason when it is not.
+But a seed is not a phase-plane-only *object*: the ones already placed keep
+their handles' meaning and their trajectories are drawn **against t as well**,
+thin, one line per state — the same starting point read the other way round.
+
+**Why dragging stays smooth.** The handle follows the pointer on every
+`pointermove`; the re-integration is **throttled to one every 55 ms**, leading
+edge plus a trailing call so the position the pointer actually stopped at is
+never the one that got skipped, and the drag ends with one final un-throttled
+integration. Between them the previous trajectory stays on screen, drawn
+slightly faded — the same bargain the frame gestures make with the solve, so a
+drag is a curve keeping up rather than a curve blinking out.
+
+**Both calls are optional and both are probed**, exactly the way `solve_with`
+is: `app/pkg/` is a build artefact that can be older than the crate. Without
+`vector_field` the `field` entry in the views menu reads *this WASM build has no
+vector_field* — naming the build, not blaming the document — and without
+`trajectory_from` the seeds control says the same and a click on the plane does
+nothing at all.
 
 #### A document can say what to look at
 
@@ -399,8 +491,8 @@ The panes have explicit sizes and content scrolls *inside* them.
 - The slider settings, the demo gallery, the views menu and the reference are
   all `position: fixed` overlays, not expanding panels.
 - The plot's control strip is a fixed-height row: the integrator switch, the
-  views menu, the frame controls and the readout all live in it, and nothing in
-  it can change the size of the canvas below.
+  views menu, the seeds control, the frame controls and the readout all live in
+  it, and nothing in it can change the size of the canvas below.
 - The canvas is absolutely positioned inside its box, so its size can never feed
   back into the grid that sizes it.
 
@@ -432,6 +524,11 @@ settings overlay opening.
 | drag along the x or y labels | scale that axis, about the value under the pointer |
 | wheel | zoom about the cursor; over an axis strip, that axis alone |
 | double-click | back to −5…5 |
+| click the plane (`phase` or `field` on) | drop a seed there |
+| drag a seed handle | move it; its trajectory follows live |
+| the `×` on a hovered handle | remove that seed |
+| `seeds · N ×` on the strip | remove all of them |
 
 Every one of these that moves the **horizontal** axis is also a new query: the
-solve is re-run over the new span, once, 180 ms after the gesture stops.
+solve is re-run over the new span, once, 180 ms after the gesture stops. Every
+one that moves the frame at all re-queries the **field**, on the same 180 ms.

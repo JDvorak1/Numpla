@@ -111,7 +111,10 @@ click(viewsBtn);
 await settle(10);
 const viewItems = () => $('viewmenu').querySelectorAll('.viewitem');
 ok('the views menu opens', !$('viewmenu').hidden);
-ok('it lists every view', viewItems().length === 3, `${viewItems().length}`);
+ok('it lists every view', viewItems().length === 4, `${viewItems().length}`);
+ok('the field is one of them',
+   viewItems().some((i) => i.dataset.view === 'field'),
+   viewItems().map((i) => i.dataset.view).join(', '));
 const timeItem = () => viewItems().find((i) => i.dataset.view === 'time');
 ok('t–y is on by itself', timeItem().classList.contains('is-on'));
 click(timeItem());
@@ -489,6 +492,485 @@ if ($('info-btn')) {
     ok('a partial run is not styled as an error', !badge.classList.contains('is-bad'),
        badge.classList.value);
   }
+}
+
+// ---------------------------------------------------------------------------
+// The field: arrows of one length, shaded by magnitude, drawn UNDER the curves
+//
+// The drawing itself is checked against a recording context, because the two
+// decisions that make the picture readable — normalise the length, show
+// magnitude as a shade — are invisible to every other kind of test. A field
+// whose arrows scale with speed passes "there are arrows" and is still a mess.
+// ---------------------------------------------------------------------------
+
+const plotMod = await import(new URL('./plot.js', APP).href);
+
+function recordingCtx() {
+  const calls = [];
+  const ctx = {
+    canvas: null, globalAlpha: 1, lineWidth: 1, lineJoin: '', lineCap: '',
+    fillStyle: '', font: '', textAlign: '', textBaseline: '',
+    save() {}, restore() {}, clip() {}, rect() {}, ellipse() {}, closePath() {},
+    fill() { calls.push(['fill']); }, fillRect() {}, clearRect() {},
+    setTransform() {}, fillText() {}, setLineDash() {},
+    measureText: () => ({ width: 10 }),
+    beginPath() { calls.push(['begin']); },
+    moveTo(x, y) { calls.push(['m', x, y]); },
+    lineTo(x, y) { calls.push(['l', x, y]); },
+    arc(x, y, r) { calls.push(['arc', x, y, r]); },
+    stroke() { calls.push(['stroke']); },
+  };
+  let ss = '';
+  Object.defineProperty(ctx, 'strokeStyle', {
+    get: () => ss,
+    set: (v) => { ss = v; calls.push(['ss', v]); },
+  });
+  return { ctx, calls };
+}
+
+/** Group the recorded calls into paths, each tagged with its stroke colour. */
+function paths(calls) {
+  const out = [];
+  let ink = '';
+  let cur = null;
+  for (const c of calls) {
+    if (c[0] === 'ss') { ink = c[1]; continue; }
+    if (c[0] === 'begin') { cur = { ink, pts: [] }; out.push(cur); continue; }
+    if (!cur) continue;
+    if (c[0] === 'm' || c[0] === 'l') cur.pts.push([c[0], c[1], c[2]]);
+    if (c[0] === 'arc') cur.arc = c;
+  }
+  return out;
+}
+
+{
+  const { Plot, fieldGrid, shadeRamp, FIELD_MIN, FIELD_MAX } = plotMod;
+
+  // The density rule, stated once in plot.js and checked here: per axis, from
+  // the box, in pixels — so the cells stay square whatever shape the window is.
+  const wide = fieldGrid(900, 300);
+  const tall = fieldGrid(300, 900);
+  ok('the grid density is read off the box, per axis',
+     wide.nx > wide.ny && tall.ny > tall.nx,
+     `${JSON.stringify(wide)} / ${JSON.stringify(tall)}`);
+  ok('a wide box and a tall box are mirror images',
+     wide.nx === tall.ny && wide.ny === tall.nx,
+     `${JSON.stringify(wide)} / ${JSON.stringify(tall)}`);
+  ok('the density is clamped at both ends',
+     fieldGrid(10, 10).nx === FIELD_MIN && fieldGrid(9000, 9000).nx === FIELD_MAX,
+     `${fieldGrid(10, 10).nx} .. ${fieldGrid(9000, 9000).nx}`);
+
+  const ramp = shadeRamp([1e-3, 1e-2, 1e-1, 1, 10, 100, 1000]);
+  ok('the shade ramp is logarithmic and robust', ramp.hi > ramp.lo && !ramp.flat,
+     `lo ${ramp.lo} hi ${ramp.hi}`);
+  ok('a uniform field is not amplified into a picture of variation',
+     shadeRamp([2, 2.0000001, 2]).flat);
+
+  // A 4x3 field with magnitudes spanning six decades, on a deliberately
+  // anisotropic window: the hard case for both decisions.
+  const nx = 4, ny = 3;
+  const data = new Float64Array(nx * ny * 4);
+  const mags = [];
+  for (let j = 0; j < ny; j++) {
+    for (let i = 0; i < nx; i++) {
+      const k = j * nx + i;
+      const m = Math.pow(10, k - 6);            // 1e-6 … 1e5
+      mags.push(m);
+      data[k * 4] = -1.5 + (3 * i) / (nx - 1);
+      data[k * 4 + 1] = -0.75 + (1.5 * j) / (ny - 1);
+      data[k * 4 + 2] = m;                      // pointing +x, at speed m
+      data[k * 4 + 3] = m;                      // and +y just as fast
+    }
+  }
+
+  const rec = recordingCtx();
+  const fake = {
+    width: 0, height: 0,
+    getBoundingClientRect: () => ({ left: 0, top: 0, width: 900, height: 400 }),
+    getContext: () => rec.ctx,
+  };
+  const pl = new Plot(fake);
+  pl.setSupport({ time: true, phase: true, polar: false, field: true });
+  pl.setViews(['field']);
+  pl.setWindow({ x0: -2, x1: 2, y0: -1, y1: 1 });   // 4 units wide, 2 units tall
+  pl.setField({ nx, ny, t: 0, data });
+  pl.draw(null);
+
+  // An arrow is a shaft plus two barbs: three moveTo/lineTo pairs in one path.
+  const arrows = paths(rec.calls).filter((p) => p.pts.length === 6);
+  ok('every grid point gets an arrow', arrows.length === nx * ny,
+     `${arrows.length} arrows for ${nx * ny} samples`);
+
+  const shaft = (a) => Math.hypot(a.pts[1][1] - a.pts[0][1], a.pts[1][2] - a.pts[0][2]);
+  const lens = arrows.map(shaft);
+  const spread = Math.max(...lens) - Math.min(...lens);
+  ok('the arrows are all one length, over six decades of speed',
+     spread < 1e-9 && lens[0] > 4,
+     `lengths ${Math.min(...lens).toFixed(3)}..${Math.max(...lens).toFixed(3)}`);
+
+  const lum = (ink) => {
+    const m = /rgb\((\d+), (\d+), (\d+)\)/.exec(ink);
+    return m ? Number(m[1]) + Number(m[2]) + Number(m[3]) : NaN;
+  };
+  const inks = arrows.map((a) => lum(a.ink));
+  ok('magnitude is the shade instead', new Set(inks).size > 3,
+     `${new Set(arrows.map((a) => a.ink)).size} distinct shades`);
+  ok('and it runs pale for slow, dark for fast',
+     inks[0] > inks[inks.length - 1],
+     `slowest ${inks[0]} vs fastest ${inks[inks.length - 1]}`);
+
+  // The direction is normalised in PIXELS, so an arrow is tangent to the curve
+  // that would be drawn through it — not to the one in an unscaled plane.
+  const a0 = arrows[0];
+  const ang = Math.atan2(a0.pts[1][2] - a0.pts[0][2], a0.pts[1][1] - a0.pts[0][1]);
+  const box = pl.box;
+  const kx = (box.R - box.L) / 4;
+  const ky = (box.B - box.T) / 2;
+  ok('the arrows point along the stretched frame, not through it',
+     Math.abs(ang - Math.atan2(-ky, kx)) < 1e-9,
+     `drawn ${ang.toFixed(4)} vs expected ${Math.atan2(-ky, kx).toFixed(4)}`);
+
+  // Under the curves: the field is laid down before anything else is stroked.
+  const rec2 = recordingCtx();
+  const pl2 = new Plot({
+    width: 0, height: 0,
+    getBoundingClientRect: () => ({ left: 0, top: 0, width: 900, height: 400 }),
+    getContext: () => rec2.ctx,
+  });
+  pl2.setSupport({ time: true, phase: true, polar: false, field: true });
+  pl2.setViews(['phase', 'field']);
+  pl2.setWindow({ x0: -2, x1: 2, y0: -2, y1: 2 });
+  pl2.setField({ nx, ny, t: 0, data });
+  const curve = new Float64Array(3 * 40);
+  for (let i = 0; i < 40; i++) {
+    const t = i / 39;
+    curve[i * 3] = t; curve[i * 3 + 1] = Math.cos(t); curve[i * 3 + 2] = Math.sin(t);
+  }
+  pl2.draw({ names: ['x', 'y'], dim: 2, n: 40, data: curve, t0: 0, t1: 1, polar: null, extra: null });
+  const groups = paths(rec2.calls);
+  const lastArrow = groups.map((p) => p.pts.length === 6).lastIndexOf(true);
+  const phaseCurve = groups.findIndex((p) => p.pts.length === 40);
+  ok('the field is drawn under the trajectories',
+     lastArrow >= 0 && phaseCurve > lastArrow,
+     `last arrow at ${lastArrow}, curve at ${phaseCurve}`);
+}
+
+// ---------------------------------------------------------------------------
+// The field and seeds in the running app
+//
+// `vector_field` and `trajectory_from` are additive and app/pkg/ may predate
+// them, so the shell probes for them exactly the way it probes `solve_with`.
+// Both worlds are checked here: without the calls the views menu says so and
+// nothing throws; with them (real, or the stub below on a build that has not
+// shipped them yet) the whole pipeline runs.
+// ---------------------------------------------------------------------------
+
+const inspect = globalThis.__numplaInspect;
+
+{
+  const { probeFieldApi, probeSeedApi } = await import(new URL('./main.js', APP).href);
+  ok('the optional calls are probed, never assumed',
+     probeFieldApi(null) === null && probeFieldApi({}) === null &&
+     probeSeedApi({}) === null);
+  ok('a snake_case build is bound', typeof probeFieldApi({ vector_field() {} }) === 'function'
+     && typeof probeSeedApi({ trajectory_from() {} }) === 'function');
+  ok('a camelCase build is bound too', typeof probeFieldApi({ vectorField() {} }) === 'function'
+     && typeof probeSeedApi({ trajectoryFrom() {} }) === 'function');
+}
+
+const HARMONIC = ["x' = -y", "y' = x", 'x(0) = 1', 'y(0) = 0'].join('\n');
+const viewItem = (id) =>
+  $('viewmenu').querySelectorAll('.viewitem').find((i) => i.dataset.view === id);
+const whyOf = (id) => {
+  const it = viewItem(id);
+  return it ? it.querySelector('.viewitem__why').textContent : '';
+};
+
+// -- with neither call: the shell says why, and keeps working ---------------
+{
+  inspect.setApis({ field: null, seed: null });
+  click($('frame-reset'));
+  await settleSolve();
+  inspect.setDocument(HARMONIC);
+  await settleSolve();
+
+  ok('a build with no vector_field still solves',
+     /solved/.test($('stat-solve').textContent), `status: ${$('stat-solve').textContent}`);
+  ok('two states light the phase plane up', inspect.views().caps.phase);
+  ok('but the field view is not offered without the call',
+     inspect.views().caps.field === false && inspect.views().on.indexOf('field') < 0,
+     JSON.stringify(inspect.views()));
+  ok('and nothing is computed for it', inspect.field() === null);
+
+  if ($('viewmenu').hidden) { click(viewsBtn); await settle(10); }
+  ok('the menu names the missing call rather than blaming the document',
+     /vector_field/.test(whyOf('field')), `why: ${whyOf('field')}`);
+  ok('the seeds control says the same about its own call',
+     /trajectory_from/.test($('seeds-btn').title), `title: ${$('seeds-btn').title}`);
+  click(viewsBtn);
+  await settle(10);
+
+  // A click on the plane with no way to integrate a seed must do nothing at all.
+  const before = inspect.seeds().length;
+  dispatch(canvas, 'pointerdown', { type: 'pointerdown', target: canvas, clientX: 300, clientY: 10, pointerId: 9 });
+  dispatch(canvas, 'pointerup', { type: 'pointerup', target: canvas, clientX: 300, clientY: 10, pointerId: 9 });
+  await settle(10);
+  ok('clicking the plane places nothing when seeds cannot be integrated',
+     inspect.seeds().length === before, `${inspect.seeds().length} seeds`);
+}
+
+// -- with both calls, real or stubbed ---------------------------------------
+{
+  const real = inspect.probe();
+  // The stub is a rotation: x' = -y, y' = x — the very document loaded above,
+  // so a stubbed run is answering the same question the real one would.
+  const stubField = (x0, x1, y0, y1, nx, ny, t) => {
+    const out = new Float64Array(nx * ny * 4);
+    for (let j = 0; j < ny; j++) {
+      for (let i = 0; i < nx; i++) {
+        const k = j * nx + i;
+        const x = x0 + ((x1 - x0) * i) / Math.max(1, nx - 1);
+        const y = y0 + ((y1 - y0) * j) / Math.max(1, ny - 1);
+        out[k * 4] = x; out[k * 4 + 1] = y; out[k * 4 + 2] = -y; out[k * 4 + 3] = x;
+      }
+    }
+    return out;
+  };
+  const stubSeed = (t0, t1, method, y0, n) => {
+    const out = new Float64Array(n * 3);
+    for (let i = 0; i < n; i++) {
+      const t = t0 + ((t1 - t0) * i) / Math.max(1, n - 1);
+      out[i * 3] = t;
+      out[i * 3 + 1] = y0[0] * Math.cos(t) - y0[1] * Math.sin(t);
+      out[i * 3 + 2] = y0[0] * Math.sin(t) + y0[1] * Math.cos(t);
+    }
+    return out;
+  };
+
+  if (real.field && real.seed) inspect.setApis(null);
+  else inspect.setApis({ field: stubField, seed: stubSeed });
+  ok(`the field and seed calls are available${real.field ? ' (real WASM)' : ' (stubbed)'}`,
+     inspect.probe().field && inspect.probe().seed);
+
+  // A real box, so the plot draws for real and pixels mean something. The
+  // shim gives every element the same 400x40 rect, which is not a plot.
+  const realRect = canvas.getBoundingClientRect;
+  canvas.getBoundingClientRect = () => ({ left: 0, top: 0, width: 900, height: 400 });
+
+  inspect.setDocument(HARMONIC);
+  await settleSolve();
+  await settle(20);
+
+  ok('two states and the call together make the field drawable',
+     inspect.views().caps.field === true, JSON.stringify(inspect.views().caps));
+  ok('and it turns itself on, like every other supported view',
+     inspect.views().on.indexOf('field') >= 0, JSON.stringify(inspect.views().on));
+
+  const f0 = inspect.field();
+  ok('the arrows are computed', !!f0 && f0.count === f0.nx * f0.ny,
+     f0 ? `${f0.nx}x${f0.ny} = ${f0.count}` : 'null');
+  ok('the grid is dense enough to read and sparse enough to see',
+     !!f0 && f0.nx >= 5 && f0.ny >= 5 && f0.nx * f0.ny <= 26 * 26,
+     f0 ? `${f0.nx}x${f0.ny}` : 'null');
+  ok('the grid follows the box shape, not the window',
+     !!f0 && f0.nx > f0.ny, f0 ? `${f0.nx}x${f0.ny} in a 900x400 box` : 'null');
+  ok('the field is sampled at the start of the window',
+     !!f0 && Math.abs(f0.t - inspect.window().x0) < 1e-9,
+     f0 ? `t = ${f0.t}, window starts at ${inspect.window().x0}` : 'null');
+  ok('the query is the visible window',
+     !!f0 && f0.win.x0 === inspect.window().x0 && f0.win.y1 === inspect.window().y1);
+
+  // THE WINDOW IS THE QUERY: pan, and the arrows are recomputed for where you
+  // are now looking — debounced, like the re-solve.
+  dispatch(canvas, 'pointerdown', { type: 'pointerdown', target: canvas, clientX: 400, clientY: 200, pointerId: 11 });
+  dispatch(canvas, 'pointermove', { type: 'pointermove', target: canvas, clientX: 480, clientY: 240, pointerId: 11 });
+  dispatch(canvas, 'pointerup', { type: 'pointerup', target: canvas, clientX: 480, clientY: 240, pointerId: 11 });
+  await settleSolve();
+  const f1 = inspect.field();
+  ok('panning recomputes the arrows', !!f1 && f1.gen > f0.gen, `${f0.gen} -> ${f1 && f1.gen}`);
+  ok('and they are recomputed for the NEW window',
+     !!f1 && f1.win.x0 !== f0.win.x0 && f1.win.x0 === inspect.window().x0,
+     `${f0.win.x0} -> ${f1 && f1.win.x0}, window ${inspect.window().x0}`);
+
+  const genBefore = inspect.field().gen;
+  await wait(60);
+  ok('a still window is not re-queried', inspect.field().gen === genBefore);
+
+  wheel(400, 200, -300);
+  await settleSolve();
+  ok('zooming recomputes them too', inspect.field().gen > genBefore,
+     `${genBefore} -> ${inspect.field().gen}`);
+
+  // Only for two states — the same condition the phase plane uses.
+  click($('frame-reset'));
+  await settleSolve();
+  inspect.setDocument(["x' = -x", 'x(0) = 1'].join('\n'));
+  await settleSolve();
+  ok('one state is not a plane, so there is no field',
+     inspect.views().caps.field === false && inspect.field() === null,
+     JSON.stringify(inspect.views().caps));
+  if ($('viewmenu').hidden) { click(viewsBtn); await settle(10); }
+  ok('and the menu says which condition failed',
+     /2 states/.test(whyOf('field')), `why: ${whyOf('field')}`);
+  click(viewsBtn);
+  await settle(10);
+
+  inspect.setDocument(["x' = -y", "y' = x", "z' = 0", 'x(0) = 1', 'y(0) = 0', 'z(0) = 0'].join('\n'));
+  await settleSolve();
+  ok('three states are not a plane either', inspect.views().caps.field === false,
+     JSON.stringify(inspect.views().caps));
+
+  inspect.setDocument(HARMONIC);
+  await settleSolve();
+  await settle(20);
+  ok('and the field comes back with the second state', !!inspect.field());
+
+  // -----------------------------------------------------------------------
+  // Seeds
+  // -----------------------------------------------------------------------
+
+  const seedIds = () => inspect.seeds().filter((s) => !s.locked).map((s) => s.id);
+  const seedOf = (id) => inspect.seeds().find((s) => s.id === id) || null;
+  const pointer = (type, x, y, id = 13) =>
+    dispatch(canvas, type, { type, target: canvas, clientX: x, clientY: y, pointerId: id, button: 0 });
+  const tap = async (x, y, id = 13) => {
+    pointer('pointerdown', x, y, id);
+    pointer('pointerup', x, y, id);
+    await settle(12);
+  };
+  const documentText = () => rowEls().map((r) => r.textContent).join('\n');
+
+  ok('the document has a seed zero of its own',
+     inspect.seeds().some((s) => s.locked && s.id === 0), JSON.stringify(inspect.seeds()));
+
+  const textBefore = documentText();
+  await tap(300, 120);
+  ok('clicking the plane places a seed', seedIds().length === 1,
+     JSON.stringify(inspect.seeds()));
+  await settle(20);
+  ok('the seed gets its own trajectory over the same window',
+     (seedOf(seedIds()[0]) || {}).n > 1, JSON.stringify(inspect.seeds()));
+  ok('A SEED DOES NOT REWRITE THE DOCUMENT', documentText() === textBefore,
+     `${textBefore.replace(/\n/g, ' | ')} -> ${documentText().replace(/\n/g, ' | ')}`);
+  ok('nor does it disturb the document`s own curve',
+     /solved/.test($('stat-solve').textContent) && inspect.frame().n > 1,
+     `status: ${$('stat-solve').textContent}`);
+  ok('the seeds control counts them', /seeds · 1/.test($('seeds-btn').textContent),
+     `label: ${$('seeds-btn').textContent}`);
+
+  await tap(500, 260);
+  ok('a second one is a second seed', seedIds().length === 2, JSON.stringify(seedIds()));
+  const two = inspect.seeds().filter((s) => !s.locked);
+  ok('each is where it was put, and they differ',
+     two[0].x !== two[1].x && two[0].y !== two[1].y,
+     JSON.stringify(two));
+
+  // Dragging: the handle follows the pointer, the trajectory follows the handle.
+  const id = seedIds()[1];
+  const was = seedOf(id);
+  const trailWas = was.n;
+  pointer('pointerdown', 500, 260, 21);
+  pointer('pointermove', 560, 230, 21);
+  await settle(4);
+  const mid = seedOf(id);
+  ok('the handle keeps up with the pointer mid-drag', mid.x > was.x && mid.y > was.y,
+     `${JSON.stringify(was)} -> ${JSON.stringify(mid)}`);
+  ok('and the last good trajectory stays on screen while it catches up',
+     mid.n >= 1, `${mid.n} samples`);
+  pointer('pointermove', 620, 200, 21);
+  pointer('pointerup', 620, 200, 21);
+  await settle(20);
+  const now = seedOf(id);
+  ok('the drag ends where the pointer stopped', now.x > mid.x && now.y > mid.y,
+     `${JSON.stringify(mid)} -> ${JSON.stringify(now)}`);
+  ok('and the trajectory is re-integrated from there', now.n > 1 && now.n >= trailWas - 1,
+     `${trailWas} -> ${now.n} samples`);
+  ok('dragging a seed does not pan the frame',
+     JSON.stringify(spanOf()) === JSON.stringify(spanOf()) && inspect.window().x0 === inspect.field().win.x0);
+  ok('and it still has not touched the document', documentText() === textBefore);
+
+  // Removing one: the × on the handle itself, which appears when it is under
+  // the pointer.
+  pointer('pointermove', 620, 200, 22);           // hover it
+  await settle(4);
+  const { SEED_BADGE } = plotMod;
+  pointer('pointerdown', 620 + SEED_BADGE.dx, 200 + SEED_BADGE.dy, 22);
+  pointer('pointerup', 620 + SEED_BADGE.dx, 200 + SEED_BADGE.dy, 22);
+  await settle(12);
+  ok('the × on a hovered handle removes that seed',
+     seedIds().length === 1 && seedIds().indexOf(id) < 0, JSON.stringify(seedIds()));
+
+  // A double click is one gesture: it must not leave a seed behind, and it
+  // must still be the way back to the default frame.
+  wheel(400, 200, -200);
+  await settleSolve();
+  const seedsBeforeDbl = seedIds().length;
+  await tap(360, 150, 31);
+  await tap(360, 150, 31);
+  dispatch(canvas, 'dblclick', { type: 'dblclick', target: canvas, clientX: 360, clientY: 150 });
+  await settleSolve();
+  ok('a double click on the plane leaves no seed behind',
+     seedIds().length === seedsBeforeDbl, `${seedIds().length} vs ${seedsBeforeDbl}`);
+  ok('and it still resets the frame', JSON.stringify(spanOf()) === '[-5,5]',
+     JSON.stringify(spanOf()));
+
+  // Clearing them all.
+  await tap(300, 120, 41);
+  await tap(420, 300, 42);
+  ok('there are seeds to clear', seedIds().length >= 2, JSON.stringify(seedIds()));
+  click($('seeds-btn'));
+  await settle(12);
+  ok('the seeds control clears every one of them', seedIds().length === 0);
+  ok('and goes quiet again', $('seeds-btn').textContent === 'seeds',
+     `label: ${$('seeds-btn').textContent}`);
+  ok('seed zero is still there — it is the document, not a seed',
+     inspect.seeds().length === 1 && inspect.seeds()[0].locked);
+
+  // With only t–y on, the plane is gone: a seed cannot be PLACED (a click
+  // there names a time, not a state), and the ones already down are drawn
+  // against t instead.
+  await tap(300, 120, 51);
+  ok('a seed exists to carry over', seedIds().length === 1);
+  if ($('viewmenu').hidden) { click(viewsBtn); await settle(10); }
+  click(viewItem('phase'));
+  await settle(10);
+  click(viewItem('field'));
+  await settleSolve();
+  ok('the plane can be turned off', inspect.views().on.indexOf('phase') < 0 &&
+     inspect.views().on.indexOf('field') < 0, JSON.stringify(inspect.views().on));
+  const carried = seedIds().length;
+  ok('the seeds that were placed survive it', carried === 1, `${carried} seeds`);
+  ok('and they still carry a trajectory to draw against t',
+     (seedOf(seedIds()[0]) || {}).n > 1, JSON.stringify(inspect.seeds()));
+  await tap(340, 140, 52);
+  ok('but a click on a t–y plot places nothing', seedIds().length === carried,
+     `${seedIds().length} seeds`);
+  ok('and the control says why', /phase-plane idea/.test($('seeds-btn').title),
+     `title: ${$('seeds-btn').title}`);
+
+  click(viewItem('phase'));
+  await settle(10);
+  click(viewItem('field'));
+  await settleSolve();
+  click(viewsBtn);
+  await settle(10);
+  ok('turning the plane back on restores placement',
+     inspect.views().on.indexOf('phase') >= 0 && !/phase-plane idea/.test($('seeds-btn').title),
+     JSON.stringify(inspect.views().on));
+
+  // Losing the calls mid-flight is the same as never having had them.
+  inspect.setApis({ field: null, seed: null });
+  await settle(20);
+  ok('taking the calls away drops the field and the seeds, quietly',
+     inspect.field() === null && seedIds().length === 0 &&
+     inspect.views().caps.field === false);
+  ok('and the app still solves', /solved|waiting/.test($('stat-solve').textContent),
+     `status: ${$('stat-solve').textContent}`);
+
+  inspect.setApis(null);
+  canvas.getBoundingClientRect = realRect;
+  click($('frame-reset'));
+  await settleSolve();
 }
 
 const hearBtn = $('hear-btn');

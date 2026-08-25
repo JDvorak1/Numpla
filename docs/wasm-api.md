@@ -132,6 +132,23 @@ impl Model {
     /// Empty if there is no solution.
     pub fn eval(&self, t: f64) -> Vec<f64>;
 
+    /// The right-hand side sampled on a grid across [x0,x1] x [y0,y1], at
+    /// time `t`. Flat, row-major, four numbers per sample:
+    /// [x, y, dx, dy] repeated nx * ny times, with x varying fastest.
+    /// Empty when the document does not have exactly two states, does not
+    /// compile, or the grid is empty. Never throws.
+    pub fn vector_field(&self, x0: f64, x1: f64, y0: f64, y1: f64,
+                        nx: usize, ny: usize, t: f64) -> Vec<f64>;
+
+    /// One trajectory from an explicit starting state, sampled uniformly.
+    /// Flat: [t, y_0 .. y_{dim-1}] * n — the same layout as `sample`.
+    /// Does NOT disturb the stored solution.
+    /// Empty when y0.len() != dim, n is 0, the method name is unknown, or
+    /// the document cannot be integrated. Never throws.
+    /// Obeys the same stop-early rule as `solve`.
+    pub fn trajectory_from(&self, t0: f64, t1: f64, method: &str,
+                           y0: &[f64], n: usize) -> Vec<f64>;
+
     /// StepRecord list as JSON — for the telemetry strip.
     pub fn telemetry(&self) -> String;
 
@@ -391,6 +408,96 @@ a window with tens of oscillations in it. The honest consequence: a wider window
 is a coarser step, so a symplectic energy band *widens* as you zoom out. It stays
 flat across the run, which is the property being shown.
 
+## The field, and seeds
+
+Added after v1, and purely additive: nothing existing changes shape. Two calls
+that together turn one curve into a portrait — the equation as a field of
+arrows, and as many trajectories through it as somebody cares to place. See
+`docs/fields-and-seeds.md` for the view they are built for.
+
+### `vector_field(x0, x1, y0, y1, nx, ny, t)`
+
+The right-hand side evaluated on a grid across the visible window.
+
+```js
+const f = model.vector_field(xMin, xMax, yMin, yMax, 24, 16, t0);
+// sample (i, j) — column i of row j — is four numbers at 4 * (j * nx + i)
+for (let j = 0; j < ny; j++)
+  for (let i = 0; i < nx; i++) {
+    const k = 4 * (j * nx + i);
+    const [x, y, dx, dy] = f.subarray(k, k + 4);
+  }
+```
+
+| | |
+|---|---|
+| layout | flat, row-major, `[x, y, dx, dy]` per sample; `x` varies fastest |
+| length | `nx * ny * 4` |
+| grid | endpoint-inclusive in both directions — `x0` and `x1` are both sampled. `nx == 1` sits on `x0`, the same rule `sample` uses for a single time |
+| empty when | the document does not have exactly two states, does not compile, has a name it is still waiting on, `nx` or `ny` is 0, or a row could not be evaluated at some sample |
+
+**What a shell does with an empty return: draw nothing and offer the `phase`
+view's explanation.** Empty is not an error and carries no message — it is the
+same "there are not two axes here" that `phase` already answers, plus the
+ordinary "this document does not compile yet", which the issue bar is already
+showing. A field of zero-length arrows is what a *stationary* system looks like,
+so a failed evaluation returns nothing rather than a picture of rest.
+
+**`t` is an argument, not zero.** A non-autonomous system — `x' = y`,
+`y' = -sin(t)` — genuinely has a different field at every instant. Sample it at
+the left edge of the window and **say so on screen**; a time-dependent field
+drawn without a time on it is the same class of lie as a partial run drawn
+full-width.
+
+**The arrows are the solver's own evaluation.** `vector_field` and every
+integration in the product go through one `ModelSystem` — the same right-hand
+side, the same environment, the same reading of the rows. So an arrow is the
+tangent of the trajectory through the point it sits on, by construction and not
+by coincidence, and it stays so whichever method drew the curves on top of it.
+
+### `trajectory_from(t0, t1, method, y0, n)`
+
+One trajectory from a starting point the user placed. `method` is spelled the
+way `solve_with` spells it.
+
+```js
+model.solve(t0, t1);                       // the document's own curve
+const own = model.sample(n);
+const seed = model.trajectory_from(t0, t1, "Tsit5", new Float64Array([2, 0]), n);
+model.sample(n);                           // — still `own`, exactly
+```
+
+| | |
+|---|---|
+| layout | flat, `[t, y_0, .., y_{dim-1}]` per sample — identical to `sample` |
+| length | `n * (dim + 1)`, unless empty |
+| span | `[t0, tEnd]`, so a seed that stopped early ends where it stopped |
+| empty when | `y0.len() != dim`, `n == 0`, the method name is unknown, the method is symplectic and the document has no second-order rows, or the document does not compile |
+
+**It does not disturb the stored solution.** The document's own curve, its
+telemetry and its conservation series are exactly where `solve` left them, after
+any number of seeds, in any order, with any method — including a seed that fails.
+Nothing is cached either: a trajectory belongs to the seed that asked for it. So
+the drawing loop is `solve` once, then `trajectory_from` per seed, and the frame
+can be rebuilt in any order without a re-`solve`. Seeds are a *view* of the
+model: placing one does not rewrite the document and does not touch what the
+document already answered.
+
+**What a shell does with an empty return: drop that seed from the frame and
+leave the rest alone.** There is no report and no message, because every empty
+case is one the shell can already see: a `y0` from before the document grew a
+row (compare its length against `Diagnostics.states`), a symplectic method on a
+first-order document (the same refusal the mode slider already renders, from
+`solve_with`), or a document that is not compiling (the issue bar has it). One
+seed coming back empty says nothing about the others.
+
+**A seed that blows up returns the part that worked**, exactly as `solve` does.
+There is no per-seed `stopped` object — the last sample's `t` is where it
+stopped. Read it, and end that curve there; stretching a seed's samples across
+the full window, or rescaling the axes to it, is the same lie the main run's
+`tEnd` exists to prevent. Different seeds legitimately end at different times,
+which is a picture worth drawing: it is where the interesting region is.
+
 ## Conservation
 
 The Ge–Marsden trade-off (`docs/solvers.md`) says no fixed-step method preserves
@@ -504,6 +611,14 @@ measured on is the same bug as a stale sample.
   dense output are identical whichever method ran.
 - Label the plot from `SolveReport.method` and never from what was requested;
   they differ exactly when something went wrong, which is when it matters.
+- The `field` view is `vector_field` over the visible window, recomputed on pan
+  and zoom, drawn **under** the trajectories: the curves are the answer and the
+  field is the question. Normalise the arrow lengths and show magnitude by
+  shade — a field whose corners differ by three orders of magnitude is
+  unreadable if arrows scale with speed.
+- Seeds are `trajectory_from` once each, over the same window and method as the
+  document's own run, on top of a single `solve`. Re-run only the seed that
+  moved; nothing else in the frame is affected by it.
 - Offer the conservation monitor's menu from `Diagnostics.derived`. An empty
   list means the document has not named a quantity to watch yet — the useful
   prompt is a row, e.g. `E = 0.5(x'^2 + x^2)`, not a dialog.
